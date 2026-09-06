@@ -76,7 +76,96 @@ Rather than requiring heavyweight PyTorch / ONNX vector libraries (~500MB RAM, 1
 
 ---
 
-## 🚀 CLI Quick Start
+## ⚡ 5-Minute Quickstart Guide for Newbies
+
+Get up and running from zero to autonomous memory in 5 minutes.
+
+### 1. Prerequisites & Installation
+
+Clone the repository and install the lightweight Python dependencies (no PyTorch, no heavyweight vector DBs needed):
+
+```bash
+git clone https://github.com/sbolten/agy-memory-engine.git
+cd agy-memory-engine
+
+# Optional: set up your environment configuration
+cp .env.example .env
+```
+
+The database (`~/.gemini/memory.db`) will be automatically initialized with all FTS5 virtual tables on first run!
+
+---
+
+### 2. See Instant Results in the Web Dashboard
+
+The easiest way to see what's happening and test queries is the built-in live dashboard:
+
+```bash
+# Start the web UI on port 8085
+python3 agy_memory.py ui --port 8085
+```
+Open **`http://localhost:8085`** in your browser. You can:
+* Test hybrid multilingual searches in real-time with sub-millisecond metrics.
+* Visually browse Facts, Episodes, Learnings, and Graph Links.
+* Monitor pending debounced background tasks.
+
+---
+
+### 3. Add Your First Memories via CLI
+
+You can seed your agent's memory directly from the terminal:
+
+```bash
+# 1. Add an atomic fact (Layer 1)
+python3 agy_memory.py add --id "infra.server.ip" --category "infra" --fact "Home server IP is 192.168.1.100" --keywords "home server ip host"
+
+# 2. Add a personal learning / heuristic (Layer 3)
+python3 agy_memory.py add-learning --id "workflow.email.style" --category "communication" --insight "Keep email replies strictly under 3 bullet points." --keywords "email communication reply rule"
+
+# 3. Test sub-millisecond prefetch (< 2ms)
+python3 agy_memory.py prefetch "server"
+```
+
+---
+
+### 4. Hook it up to your Agent (AGY / Claude Code)
+
+#### Option A: Native MCP Integration (Works with Claude Code, Cursor, AGY)
+Add the memory engine as an MCP tool server so your agent can actively search and store knowledge:
+
+```bash
+# For Claude Code:
+claude mcp add memory python3 $(pwd)/agy_memory_mcp.py
+
+# Or in your MCP config JSON (~/.gemini/antigravity-cli/mcp_config.json or Claude Desktop):
+{
+  "mcpServers": {
+    "memory": {
+      "command": "python3",
+      "args": ["/path/to/agy-memory-engine/agy_memory_mcp.py"]
+    }
+  }
+}
+```
+
+#### Option B: Configure Agent Prompt / Instructions (`GEMINI.md` or `CLAUDE.md`)
+Add a simple memory rule to your global agent instructions (e.g. `~/.gemini/config/GEMINI.md`, `CLAUDE.md`, or your project's system prompt) so your agent knows when to query memory:
+
+```markdown
+## Long-Term Memory
+- Before answering questions regarding personal preferences, server IPs, hardware, or past projects, call `search_memory` or run `agy_memory.py prefetch "<topic>"`.
+- When the user states a new permanent fact or personal rule, persist it using `store_memory` or `record_learning`.
+```
+
+#### Option C: Autonomous Background Sync (Zero-friction)
+To have the memory engine automatically learn from your conversations without you lifting a finger:
+
+1. Register the sub-millisecond turn hook in `~/.gemini/config/hooks.json` (see [Autonomous Background Pipeline](#-autonomous-background-pipeline-cron--lifecycle-hooks)).
+2. Add the debounced background worker to your crontab (`*/5 * * * * python3 /path/to/agy-memory-engine/memory_worker.py`).
+
+---
+
+## 🚀 CLI Reference & Quick Commands
 
 ```bash
 # Multi-Layer Prefetch (< 2ms)
@@ -101,8 +190,6 @@ python3 agy_memory.py optimize --apply
 python3 agy_memory.py migrate --dry-run
 python3 agy_memory.py migrate
 ```
-
----
 
 ## 🔌 Model Context Protocol (MCP) Server
 
