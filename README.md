@@ -13,7 +13,7 @@ Inspired by Hermes Agent's multi-pillar memory architecture, using SQLite FTS5 f
 
 - [The Big Picture: Autonomous Omni-Channel Stack](#-the-big-picture-autonomous-omni-channel-stack)
 - [The 4-Layer Cognitive Memory Model](#️-the-4-layer-cognitive-memory-model)
-- [Hybrid Multilingual Tokenizer vs. Vector Databases](#-hybrid-multilingual-tokenizer-vs-vector-databases)
+- [Evolution: From Pure Tokenizer to In-Process Hybrid Search](#-evolution-from-pure-tokenizer-to-in-process-hybrid-search)
 - [5-Minute Quickstart Guide for Newbies](#-5-minute-quickstart-guide-for-newbies)
 - [CLI Reference & Quick Commands](#-cli-reference--quick-commands)
 - [Model Context Protocol (MCP) Server](#-model-context-protocol-mcp-server)
@@ -82,20 +82,20 @@ Inspired by Hermes Agent's multi-pillar memory architecture, using SQLite FTS5 f
 
 ---
 
-## 🔍 Evolution: Vom reinen Tokenizer zur In-Process Hybrid Search
-
-In Version 2.0/2.1 verzichtete `agy-memory-engine` bewusst auf externe, ressourcenhungrige Vektor-Datenbanken (wie Chroma, Milvus oder Qdrant) und PyTorch-Bloat (~500MB RAM, 150ms Latenz), um schlank zu bleiben.
-
-**Die Limitation der reinen Keyword-/FTS5-Suche:**
-Reines FTS5 scheitert am sogenannten *Vocabulary Mismatch*: Fragt der Nutzer in freier Alltagssprache nach *"Verhinderung von Datenverlust bei Aufräumarbeiten"*, während in der Datenbank die Heuristik *"Löschungen jeglicher Art erfordern explizite Genehmigung (Löschschutz)"* hinterlegt ist, findet eine reine FTS5-Suche exakt **0 Treffer**.
-
-**Die Lösung ab v2.2.0: In-Process Hybrid Search (sqlite-vec + FastEmbed)**
-Statt ein schweres Backend einzuführen, kombiniert v2.2.0 das Beste aus beiden Welten:
-1. **Ultra-schneller CLI-Prefetch (< 2ms):** Der synchrone Pre-Invocation Hook bleibt unverändert bei reinem FTS5 + Trigram-Zerlegung für deutsche Komposita – 0 ms spürbare Latenz im Chat.
-2. **In-Process Vector Extension (`sqlite-vec`):** Läuft nativ in C direkt im SQLite-Prozess (SIMD-beschleunigt, kein Daemon, kein Netzwerk-Hop).
-3. **Schlankes lokales Embedding (`fastembed`):** Nutzt ONNX Runtime mit `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384 Dimensionen, ~9ms Inferenzzeit, hervorragende DE/EN-Semantik).
-4. **Reciprocal Rank Fusion (RRF):** Führt BM25-Ergebnisse (100% Präzision bei IPs, IDs, exakten Namen) und Vektordistanz (Verständnis vager Konzepte und Synonyme) mathematisch optimal zusammen.
-5. **Automatische Synchronisation:** Hintergrund-Worker (`memory_worker.py`) und MCP-Store-Tools indizieren Vektoren transparent im Hintergrund; SQLite-Löschtrigger kaskadieren automatisch.
+## 🔍 Evolution: From Pure Tokenizer to In-Process Hybrid Search
+ 
+In version 2.0/2.1, `agy-memory-engine` deliberately avoided external, resource-heavy vector databases (such as Chroma, Milvus, or Qdrant) and PyTorch bloat (~500MB RAM, 150ms latency) to stay ultra-lightweight.
+ 
+**The limitation of pure keyword / FTS5 search:**
+Pure FTS5 struggles with *vocabulary mismatch*: If a user asks in everyday conversational language about *"preventing data loss during disk cleanup"*, while the database stores the heuristic *"Deletions of any kind require explicit approval (deletion protection)"*, pure FTS5 keyword matching returns exactly **0 results**.
+ 
+**The solution starting in v2.2.0: In-Process Hybrid Search (sqlite-vec + FastEmbed)**
+Instead of introducing a heavy server backend, v2.2.0 combines the best of both worlds:
+1. **Ultra-fast CLI Prefetch (< 2ms):** The synchronous pre-invocation hook remains unchanged on pure FTS5 + trigram decomposition for compound words — zero perceptible latency in chat.
+2. **In-Process Vector Extension (`sqlite-vec`):** Runs natively in C directly inside the SQLite process (SIMD-accelerated, zero daemon, zero network hop).
+3. **Lightweight Local Embeddings (`fastembed`):** Powered by ONNX Runtime with `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384 dimensions, ~9ms inference time, outstanding multilingual semantics).
+4. **Reciprocal Rank Fusion (RRF):** Mathematically blends BM25 results (100% precision for IPs, IDs, exact names) and vector distance (understanding vague concepts and synonyms).
+5. **Automatic Synchronization:** Background workers (`memory_worker.py`) and MCP storage tools index vectors transparently in the background; SQLite cascade triggers handle deletions automatically.
 
 ---
 
@@ -328,7 +328,7 @@ AGY_MEMORY_DASHBOARD_HOST=0.0.0.0
 A zero-dependency, standalone live web dashboard is included to inspect, search, and monitor memory state in real time:
 
 * **Live FTS5 Search Sandbox:** Test hybrid multilingual queries with sub-millisecond latency metrics.
-* **Turn Queue & Debounce Monitor:** Visual countdown bar for active conversation debouncing (5m idle / 15m timeout) with an instant *"Batch jetzt verarbeiten"* trigger.
+* **Turn Queue & Debounce Monitor:** Visual countdown bar for active conversation debouncing (5m idle / 15m timeout) with an instant *"Process batch now"* trigger.
 * **4-Layer Visualizer:** Browse Facts (Layer 1), Thematic Episodes with status badges (Layer 2), Experiential Learnings (Layer 3), and Knowledge Graph Entity Links (Layer 4).
 * **Consolidation Audit Log:** Review automated background merges, deduplications, and semantic rationale.
 
