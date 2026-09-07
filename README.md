@@ -411,6 +411,15 @@ python3 -m unittest discover tests/ -v
 
 ## 🗺️ Roadmap
 
+- [ ] **Semantic Recall & Hybrid Search (FTS5 + `sqlite-vec`)**:
+  - In-process vector extension via `sqlite-vec` alongside FTS5.
+  - Multilingual embedding model (`multilingual-e5-small` or `paraphrase-multilingual-MiniLM-L12-v2`) via `fastembed` / `onnxruntime` for vague natural language queries.
+  - Reciprocal Rank Fusion (RRF) to combine BM25 keyword precision with semantic vector similarity for on-demand queries (`search_memory`).
+  - Keep pre-invocation prefetch strictly < 2ms (FTS5 + Trigram).
+- [ ] **Hermes-Style 3-Tier Memory Architecture**:
+  - **Tier 1 (Profile/Preferences)**: Lean, fixed identity facts injected directly into agent system prompt (0ms latency, ~150-250 tokens max).
+  - **Tier 2 (Episodic & Semantic Store)**: 4-Layer SQLite `memory.db` with Hybrid Search on-demand.
+  - **Tier 3 (Working Memory)**: Active session context & scratchpad.
 - [ ] **Pluggable LLM Backends for Background Worker**:
   - Abstract extraction & consolidation caller (`call_llm`) beyond `agy --print`.
   - **Claude Code Compatibility**: Support Claude CLI (`claude -p`) as background extraction engine.
