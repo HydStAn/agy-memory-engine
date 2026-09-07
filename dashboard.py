@@ -65,6 +65,7 @@ def get_profile(user: str) -> dict:
     return profs.get(user.lower().strip(), profs["ubuntu"])
 
 from schema import db_session
+from config import VECTOR_SEARCH_ENABLED
 from agy_memory import (
     extract_multilingual_tokens,
     get_all_vocabulary,
@@ -78,6 +79,13 @@ from queue_manager import (
     get_recent_turns,
     prune_processed_turns
 )
+try:
+    from embedder import embed_text, reciprocal_rank_fusion
+    HAS_DASHBOARD_EMBEDDER = True
+except ImportError:
+    embed_text = None
+    reciprocal_rank_fusion = None
+    HAS_DASHBOARD_EMBEDDER = False
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -2066,38 +2074,96 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                     self._send_json({"facts": [], "episodes": [], "learnings": [], "tokens": []})
                     return
 
-                fts_terms = [f'"{w}"*' if len(w) >= 4 else f'"{w}"' for w in words]
-                fts_query = " OR ".join(fts_terms)
+                # --- Lexical Search (FTS5) ---
+                fts_facts = []
+                fts_episodes = []
+                fts_learnings = []
+                if words:
+                    fts_terms = [f'"{w}"*' if len(w) >= 4 else f'"{w}"' for w in words]
+                    fts_query = " OR ".join(fts_terms)
 
-                # Query Facts
-                cursor.execute("""
-                    SELECT m.id, m.category, m.fact 
-                    FROM memories m
-                    JOIN memories_fts f ON m.id = f.id
-                    WHERE memories_fts MATCH ?
-                    ORDER BY f.rank LIMIT 10;
-                """, (fts_query,))
-                facts = [{"id": r[0], "category": r[1], "fact": r[2]} for r in cursor.fetchall()]
+                    # Query Facts
+                    cursor.execute("""
+                        SELECT m.id, m.category, m.fact 
+                        FROM memories m
+                        JOIN memories_fts f ON m.id = f.id
+                        WHERE memories_fts MATCH ?
+                        ORDER BY f.rank LIMIT 10;
+                    """, (fts_query,))
+                    fts_facts = [{"id": r[0], "category": r[1], "fact": r[2]} for r in cursor.fetchall()]
 
-                # Query Episodes
-                cursor.execute("""
-                    SELECT e.id, e.topic, e.title, e.period, e.status, e.narrative 
-                    FROM episodes e
-                    JOIN episodes_fts f ON e.id = f.id
-                    WHERE episodes_fts MATCH ?
-                    ORDER BY f.rank LIMIT 10;
-                """, (fts_query,))
-                episodes = [{"id": r[0], "topic": r[1], "title": r[2], "period": r[3], "status": r[4], "narrative": r[5]} for r in cursor.fetchall()]
+                    # Query Episodes
+                    cursor.execute("""
+                        SELECT e.id, e.topic, e.title, e.period, e.status, e.narrative 
+                        FROM episodes e
+                        JOIN episodes_fts f ON e.id = f.id
+                        WHERE episodes_fts MATCH ?
+                        ORDER BY f.rank LIMIT 10;
+                    """, (fts_query,))
+                    fts_episodes = [{"id": r[0], "topic": r[1], "title": r[2], "period": r[3], "status": r[4], "narrative": r[5]} for r in cursor.fetchall()]
 
-                # Query Learnings
-                cursor.execute("""
-                    SELECT l.id, l.category, l.insight 
-                    FROM learnings l
-                    JOIN learnings_fts f ON l.id = f.id
-                    WHERE learnings_fts MATCH ?
-                    ORDER BY f.rank LIMIT 10;
-                """, (fts_query,))
-                learnings = [{"id": r[0], "category": r[1], "insight": r[2]} for r in cursor.fetchall()]
+                    # Query Learnings
+                    cursor.execute("""
+                        SELECT l.id, l.category, l.insight 
+                        FROM learnings l
+                        JOIN learnings_fts f ON l.id = f.id
+                        WHERE learnings_fts MATCH ?
+                        ORDER BY f.rank LIMIT 10;
+                    """, (fts_query,))
+                    fts_learnings = [{"id": r[0], "category": r[1], "insight": r[2]} for r in cursor.fetchall()]
+
+                # --- Semantic Vector Search ---
+                vec_facts = []
+                vec_episodes = []
+                vec_learnings = []
+                if HAS_DASHBOARD_EMBEDDER and VECTOR_SEARCH_ENABLED and embed_text:
+                    q_emb = embed_text(q)
+                    if q_emb is not None:
+                        try:
+                            cursor.execute("""
+                                SELECT m.id, m.category, m.fact
+                                FROM vec_memories v
+                                JOIN memories m ON m.id = v.id
+                                WHERE v.embedding MATCH ? AND k = 10
+                                ORDER BY v.distance ASC
+                            """, (q_emb,))
+                            vec_facts = [{"id": r[0], "category": r[1], "fact": r[2]} for r in cursor.fetchall()]
+                        except Exception:
+                            pass
+
+                        try:
+                            cursor.execute("""
+                                SELECT e.id, e.topic, e.title, e.period, e.status, e.narrative
+                                FROM vec_episodes v
+                                JOIN episodes e ON e.id = v.id
+                                WHERE v.embedding MATCH ? AND k = 10
+                                ORDER BY v.distance ASC
+                            """, (q_emb,))
+                            vec_episodes = [{"id": r[0], "topic": r[1], "title": r[2], "period": r[3], "status": r[4], "narrative": r[5]} for r in cursor.fetchall()]
+                        except Exception:
+                            pass
+
+                        try:
+                            cursor.execute("""
+                                SELECT l.id, l.category, l.insight
+                                FROM vec_learnings v
+                                JOIN learnings l ON l.id = v.id
+                                WHERE v.embedding MATCH ? AND k = 10
+                                ORDER BY v.distance ASC
+                            """, (q_emb,))
+                            vec_learnings = [{"id": r[0], "category": r[1], "insight": r[2]} for r in cursor.fetchall()]
+                        except Exception:
+                            pass
+
+                # --- Reciprocal Rank Fusion ---
+                if HAS_DASHBOARD_EMBEDDER and reciprocal_rank_fusion:
+                    facts = reciprocal_rank_fusion(fts_facts, vec_facts, limit=10)
+                    episodes = reciprocal_rank_fusion(fts_episodes, vec_episodes, limit=10)
+                    learnings = reciprocal_rank_fusion(fts_learnings, vec_learnings, limit=10)
+                else:
+                    facts = fts_facts[:10]
+                    episodes = fts_episodes[:10]
+                    learnings = fts_learnings[:10]
 
                 self._send_json({
                     "tokens": words,
