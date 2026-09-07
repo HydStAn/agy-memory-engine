@@ -82,16 +82,20 @@ Inspired by Hermes Agent's multi-pillar memory architecture, using SQLite FTS5 f
 
 ---
 
-## 🔍 Hybrid Multilingual Tokenizer vs. Vector Databases
+## 🔍 Evolution: Vom reinen Tokenizer zur In-Process Hybrid Search
 
-Rather than requiring heavyweight PyTorch / ONNX vector libraries (~500MB RAM, 150ms latency), `agy-memory-engine` implements an in-process **Hybrid Multilingual Semantic Tokenizer**:
+In Version 2.0/2.1 verzichtete `agy-memory-engine` bewusst auf externe, ressourcenhungrige Vektor-Datenbanken (wie Chroma, Milvus oder Qdrant) und PyTorch-Bloat (~500MB RAM, 150ms Latenz), um schlank zu bleiben.
 
-1. **Multilingual Compound Sub-Token Decomposition:** Automatically decomposes composite nouns across German, Dutch, Scandinavian and Romance languages (e.g. `Hundeversicherung` ➔ `hund` + `versicherung`, `Zweitwohnungssteuer` ➔ `zweitwohnung` + `steuer`, `hondenverzekering` ➔ `hond` + `verzekering`) with Fugenmorpheme handling (`-s-`, `-en-`, `-n-`, `-er-`, `-e-`) and database vocabulary validation.
-2. **Morphological Suffix & Stemming Normalizer:** Normalizes inflectional endings across 8 European languages (DE, EN, FR, IT, ES, NL, SV/NO/DA) so inflected queries (e.g. `insurances`, `voitures`, `prenotazioni`, `reservaciones`) match stored canonical records.
-3. **BM25 Relevance Scoring:** Fast native SQLite FTS5 rank over facts, episodes, and learnings.
-4. **Status-Aware Aging:** Weights `active` topics above `cooling` and `historic` dossiers.
-5. **1-Hop Entity Expansion:** Resolves linked hardware/services automatically during prefetch.
-6. **Exact Match Guarantee:** 100% precision on IP addresses, ports, IDs, and serial numbers.
+**Die Limitation der reinen Keyword-/FTS5-Suche:**
+Reines FTS5 scheitert am sogenannten *Vocabulary Mismatch*: Fragt der Nutzer in freier Alltagssprache nach *"Verhinderung von Datenverlust bei Aufräumarbeiten"*, während in der Datenbank die Heuristik *"Löschungen jeglicher Art erfordern explizite Genehmigung (Löschschutz)"* hinterlegt ist, findet eine reine FTS5-Suche exakt **0 Treffer**.
+
+**Die Lösung ab v2.2.0: In-Process Hybrid Search (sqlite-vec + FastEmbed)**
+Statt ein schweres Backend einzuführen, kombiniert v2.2.0 das Beste aus beiden Welten:
+1. **Ultra-schneller CLI-Prefetch (< 2ms):** Der synchrone Pre-Invocation Hook bleibt unverändert bei reinem FTS5 + Trigram-Zerlegung für deutsche Komposita – 0 ms spürbare Latenz im Chat.
+2. **In-Process Vector Extension (`sqlite-vec`):** Läuft nativ in C direkt im SQLite-Prozess (SIMD-beschleunigt, kein Daemon, kein Netzwerk-Hop).
+3. **Schlankes lokales Embedding (`fastembed`):** Nutzt ONNX Runtime mit `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384 Dimensionen, ~9ms Inferenzzeit, hervorragende DE/EN-Semantik).
+4. **Reciprocal Rank Fusion (RRF):** Führt BM25-Ergebnisse (100% Präzision bei IPs, IDs, exakten Namen) und Vektordistanz (Verständnis vager Konzepte und Synonyme) mathematisch optimal zusammen.
+5. **Automatische Synchronisation:** Hintergrund-Worker (`memory_worker.py`) und MCP-Store-Tools indizieren Vektoren transparent im Hintergrund; SQLite-Löschtrigger kaskadieren automatisch.
 
 ---
 
