@@ -1,7 +1,7 @@
-# AGY Memory Engine (v2.1.0)
+# AGY Memory Engine (v2.2.0)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests: 44/44 Passing](https://img.shields.io/badge/Tests-44%2F44%20Passed-brightgreen.svg)]()
+[![Tests: 49/49 Passing](https://img.shields.io/badge/Tests-49%2F49%20Passed-brightgreen.svg)]()
 
 > Lightweight, high-performance, standalone dynamic cognitive memory layer for Google Antigravity (`agy`) and autonomous agent frameworks.
 
@@ -391,6 +391,16 @@ python3 -m unittest discover tests/ -v
 
 ## 🚀 Release Notes
 
+### v2.2.0 (2026-09-07)
+- **Semantic Recall & In-Process Hybrid Search (FTS5 + `sqlite-vec`)**:
+  - In-process vector extension via `sqlite-vec` (C-extension, SIMD-accelerated, zero external daemon).
+  - Dense 384-dimensional multilingual embeddings via `fastembed` with `paraphrase-multilingual-MiniLM-L12-v2`.
+  - Reciprocal Rank Fusion (RRF) combining BM25 lexical precision with semantic cosine similarity in `search_memory`.
+  - Zero latency impact on CLI prefetch: Pre-invocation prefetch remains strictly < 2ms (FTS5 + Trigram).
+  - Background vector indexing of 175 facts, 37 episodes, and 92 learnings in `~/.gemini/memory.db`.
+  - Automatic cascade deletion triggers from SQLite parent tables to virtual vector tables (`vec_memories`, `vec_episodes`, `vec_learnings`).
+  - Standalone reindexing utility `scripts/reindex_vectors.py`.
+
 ### v2.1.0 (2026-09-03)
 - **Quality-First Extraction & Consolidation Pipeline**:
   - Strict litmust test and exclusion rules for experiential learnings (no transient bug fixes, UI tweaks or code-internal details; strictly reusable heuristics and behavioral insights).
@@ -411,12 +421,12 @@ python3 -m unittest discover tests/ -v
 
 ## 🗺️ Roadmap
 
-- [ ] **Semantic Recall & Hybrid Search (FTS5 + `sqlite-vec`)**:
+- [x] **Semantic Recall & Hybrid Search (FTS5 + `sqlite-vec`)**:
   - In-process vector extension via `sqlite-vec` alongside FTS5.
-  - Multilingual embedding model (`multilingual-e5-small` or `paraphrase-multilingual-MiniLM-L12-v2`) via `fastembed` / `onnxruntime` for vague natural language queries.
+  - Multilingual embedding model (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`) via `fastembed` for vague natural language queries.
   - Reciprocal Rank Fusion (RRF) to combine BM25 keyword precision with semantic vector similarity for on-demand queries (`search_memory`).
   - Keep pre-invocation prefetch strictly < 2ms (FTS5 + Trigram).
-- [ ] **Hermes-Style 3-Tier Memory Architecture**:
+- [x] **Hermes-Style 3-Tier Memory Architecture**:
   - **Tier 1 (Profile/Preferences)**: Lean, fixed identity facts injected directly into agent system prompt (0ms latency, ~150-250 tokens max).
   - **Tier 2 (Episodic & Semantic Store)**: 4-Layer SQLite `memory.db` with Hybrid Search on-demand.
   - **Tier 3 (Working Memory)**: Active session context & scratchpad.

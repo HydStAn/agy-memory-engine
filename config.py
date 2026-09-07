@@ -48,6 +48,11 @@ DEFAULT_MODEL = "gemini-3.8-flash-low"
 MODEL_NAME = get_config("AGY_MEMORY_MODEL", DEFAULT_MODEL)
 CACHE_PATH = os.environ.get("AGY_MEMORY_CACHE", str(Path.home() / ".gemini" / "memory_model_cache.txt"))
 
+# --- Vector Embedding Configuration ---
+EMBEDDING_MODEL_NAME = get_config("AGY_EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
+EMBEDDING_DIM = int(get_config("AGY_EMBEDDING_DIM", "384"))
+VECTOR_SEARCH_ENABLED = get_config("AGY_VECTOR_SEARCH_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+
 # --- Binary Paths ---
 AGY_BIN = (
     get_config("AGY_BIN")

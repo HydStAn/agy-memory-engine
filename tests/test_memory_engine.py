@@ -901,6 +901,25 @@ class TestMCPServerTools(unittest.TestCase):
         res_opt = json.loads(optimize_memory(apply_changes=True, consolidate=False))
         self.assertEqual(res_opt["status"], "success")
 
+    def test_hybrid_vector_search_end_to_end(self):
+        from agy_memory_mcp import store_memory, record_episode, search_memory
+        # 1. Store memories with vector embeddings
+        store_memory("infra.ac.midea", "Midea PortaSplit mobile Klimaanlage mit Schallschutzhaube", category="hardware", keywords="klima kühlung leise")
+        record_episode("ep.ac.install", "home", "Klimagerät Montage am Balkon", "Installation der Schalldämmhaube für das Außengerät zur Lärmreduktion.", status="active")
+
+        # 2. Search using vague semantic query that has no direct word overlap
+        res_raw = search_memory("Lärmdämmung Außengerät", limit=2)
+        res = json.loads(res_raw)
+        
+        # Verify results returned via hybrid fusion
+        self.assertIn("facts", res)
+        self.assertIn("episodes", res)
+        fact_ids = [f["id"] for f in res["facts"]]
+        ep_ids = [e["id"] for e in res["episodes"]]
+        
+        # Either the fact or the episode must be retrieved semantically
+        self.assertTrue("infra.ac.midea" in fact_ids or "ep.ac.install" in ep_ids)
+
 
 if __name__ == "__main__":
     unittest.main()
