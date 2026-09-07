@@ -118,7 +118,7 @@ class TestEpisodeLifecycle(unittest.TestCase):
             period="2020-2026",
             status="active",
             narrative="Laufender Nachbarschaftskonflikt bezüglich Baumschnitt und Kamin.",
-            entities="Herr Jenni, Familie Bolten",
+            entities="Herr Jenni, Familie Meier",
             stance="Nur schriftliche Anwaltskommunikation",
             keywords="Jenni Baum Garten Kamin Streit"
         )

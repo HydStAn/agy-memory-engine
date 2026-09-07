@@ -757,7 +757,7 @@ def _sync_turn_inner(user_prompt: str, assistant_response: str, dry_run: bool = 
     inv = get_existing_database_inventory()
     inv_context = json.dumps(inv, ensure_ascii=False, indent=2)
 
-    prompt = f"""You are the Multi-Layer Cognitive Memory Engine for Stephan Bolten.
+    prompt = f"""You are the Multi-Layer Cognitive Memory Engine for the user.
 Analyze the conversation turn below and extract ONLY genuinely persistent, reusable information.
 
 ## Layer Definitions
@@ -1060,7 +1060,7 @@ def consolidate_memories(dry_run: bool = False) -> list:
 
     canonical_cats = ", ".join(sorted(CANONICAL_FACT_CATEGORIES))
     facts_json = json.dumps(categories_to_check, ensure_ascii=False, indent=2)
-    prompt = f"""You are the Memory Consolidation Engine for Stephan Bolten.
+    prompt = f"""You are the Memory Consolidation Engine for the user.
 Review the following atomic facts grouped by category.
 Identify any facts within each category that are duplicates, heavily overlapping, redundant, or represent the same information across different keys.
 
