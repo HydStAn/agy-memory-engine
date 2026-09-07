@@ -422,4 +422,4 @@ python3 -m unittest discover tests/ -v
 
 ## 📄 License
 
-MIT License © 2026 HydStan
+MIT License © 2026 HydStAn
