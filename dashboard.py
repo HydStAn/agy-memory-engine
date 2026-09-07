@@ -80,11 +80,12 @@ from queue_manager import (
     prune_processed_turns
 )
 try:
-    from embedder import embed_text, reciprocal_rank_fusion
+    from embedder import embed_text, reciprocal_rank_fusion, log_vec_query_failure
     HAS_DASHBOARD_EMBEDDER = True
 except ImportError:
     embed_text = None
     reciprocal_rank_fusion = None
+    log_vec_query_failure = None
     HAS_DASHBOARD_EMBEDDER = False
 
 
@@ -2128,8 +2129,9 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                                 ORDER BY v.distance ASC
                             """, (q_emb,))
                             vec_facts = [{"id": r[0], "category": r[1], "fact": r[2]} for r in cursor.fetchall()]
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            if log_vec_query_failure:
+                                log_vec_query_failure("vec_memories", e)
 
                         try:
                             cursor.execute("""
@@ -2140,8 +2142,9 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                                 ORDER BY v.distance ASC
                             """, (q_emb,))
                             vec_episodes = [{"id": r[0], "topic": r[1], "title": r[2], "period": r[3], "status": r[4], "narrative": r[5]} for r in cursor.fetchall()]
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            if log_vec_query_failure:
+                                log_vec_query_failure("vec_episodes", e)
 
                         try:
                             cursor.execute("""
@@ -2152,8 +2155,9 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                                 ORDER BY v.distance ASC
                             """, (q_emb,))
                             vec_learnings = [{"id": r[0], "category": r[1], "insight": r[2]} for r in cursor.fetchall()]
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            if log_vec_query_failure:
+                                log_vec_query_failure("vec_learnings", e)
 
                 # --- Reciprocal Rank Fusion ---
                 if HAS_DASHBOARD_EMBEDDER and reciprocal_rank_fusion:

@@ -920,6 +920,39 @@ class TestMCPServerTools(unittest.TestCase):
         # Either the fact or the episode must be retrieved semantically
         self.assertTrue("infra.ac.midea" in fact_ids or "ep.ac.install" in ep_ids)
 
+    def test_vector_refinements_and_batch_indexing(self):
+        import embedder
+        from scripts.reindex_vectors import reindex_all
+
+        # 1. Test build_text_repr
+        fact_repr = embedder.build_text_repr("fact", {"category": "hardware", "fact": "MacBook Pro M3 Max", "keywords": "apple laptop"})
+        self.assertEqual(fact_repr, "[hardware] MacBook Pro M3 Max apple laptop")
+        
+        ep_repr = embedder.build_text_repr("episode", {
+            "topic": "travel", "title": "Trip to Japan", "narrative": "Traveled to Tokyo and Kyoto.", "stance": "positive", "keywords": "shinkansen"
+        })
+        self.assertEqual(ep_repr, "[travel] Trip to Japan: Traveled to Tokyo and Kyoto. (Stance: positive) shinkansen")
+
+        learning_repr = embedder.build_text_repr("learning", {
+            "category": "workflow", "insight": "Commit early and often", "context": "Git branching", "keywords": "git dev"
+        })
+        self.assertEqual(learning_repr, "[workflow] Commit early and often (Context: Git branching) git dev")
+
+        # 2. Test LRU cache on embed_text
+        emb1 = embedder.embed_text("Test cache query")
+        emb2 = embedder.embed_text("Test cache query")
+        if emb1 is not None and emb2 is not None:
+            self.assertTrue((emb1 == emb2).all())
+
+        # 3. Test reindex_all with batch mode
+        from agy_memory_mcp import store_memory
+        store_memory("fact.batch.1", "Sample batch fact 1", category="infra", keywords="batch test")
+        store_memory("fact.batch.2", "Sample batch fact 2", category="infra", keywords="batch test")
+        
+        reindex_res = reindex_all(db_path=TEST_DB, verbose=False)
+        self.assertEqual(reindex_res.get("status"), "success")
+        self.assertGreaterEqual(reindex_res.get("stats", {}).get("facts", 0), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

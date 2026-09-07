@@ -29,10 +29,11 @@ from config import (
     AGY_BIN
 )
 try:
-    from embedder import upsert_vector, delete_vector
+    from embedder import upsert_vector, delete_vector, build_text_repr
 except ImportError:
     upsert_vector = None
     delete_vector = None
+    build_text_repr = None
 
 __version__ = "2.2.0"
 
@@ -604,7 +605,7 @@ def upsert_fact(fact_id: str, category: str, fact: str, keywords: str = ""):
         """, (fact_id, category, fact, keywords))
         if upsert_vector:
             # Vector representation includes category, content and keywords
-            text_repr = f"[{category}] {fact} {keywords or ''}".strip()
+            text_repr = build_text_repr("fact", {"category": category, "fact": fact, "keywords": keywords}) if build_text_repr else f"[{category}] {fact} {keywords or ''}".strip()
             upsert_vector(conn, "vec_memories", fact_id, text_repr)
         conn.commit()
 
@@ -627,7 +628,7 @@ def upsert_episode(episode_id: str, topic: str, title: str, narrative: str, peri
                 updated_at = CURRENT_TIMESTAMP;
         """, (episode_id, topic, title, period, status, narrative, entities, stance, keywords))
         if upsert_vector:
-            text_repr = f"[{topic}] {title}: {narrative} (Stance: {stance or 'neutral'}) {keywords or ''}".strip()
+            text_repr = build_text_repr("episode", {"topic": topic, "title": title, "narrative": narrative, "stance": stance, "keywords": keywords}) if build_text_repr else f"[{topic}] {title}: {narrative} (Stance: {stance or 'neutral'}) {keywords or ''}".strip()
             upsert_vector(conn, "vec_episodes", episode_id, text_repr)
         conn.commit()
 
@@ -646,7 +647,7 @@ def upsert_learning(learning_id: str, category: str, insight: str, context: str 
                 updated_at = CURRENT_TIMESTAMP;
         """, (learning_id, category, insight, context, keywords))
         if upsert_vector:
-            text_repr = f"[{category}] {insight} (Context: {context or ''}) {keywords or ''}".strip()
+            text_repr = build_text_repr("learning", {"category": category, "insight": insight, "context": context, "keywords": keywords}) if build_text_repr else f"[{category}] {insight} (Context: {context or ''}) {keywords or ''}".strip()
             upsert_vector(conn, "vec_learnings", learning_id, text_repr)
         conn.commit()
 

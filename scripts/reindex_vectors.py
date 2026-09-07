@@ -26,6 +26,8 @@ def reindex_all(db_path: str = None, verbose: bool = True) -> dict:
 
     stats = {"facts": 0, "episodes": 0, "learnings": 0}
 
+    BATCH_SIZE = 64
+
     with db_session(target_db) as conn:
         cursor = conn.cursor()
 
@@ -34,33 +36,56 @@ def reindex_all(db_path: str = None, verbose: bool = True) -> dict:
         facts = cursor.fetchall()
         if facts:
             if verbose:
-                print(f"Indexing {len(facts)} facts into vec_memories...")
+                print(f"Indexing {len(facts)} facts into vec_memories (batch mode)...")
+            items = []
             for fid, cat, fact, kws in facts:
-                text = f"[{cat or 'general'}] {fact} {kws or ''}".strip()
-                if embedder.upsert_vector(conn, "vec_memories", fid, text):
-                    stats["facts"] += 1
+                text = embedder.build_text_repr("fact", {"category": cat, "fact": fact, "keywords": kws})
+                items.append((fid, text))
+            
+            for i in range(0, len(items), BATCH_SIZE):
+                batch = items[i:i + BATCH_SIZE]
+                stats["facts"] += embedder.upsert_vectors_batch(conn, "vec_memories", batch)
 
         # 2. Episodes
         cursor.execute("SELECT id, topic, title, narrative, stance, keywords FROM episodes")
         episodes = cursor.fetchall()
         if episodes:
             if verbose:
-                print(f"Indexing {len(episodes)} episodes into vec_episodes...")
+                print(f"Indexing {len(episodes)} episodes into vec_episodes (batch mode)...")
+            items = []
             for eid, topic, title, narrative, stance, kws in episodes:
-                text = f"[{topic}] {title}: {narrative} (Stance: {stance or 'neutral'}) {kws or ''}".strip()
-                if embedder.upsert_vector(conn, "vec_episodes", eid, text):
-                    stats["episodes"] += 1
+                text = embedder.build_text_repr("episode", {
+                    "topic": topic,
+                    "title": title,
+                    "narrative": narrative,
+                    "stance": stance,
+                    "keywords": kws
+                })
+                items.append((eid, text))
+
+            for i in range(0, len(items), BATCH_SIZE):
+                batch = items[i:i + BATCH_SIZE]
+                stats["episodes"] += embedder.upsert_vectors_batch(conn, "vec_episodes", batch)
 
         # 3. Learnings
         cursor.execute("SELECT id, category, insight, context, keywords FROM learnings")
         learnings = cursor.fetchall()
         if learnings:
             if verbose:
-                print(f"Indexing {len(learnings)} learnings into vec_learnings...")
+                print(f"Indexing {len(learnings)} learnings into vec_learnings (batch mode)...")
+            items = []
             for lid, cat, insight, ctx, kws in learnings:
-                text = f"[{cat or 'general'}] {insight} (Context: {ctx or ''}) {kws or ''}".strip()
-                if embedder.upsert_vector(conn, "vec_learnings", lid, text):
-                    stats["learnings"] += 1
+                text = embedder.build_text_repr("learning", {
+                    "category": cat,
+                    "insight": insight,
+                    "context": ctx,
+                    "keywords": kws
+                })
+                items.append((lid, text))
+
+            for i in range(0, len(items), BATCH_SIZE):
+                batch = items[i:i + BATCH_SIZE]
+                stats["learnings"] += embedder.upsert_vectors_batch(conn, "vec_learnings", batch)
 
         conn.commit()
 

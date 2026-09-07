@@ -24,12 +24,14 @@ from scripts.migrate_v2_to_v2_1 import (
     CANONICAL_EPISODE_STATUSES,
 )
 try:
-    from embedder import embed_text, upsert_vector, reciprocal_rank_fusion
+    from embedder import embed_text, upsert_vector, reciprocal_rank_fusion, build_text_repr, log_vec_query_failure
     HAS_EMBEDDER = True
 except ImportError:
     embed_text = None
     upsert_vector = None
     reciprocal_rank_fusion = None
+    build_text_repr = None
+    log_vec_query_failure = None
     HAS_EMBEDDER = False
 
 mcp = FastMCP("memory")
@@ -127,8 +129,9 @@ def search_memory(query: str, limit: int = 5) -> str:
                             ORDER BY v.distance ASC
                         """, (query_emb, limit))
                         vec_facts = [{"type": "fact", "id": r[0], "category": r[1], "content": r[2]} for r in cursor.fetchall()]
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if log_vec_query_failure:
+                            log_vec_query_failure("vec_memories", e)
 
                     # Semantic search in vec_episodes
                     try:
@@ -149,8 +152,9 @@ def search_memory(query: str, limit: int = 5) -> str:
                             "narrative": r[5],
                             "stance": r[6]
                         } for r in cursor.fetchall()]
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if log_vec_query_failure:
+                            log_vec_query_failure("vec_episodes", e)
 
                     # Semantic search in vec_learnings
                     try:
@@ -168,8 +172,9 @@ def search_memory(query: str, limit: int = 5) -> str:
                             "insight": r[2],
                             "context": r[3]
                         } for r in cursor.fetchall()]
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if log_vec_query_failure:
+                            log_vec_query_failure("vec_learnings", e)
 
             # --- Reciprocal Rank Fusion (RRF) ---
             if HAS_EMBEDDER and reciprocal_rank_fusion:
@@ -226,7 +231,7 @@ def store_memory(id: str, fact: str, category: str = "general", keywords: str = 
                     updated_at = CURRENT_TIMESTAMP;
             """, (id.strip(), norm_category, fact.strip(), keywords.strip()))
             if HAS_EMBEDDER and VECTOR_SEARCH_ENABLED and upsert_vector:
-                text_repr = f"[{norm_category}] {fact.strip()} {keywords.strip()}".strip()
+                text_repr = build_text_repr("fact", {"category": norm_category, "fact": fact.strip(), "keywords": keywords.strip()}) if build_text_repr else f"[{norm_category}] {fact.strip()} {keywords.strip()}".strip()
                 upsert_vector(conn, "vec_memories", id.strip(), text_repr)
             conn.commit()
         return f"Successfully stored fact '{id}' (category: {norm_category})"
@@ -271,7 +276,7 @@ def record_episode(id: str, topic: str, title: str, narrative: str, period: str 
                     updated_at = CURRENT_TIMESTAMP;
             """, (id.strip(), norm_topic, title.strip(), period.strip(), norm_status, narrative.strip(), entities.strip(), stance.strip(), keywords.strip()))
             if HAS_EMBEDDER and VECTOR_SEARCH_ENABLED and upsert_vector:
-                text_repr = f"[{norm_topic}] {title.strip()}: {narrative.strip()} (Stance: {stance.strip() or 'neutral'}) {keywords.strip()}".strip()
+                text_repr = build_text_repr("episode", {"topic": norm_topic, "title": title.strip(), "narrative": narrative.strip(), "stance": stance.strip(), "keywords": keywords.strip()}) if build_text_repr else f"[{norm_topic}] {title.strip()}: {narrative.strip()} (Stance: {stance.strip() or 'neutral'}) {keywords.strip()}".strip()
                 upsert_vector(conn, "vec_episodes", id.strip(), text_repr)
             conn.commit()
         return f"Successfully recorded narrative episode '{id}' (topic: {norm_topic}, status: {norm_status})"
@@ -304,7 +309,7 @@ def record_learning(id: str, category: str, insight: str, context: str = "", key
                     updated_at = CURRENT_TIMESTAMP;
             """, (id.strip(), norm_category, insight.strip(), context.strip(), keywords.strip()))
             if HAS_EMBEDDER and VECTOR_SEARCH_ENABLED and upsert_vector:
-                text_repr = f"[{norm_category}] {insight.strip()} (Context: {context.strip() or ''}) {keywords.strip()}".strip()
+                text_repr = build_text_repr("learning", {"category": norm_category, "insight": insight.strip(), "context": context.strip(), "keywords": keywords.strip()}) if build_text_repr else f"[{norm_category}] {insight.strip()} (Context: {context.strip() or ''}) {keywords.strip()}".strip()
                 upsert_vector(conn, "vec_learnings", id.strip(), text_repr)
             conn.commit()
         return f"Successfully recorded learning '{id}' (category: {norm_category})"
