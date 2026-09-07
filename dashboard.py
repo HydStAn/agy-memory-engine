@@ -27,6 +27,43 @@ from config import (
     INACTIVITY_THRESHOLD_SECONDS,
     MAX_WAIT_THRESHOLD_SECONDS
 )
+
+def get_all_profiles() -> dict:
+    """Dynamically discover all configured AGY user profiles on the host."""
+    profiles = {
+        "ubuntu": {
+            "id": "ubuntu",
+            "label": "Stephan (Ubuntu)",
+            "db_path": os.path.expanduser("~/.gemini/memory.db"),
+            "queue_db_path": os.path.expanduser("~/.gemini/turn_queue.db"),
+            "archive_dir": os.path.expanduser("~/.gemini/archive"),
+        }
+    }
+    home_dir = Path("/home")
+    if home_dir.exists():
+        for udir in sorted(home_dir.iterdir()):
+            if not udir.is_dir() or udir.name in ("ubuntu", "opc"):
+                continue
+            try:
+                gemini_dir = udir / ".gemini"
+                db_path = gemini_dir / "memory.db"
+                if db_path.exists() or gemini_dir.exists():
+                    uname = udir.name
+                    profiles[uname] = {
+                        "id": uname,
+                        "label": uname.capitalize(),
+                        "db_path": str(db_path),
+                        "queue_db_path": str(gemini_dir / "turn_queue.db"),
+                        "archive_dir": str(gemini_dir / "archive"),
+                    }
+            except (PermissionError, OSError):
+                continue
+    return profiles
+
+def get_profile(user: str) -> dict:
+    profs = get_all_profiles()
+    return profs.get(user.lower().strip(), profs["ubuntu"])
+
 from schema import db_session
 from agy_memory import (
     extract_multilingual_tokens,
@@ -145,6 +182,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       font-family: monospace;
     }
     .badge b { color: var(--accent); }
+    .profile-select {
+      background: #1f242c;
+      border: 1px solid var(--accent);
+      color: var(--text-bright);
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .profile-select:hover, .profile-select:focus {
+      box-shadow: 0 0 10px var(--accent-glow);
+    }
 
     /* Clean 5-Metric Primary Navigation Bar */
     .stats-grid {
@@ -606,6 +658,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="pulse-badge"><div class="pulse-dot"></div> Live FTS5</div>
     </div>
     <div class="header-meta">
+      <div class="badge" style="display:flex; align-items:center; gap:6px; padding:2px 8px;">
+        <span>👤 Profile:</span>
+        <select id="sel-profile" class="profile-select" onchange="onProfileChange(this.value)">
+          <option value="ubuntu">Stephan (Ubuntu)</option>
+          <option value="henrik">Henrik</option>
+        </select>
+      </div>
       <div class="badge">Model: <b id="lbl-model">-</b></div>
       <div class="badge">DB: <b id="lbl-db-size">-</b></div>
       <button class="btn btn-secondary" onclick="switchTab('history')">📸 History & Snapshots</button>
@@ -760,6 +819,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div id="toast-container" class="toast-container"></div>
 
   <script>
+    let currentProfile = (new URLSearchParams(window.location.search)).get('user') || 'ubuntu';
     let rawData = null;
     let searchTimer = null;
     const openTurnDetails = new Set();
@@ -854,11 +914,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (rawData && rawData.links) renderGraph(rawData.links, true);
     }
 
+    function onProfileChange(val) {
+      currentProfile = val;
+      const url = new URL(window.location);
+      url.searchParams.set('user', val);
+      window.history.replaceState({}, '', url);
+      lastRenderedQueueHash = '';
+      lastRenderedFactsHash = '';
+      lastRenderedEpisodesHash = '';
+      lastRenderedLearningsHash = '';
+      lastRenderedGraphHash = '';
+      lastRenderedAuditHash = '';
+      lastRenderedSnapshotsHash = '';
+      fetchData(true);
+      showToast('Switched to profile: ' + (val === 'henrik' ? 'Henrik' : 'Stephan (Ubuntu)'), 'info', 2000);
+    }
+
     async function fetchData(forceDomRefresh = false) {
       try {
-        const res = await fetch('/api/stats');
+        const res = await fetch('/api/stats?user=' + encodeURIComponent(currentProfile));
         const data = await res.json();
         rawData = data;
+
+        const sel = document.getElementById('sel-profile');
+        if (sel && data.profiles && Array.isArray(data.profiles)) {
+          const currentOptions = Array.from(sel.options).map(o => o.value).join(',');
+          const newOptions = data.profiles.map(p => p.id).join(',');
+          if (currentOptions !== newOptions) {
+            sel.innerHTML = data.profiles.map(p => `<option value="${p.id}">${escapeHtml(p.label)}</option>`).join('');
+          }
+          sel.value = currentProfile;
+        }
 
         document.getElementById('lbl-model').innerText = data.model || 'gemini-3.7-flash-low';
         document.getElementById('lbl-db-size').innerText = data.db_size || '-';
@@ -1474,7 +1560,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       const t0 = performance.now();
       try {
-        const res = await fetch('/api/search?q=' + encodeURIComponent(q));
+        const res = await fetch('/api/search?q=' + encodeURIComponent(q) + '&user=' + encodeURIComponent(currentProfile));
         const data = await res.json();
         const t1 = performance.now();
         latLbl.innerText = `${(t1 - t0).toFixed(1)} ms (${data.tokens ? data.tokens.join(', ') : ''})`;
@@ -1528,7 +1614,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         onConfirm: async () => {
           showToast('Processing queue turns...', 'info', 3000);
           try {
-            const res = await fetch('/api/force-worker', { method: 'POST' });
+            const res = await fetch('/api/force-worker', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ user: currentProfile })
+            });
             const data = await res.json();
             if (data.status === 'ok') {
               showResultModal({
@@ -1569,7 +1659,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         confirmStyle: 'btn-danger',
         onConfirm: async () => {
           try {
-            const res = await fetch('/api/clear-processed-queue', { method: 'POST' });
+            const res = await fetch('/api/clear-processed-queue', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ user: currentProfile })
+            });
             const data = await res.json();
             showToast(data.message || 'Processed turns cleared from queue.', 'success', 3500);
             lastRenderedQueueHash = '';
@@ -1605,7 +1699,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           showToast('Database optimization started...', 'info', 4000);
 
           try {
-            const res = await fetch('/api/optimize', { method: 'POST' });
+            const res = await fetch('/api/optimize', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ user: currentProfile })
+            });
             const data = await res.json();
             if (data.status === 'ok') {
               showResultModal({
@@ -1663,7 +1761,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             const res = await fetch('/api/restore-snapshot', {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
-              body: JSON.stringify({ filename })
+              body: JSON.stringify({ filename, user: currentProfile })
             });
             const data = await res.json();
             if (data.status === 'ok') {
@@ -1701,7 +1799,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     async function createManualSnapshot() {
       showToast('Creating manual snapshot...', 'info', 2000);
       try {
-        const res = await fetch('/api/create-snapshot', { method: 'POST' });
+        const res = await fetch('/api/create-snapshot', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user: currentProfile })
+        });
         const data = await res.json();
         if (data.status === 'ok') {
           showToast(`📸 Snapshot created: ${data.filename}`, 'success', 3500);
@@ -1778,24 +1880,33 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        user = params.get("user", ["ubuntu"])[0]
         if path == "/api/stats":
-            self._handle_stats()
+            self._handle_stats(user)
             return
 
         if path == "/api/search":
             q = params.get("q", [""])[0]
-            self._handle_search(q)
+            self._handle_search(q, user)
             return
 
         self._send_json({"error": "Not Found"}, status=404)
 
     def do_POST(self):
         url = urllib.parse.urlparse(self.path)
+        length = int(self.headers.get("Content-Length", 0))
+        req_data = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+        user = req_data.get("user", "ubuntu")
+        prof = get_profile(user)
+
         if url.path == "/api/force-worker":
             import subprocess
             try:
                 worker_bin = BASE_DIR / "memory_worker.py"
-                res = subprocess.run([sys.executable, str(worker_bin), "--force"], capture_output=True, text=True, timeout=60)
+                env = os.environ.copy()
+                env["AGY_MEMORY_DB"] = prof["db_path"]
+                env["AGY_TURN_QUEUE_DB"] = prof["queue_db_path"]
+                res = subprocess.run([sys.executable, str(worker_bin), "--force"], env=env, capture_output=True, text=True, timeout=60)
                 self._send_json({"status": "ok", "message": res.stdout.strip() or "Queue processed successfully."})
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
@@ -1803,7 +1914,7 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
 
         if url.path == "/api/clear-processed-queue":
             try:
-                prune_processed_turns(days=0)
+                prune_processed_turns(days=0, db_path=prof["queue_db_path"])
                 self._send_json({"status": "ok", "message": "All processed and skipped turns have been purged from the queue."})
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
@@ -1813,8 +1924,12 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             import subprocess
             try:
                 main_bin = BASE_DIR / "agy_memory.py"
+                env = os.environ.copy()
+                env["AGY_MEMORY_DB"] = prof["db_path"]
+                env["AGY_TURN_QUEUE_DB"] = prof["queue_db_path"]
                 res = subprocess.run(
                     [sys.executable, str(main_bin), "optimize", "--apply"],
+                    env=env,
                     capture_output=True,
                     text=True,
                     timeout=120
@@ -1831,7 +1946,7 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
 
         if url.path == "/api/create-snapshot":
             try:
-                res = create_snapshot(tag="manual")
+                res = create_snapshot(tag="manual", db_path=prof["db_path"])
                 self._send_json(res)
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
@@ -1839,13 +1954,11 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
 
         if url.path == "/api/restore-snapshot":
             try:
-                length = int(self.headers.get("Content-Length", 0))
-                req_data = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
                 filename = req_data.get("filename")
                 if not filename:
                     self._send_json({"status": "error", "message": "Missing 'filename' in request."}, status=400)
                     return
-                res = restore_snapshot(filename)
+                res = restore_snapshot(filename, db_path=prof["db_path"])
                 self._send_json(res)
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
@@ -1853,9 +1966,14 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
 
         self._send_json({"error": "Not Found"}, status=404)
 
-    def _handle_stats(self):
+    def _handle_stats(self, user: str = "ubuntu"):
         try:
-            with db_session() as conn:
+            prof = get_profile(user)
+            target_db = prof["db_path"]
+            target_queue = prof["queue_db_path"]
+            target_archive = prof["archive_dir"]
+
+            with db_session(target_db) as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT COUNT(*) FROM memories")
                 cnt_facts = cursor.fetchone()[0]
@@ -1890,21 +2008,25 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                 audit = [{"action": r[0], "category": r[1], "target_id": r[2], "diff_summary": r[3], "rationale": r[4], "timestamp": str(r[5])} for r in cursor.fetchall()]
 
             # Queue stats
-            q_stats = get_pending_stats()
-            q_turns = get_recent_turns(limit=50)
+            q_stats = get_pending_stats(db_path=target_queue) if os.path.exists(target_queue) else {"count": 0, "newest_age_seconds": 0, "oldest_age_seconds": 0}
+            q_turns = get_recent_turns(limit=50, db_path=target_queue) if os.path.exists(target_queue) else []
 
             # Snapshots
-            snapshots = list_snapshots()
+            snapshots = list_snapshots(archive_dir=target_archive) if os.path.exists(target_archive) else []
 
             # DB file size
             db_size = "-"
-            if os.path.exists(DB_PATH):
-                sz = os.path.getsize(DB_PATH)
+            if os.path.exists(target_db):
+                sz = os.path.getsize(target_db)
                 db_size = f"{sz / 1024:.1f} KB" if sz < 1024 * 1024 else f"{sz / (1024*1024):.2f} MB"
 
+            all_profs = get_all_profiles()
             self._send_json({
                 "model": MODEL_NAME,
-                "db_path": DB_PATH,
+                "profiles": [{"id": p["id"], "label": p["label"]} for p in all_profs.values()],
+                "profile": prof["id"],
+                "profile_label": prof["label"],
+                "db_path": target_db,
                 "db_size": db_size,
                 "counts": {
                     "facts": cnt_facts,
@@ -1929,13 +2051,14 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
 
-    def _handle_search(self, q: str):
+    def _handle_search(self, q: str, user: str = "ubuntu"):
         if not q.strip():
             self._send_json({"facts": [], "episodes": [], "learnings": [], "tokens": []})
             return
 
+        prof = get_profile(user)
         try:
-            with db_session() as conn:
+            with db_session(prof["db_path"]) as conn:
                 cursor = conn.cursor()
                 vocab = get_all_vocabulary(cursor)
                 words = extract_multilingual_tokens(q, vocab)

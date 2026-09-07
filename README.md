@@ -9,6 +9,25 @@ Inspired by Hermes Agent's multi-pillar memory architecture, using SQLite FTS5 f
 
 ---
 
+## 📑 Table of Contents
+
+- [The Big Picture: Autonomous Omni-Channel Stack](#-the-big-picture-autonomous-omni-channel-stack)
+- [The 4-Layer Cognitive Memory Model](#️-the-4-layer-cognitive-memory-model)
+- [Hybrid Multilingual Tokenizer vs. Vector Databases](#-hybrid-multilingual-tokenizer-vs-vector-databases)
+- [5-Minute Quickstart Guide for Newbies](#-5-minute-quickstart-guide-for-newbies)
+- [CLI Reference & Quick Commands](#-cli-reference--quick-commands)
+- [Model Context Protocol (MCP) Server](#-model-context-protocol-mcp-server)
+- [Seamless Integration with Antigravity Telegram Bot](#-seamless-integration-with-antigravity-telegram-bot)
+- [Configuration (`.env`)](#️-configuration-env)
+- [Real-Time Debug Web Dashboard](#-real-time-debug-web-dashboard)
+- [Autonomous Background Pipeline (Cron & Lifecycle Hooks)](#-autonomous-background-pipeline-cron--lifecycle-hooks)
+- [Testing](#-testing)
+- [Release Notes](#-release-notes)
+- [Roadmap](#️-roadmap)
+- [License](#-license)
+
+---
+
 ## 🧩 The Big Picture: Autonomous Omni-Channel Stack
 
 `agy-memory-engine` acts as the persistent semantic backbone across all client interfaces (Telegram, Terminal CLI, Web Cockpit, IDE):
@@ -387,6 +406,17 @@ python3 -m unittest discover tests/ -v
   - Semantic relation remapping and directional inversion (e.g. `hosts` -> `hosted_on`, `monitored_by` -> `monitors`).
   - Strict episode status normalization (`monitoring` -> `active`), topic mapping, and orphan link pruning.
   - FTS5 virtual table rebuilds and database vacuuming with `PRAGMA user_version = 210`.
+
+---
+
+## 🗺️ Roadmap
+
+- [ ] **Pluggable LLM Backends for Background Worker**:
+  - Abstract extraction & consolidation caller (`call_llm`) beyond `agy --print`.
+  - **Claude Code Compatibility**: Support Claude CLI (`claude -p`) as background extraction engine.
+  - **Direct Provider APIs**: Native lightweight connectors for Anthropic (e.g. Claude 3.5 Haiku) and OpenAI-compatible endpoints without external CLI dependencies.
+- [ ] **Multi-Agent Session Routing**: Dynamic extraction profile tagging per client/agent session.
+- [ ] **Selective Synced Subgraphs**: Export and sync filtered memory subsets across distributed nodes.
 
 ---
 

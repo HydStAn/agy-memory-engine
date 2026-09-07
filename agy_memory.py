@@ -1378,10 +1378,10 @@ def optimize_db(apply_changes: bool = False, age_decay: bool = True, consolidate
 compact_all = optimize_db
 
 
-def list_snapshots() -> list:
-    """List all available snapshots from ~/.gemini/archive with file metadata and record counts."""
+def list_snapshots(archive_dir: str = None) -> list:
+    """List all available snapshots with file metadata and record counts."""
     import glob
-    archive_dir = os.path.expanduser("~/.gemini/archive")
+    archive_dir = archive_dir or os.path.expanduser("~/.gemini/archive")
     if not os.path.exists(archive_dir):
         return []
 
