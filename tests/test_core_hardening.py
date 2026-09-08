@@ -48,13 +48,13 @@ class CoreHardeningTests(unittest.TestCase):
             live.commit()
             self.assertGreater(Path(self.db + '-wal').stat().st_size, 0)
             snap = memory.create_snapshot()
-            with sqlite3.connect(self.home / '.gemini/archive' / snap['filename']) as copy:
+            with sqlite3.connect(memory.archive_path(self.db) / snap['filename']) as copy:
                 self.assertEqual(copy.execute('SELECT fact FROM memories').fetchone()[0], 'committed in WAL')
             live.execute("UPDATE memories SET fact='later'")
             live.commit()
             restored = memory.restore_snapshot(snap['filename'])
             self.assertEqual(live.execute('SELECT fact FROM memories').fetchone()[0], 'committed in WAL')
-            with sqlite3.connect(self.home / '.gemini/archive' / restored['safety_backup']) as backup:
+            with sqlite3.connect(memory.archive_path(self.db) / restored['safety_backup']) as backup:
                 self.assertEqual(backup.execute('SELECT fact FROM memories').fetchone()[0], 'later')
 
     def test_backup_contention_is_bounded(self):
@@ -82,7 +82,7 @@ class CoreHardeningTests(unittest.TestCase):
             result = memory.optimize_db(False)
             self.assertEqual(result['memories'], 0)
             self.assertFalse(Path(fresh).exists())
-            self.assertFalse((self.home / '.gemini/archive').exists())
+            self.assertFalse((memory.archive_path(self.db)).exists())
             result = memory.optimize_db(True)
             self.assertTrue(result['applied'])
             self.assertTrue(Path(fresh).exists())
@@ -90,7 +90,7 @@ class CoreHardeningTests(unittest.TestCase):
 
     def test_corrupt_restore_preserves_target_and_archive(self):
         memory.upsert_fact('safe', 'infra', 'original')
-        archive = self.home / '.gemini/archive'
+        archive = memory.archive_path(self.db)
         archive.mkdir(parents=True)
         (archive / 'memory_db_backup_bad.bak').write_bytes(b'not sqlite')
         before = set(archive.iterdir())
@@ -247,7 +247,9 @@ class CoreHardeningTests(unittest.TestCase):
         from scripts.migrate_v2_to_v2_1 import map_relation
         self.assertEqual(map_relation('med', 'doctor', 'prescribed_by'), ('doctor', 'med', 'prescribes'))
         memory.upsert_fact('f', 'infrastructure', 'fact')
-        memory.upsert_learning('l', 'nonsense', 'insight')
+        with self.assertRaises(ValueError):
+            memory.upsert_learning('l', 'nonsense', 'insight')
+        memory.upsert_learning('l', 'general', 'insight')
         with schema.db_session() as conn:
             self.assertEqual(conn.execute('SELECT category FROM memories').fetchone()[0], 'infra')
             self.assertEqual(conn.execute('SELECT category FROM learnings').fetchone()[0], 'general')
@@ -292,7 +294,7 @@ class CoreHardeningTests(unittest.TestCase):
             result = json.loads(response['result']['content'][0]['text'])
             self.assertEqual(result['status'], 'success')
             self.assertFalse(result['stats']['applied'])
-            self.assertFalse((self.home / '.gemini/archive').exists())
+            self.assertFalse((memory.archive_path(self.db)).exists())
         finally:
             selector.close()
             process.terminate()
@@ -301,7 +303,7 @@ class CoreHardeningTests(unittest.TestCase):
     def test_mcp_optimization_stdout_guard(self):
         from agy_memory_mcp import optimize_memory
         output = io.StringIO()
-        with patch('agy_memory_mcp.optimize_db', side_effect=lambda **kw: print('legacy diagnostic')), redirect_stdout(output):
+        with redirect_stdout(output):
             result = json.loads(optimize_memory(False))
         self.assertEqual(result['status'], 'success')
         self.assertEqual(output.getvalue(), '')

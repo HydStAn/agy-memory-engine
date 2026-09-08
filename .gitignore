@@ -5,3 +5,9 @@
 __pycache__/
 *.pyc
 .env
+
+# Detached task artifacts and local runtime locks
+/tmp/
+*.sync.lock
+*.maintenance.lock
+*.worker.lock

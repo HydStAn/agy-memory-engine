@@ -1946,13 +1946,32 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             )
             return
 
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 1024 * 1024:
+            self._send_json({"status": "error", "message": "Request payload exceeds maximum allowed size (1MB)."}, status=413)
+            return
+
         url = urllib.parse.urlparse(self.path)
         if url.path == "/api/force-worker":
             import subprocess
             try:
                 worker_bin = BASE_DIR / "memory_worker.py"
-                res = subprocess.run([sys.executable, str(worker_bin), "--force"], capture_output=True, text=True, timeout=60)
-                self._send_json({"status": "ok", "message": res.stdout.strip() or "Queue processed successfully."})
+                res = subprocess.run([sys.executable, str(worker_bin), "--force"], capture_output=True, text=True, timeout=180)
+                output = (res.stdout or "").strip()
+                err = (res.stderr or "").strip()
+                if res.returncode == 0:
+                    self._send_json({"status": "ok", "message": output or "Queue processed successfully.", "returncode": 0})
+                else:
+                    self._send_json(
+                        {
+                            "status": "error",
+                            "message": err or output or f"Worker process exited with code {res.returncode}",
+                            "returncode": res.returncode
+                        },
+                        status=500
+                    )
+            except subprocess.TimeoutExpired as e:
+                self._send_json({"status": "error", "message": f"Worker process timed out after {e.timeout} seconds.", "timeout": e.timeout}, status=504)
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
             return
@@ -1973,14 +1992,23 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                     [sys.executable, str(main_bin), "optimize", "--apply"],
                     capture_output=True,
                     text=True,
-                    timeout=120
+                    timeout=240
                 )
                 output = (res.stdout or "").strip()
                 err = (res.stderr or "").strip()
                 if res.returncode == 0:
-                    self._send_json({"status": "ok", "message": output or "Database optimization completed successfully."})
+                    self._send_json({"status": "ok", "message": output or "Database optimization completed successfully.", "returncode": 0})
                 else:
-                    self._send_json({"status": "error", "message": err or output or f"Process exited with code {res.returncode}"}, status=500)
+                    self._send_json(
+                        {
+                            "status": "error",
+                            "message": err or output or f"Optimization exited with code {res.returncode}",
+                            "returncode": res.returncode
+                        },
+                        status=500
+                    )
+            except subprocess.TimeoutExpired as e:
+                self._send_json({"status": "error", "message": f"Optimization process timed out after {e.timeout} seconds.", "timeout": e.timeout}, status=504)
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
             return
@@ -1988,21 +2016,22 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
         if url.path == "/api/create-snapshot":
             try:
                 res = create_snapshot(tag="manual")
-                self._send_json(res)
+                status_code = 200 if res.get("status") == "ok" else 500
+                self._send_json(res, status=status_code)
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
             return
 
         if url.path == "/api/restore-snapshot":
             try:
-                length = int(self.headers.get("Content-Length", 0))
                 req_data = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
                 filename = req_data.get("filename")
                 if not filename:
                     self._send_json({"status": "error", "message": "Missing 'filename' in request."}, status=400)
                     return
                 res = restore_snapshot(filename)
-                self._send_json(res)
+                status_code = 200 if res.get("status") == "ok" else 500
+                self._send_json(res, status=status_code)
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
             return

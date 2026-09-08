@@ -111,13 +111,13 @@ class TestFactLifecycle(unittest.TestCase):
     def test_upsert_overwrites_existing(self):
         """Upsert should overwrite an existing fact with the same ID."""
         agy_memory.upsert_fact("test.key", "general", "Original value", "kw1")
-        agy_memory.upsert_fact("test.key", "updated_cat", "Updated value", "kw2")
+        agy_memory.upsert_fact("test.key", "software", "Updated value", "kw2")
         
         with schema.db_session(TEST_DB) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT category, fact, keywords FROM memories WHERE id = 'test.key'")
             row = cursor.fetchone()
-            self.assertEqual(row[0], "general")
+            self.assertEqual(row[0], "software")
             self.assertEqual(row[1], "Updated value")
             self.assertEqual(row[2], "kw2")
             
@@ -127,7 +127,7 @@ class TestFactLifecycle(unittest.TestCase):
 
     def test_unicode_umlauts_in_facts(self):
         """Facts with German umlauts and special characters should be stored and searchable."""
-        agy_memory.upsert_fact("test.umlaut", "test", "Zürich Höhenweg Strässchen", "zürich höhe ö ä ü")
+        agy_memory.upsert_fact("test.umlaut", "general", "Zürich Höhenweg Strässchen", "zürich höhe ö ä ü")
         
         with schema.db_session(TEST_DB) as conn:
             cursor = conn.cursor()
@@ -455,15 +455,19 @@ class TestEntityLinking(unittest.TestCase):
 
     def test_link_and_list_entities(self):
         """Test creating and listing directional entity links."""
+        for entity_id in ("infra.beelink", "service.immich", "service.jellyfin"):
+            agy_memory.upsert_fact(entity_id,"infra","entity node")
         agy_memory.link_entities("infra.beelink", "service.immich", "hosts")
         agy_memory.link_entities("infra.beelink", "service.jellyfin", "hosts")
         
         links = agy_memory.list_entity_links("infra.beelink")
         self.assertEqual(len(links), 2)
-        self.assertEqual(links[0], ("infra.beelink", "service.immich", "hosts"))
+        self.assertEqual(links[0], ("service.immich", "infra.beelink", "hosted_on"))
 
     def test_unlink_entities(self):
         """Test unlinking relations."""
+        for entity_id in ("user.stephan", "device.fenix8"):
+            agy_memory.upsert_fact(entity_id,"infra","entity node")
         agy_memory.link_entities("user.stephan", "device.fenix8", "owns")
         self.assertEqual(len(agy_memory.list_entity_links("user.stephan")), 1)
         
@@ -502,7 +506,7 @@ class TestEpisodeAging(unittest.TestCase):
     def test_episode_aging_transition(self):
         """Test that old episodes transition active -> cooling -> historic."""
         agy_memory.upsert_episode("ep.old_1", "travel", "Spain Trip", "Trip completed in June.", status="active")
-        agy_memory.upsert_episode("ep.old_2", "hardware", "TrueNAS Setup", "Setup cooled down.", status="cooling")
+        agy_memory.upsert_episode("ep.old_2", "infra", "TrueNAS Setup", "Setup cooled down.", status="cooling")
 
         # Manually backdate updated_at in database
         with schema.db_session(TEST_DB) as conn:
@@ -651,7 +655,7 @@ class TestMultilingualCompoundAndStemming(unittest.TestCase):
     def test_multilingual_prefetch_end_to_end(self):
         """End-to-end test verifying that multilingual compound and inflected queries match stored facts."""
         agy_memory.upsert_fact("insurance.dog.ch", "insurance", "Hundeversicherung bei der Helvetia Police 12345.", "hund versicherung helvetia")
-        agy_memory.upsert_fact("tax.sent.zweitwohnung", "tax", "Zweitwohnungssteuer in Sent ist 1.5 Promille.", "zweitwohnung steuer sent")
+        agy_memory.upsert_fact("tax.sent.zweitwohnung", "finance", "Zweitwohnungssteuer in Sent ist 1.5 Promille.", "zweitwohnung steuer sent")
         agy_memory.upsert_fact("travel.madrid.hotel", "travel", "Hotel Urban Madrid gebucht für Oktober.", "hotel madrid reservation")
 
         # 1. German compound query should match "Hundeversicherung" via "hund" + "versicherung"
@@ -758,7 +762,7 @@ class TestDashboardEndpoints(unittest.TestCase):
         self.assertIn(fname, fnames)
 
         # Cleanup test snapshot
-        archive_dir = os.path.expanduser("~/.gemini/archive")
+        archive_dir = str(agy_memory.archive_path(schema.DB_PATH))
         test_file = os.path.join(archive_dir, fname)
         if os.path.exists(test_file):
             os.remove(test_file)
@@ -851,7 +855,7 @@ class TestMigrationV2ToV21(unittest.TestCase):
             # Episode topic & status normalized
             topic, status = conn.execute("SELECT topic, status FROM episodes WHERE id = 'ep.home'").fetchone()
             self.assertEqual(topic, "home")
-            self.assertEqual(status, "active")
+            self.assertEqual(status, "monitoring")
 
             # Links: orphan pruned, relations canonicalized
             links = conn.execute("SELECT source_id, target_id, relation FROM entity_links").fetchall()
@@ -863,7 +867,7 @@ class TestMigrationV2ToV21(unittest.TestCase):
 
             # Check PRAGMA user_version
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 210)
+            self.assertEqual(version, schema.SCHEMA_VERSION)
 
         # Cleanup backup
         if report_live["backup_file"] and os.path.exists(report_live["backup_file"]):
@@ -899,7 +903,9 @@ class TestMCPServerTools(unittest.TestCase):
         self.assertIn("category: infra", res_fact)
 
         # Test record_episode status & topic normalization
-        res_ep = record_episode("ep.test", "stweg", "Condo meeting", "Discussed roof", status="monitoring")
+        with self.assertRaises(ValueError):
+            record_episode("ep.test", "stweg", "Condo meeting", "Discussed roof", status="monitoring")
+        res_ep = record_episode("ep.test", "stweg", "Condo meeting", "Discussed roof", status="active")
         self.assertIn("topic: home", res_ep)
         self.assertIn("status: active", res_ep)
 
@@ -908,6 +914,8 @@ class TestMCPServerTools(unittest.TestCase):
         self.assertIn("category: general", res_lrn)
 
         # Test link_entities_mcp mapping & direction inversion (beelink hosts immich -> immich hosted_on beelink)
+        store_memory("infra.beelink", "host", "infra")
+        store_memory("service.immich", "service", "software")
         res_link = link_entities_mcp("infra.beelink", "service.immich", "hosts")
         self.assertIn("'service.immich' --[hosted_on]--> 'infra.beelink'", res_link)
 

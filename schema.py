@@ -7,12 +7,18 @@ and synchronization triggers. Used by both the CLI engine and the MCP server.
 
 import os
 import sqlite3
+import fcntl
+import time
+from pathlib import Path
 from contextlib import contextmanager
 
 from config import DB_PATH
 
 # Protected categories that require explicit confirmation before overwrite in sync-turn
 PROTECTED_CATEGORIES = frozenset({"health", "finance", "pension", "insurance", "preferences", "user"})
+
+_SCHEMA_IDENTITIES = {}
+SCHEMA_VERSION = 211
 
 _SCHEMA_INITIALIZED = set()  # Track which DB paths have been initialized this process
 
@@ -185,23 +191,82 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     """)
 
 
+def _upgrade_schema(conn):
+    """Versioned, transactional migration to rowid mirrors and durable receipts."""
+    conn.execute("CREATE TABLE IF NOT EXISTS batch_receipts (batch_id TEXT PRIMARY KEY, result_json TEXT NOT NULL, committed_at TEXT DEFAULT CURRENT_TIMESTAMP)")
+    conn.execute("CREATE TABLE IF NOT EXISTS entity_revisions (entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(entity_type, entity_id))")
+    columns = {
+        'memories': 'id, category, fact, keywords',
+        'episodes': 'id, topic, title, narrative, entities, stance, keywords',
+        'learnings': 'id, category, insight, context, keywords',
+        'entity_links': 'source_id, target_id, relation',
+    }
+    for table, names in columns.items():
+        for suffix in ('ai', 'au', 'ad'):
+            conn.execute(f"DROP TRIGGER IF EXISTS trg_{table}_{suffix}")
+        values = ', '.join('new.' + name.strip() for name in names.split(','))
+        conn.execute(f"CREATE TRIGGER trg_{table}_ai AFTER INSERT ON {table} BEGIN INSERT INTO {table}_fts(rowid, {names}) VALUES(new.rowid, {values}); END")
+        conn.execute(f"CREATE TRIGGER trg_{table}_ad AFTER DELETE ON {table} BEGIN DELETE FROM {table}_fts WHERE rowid=old.rowid; END")
+        conn.execute(f"CREATE TRIGGER trg_{table}_au AFTER UPDATE ON {table} BEGIN DELETE FROM {table}_fts WHERE rowid=old.rowid; INSERT INTO {table}_fts(rowid, {names}) VALUES(new.rowid, {values}); END")
+        conn.execute(f"DELETE FROM {table}_fts")
+        conn.execute(f"INSERT INTO {table}_fts(rowid, {names}) SELECT rowid, {names} FROM {table}")
+        if table != 'entity_links':
+            conn.execute(f"INSERT OR IGNORE INTO entity_revisions SELECT '{table}', id, 1 FROM {table}")
+            for suffix, event, ref in (('ai', 'INSERT', 'new'), ('au', 'UPDATE', 'new'), ('ad', 'DELETE', 'old')):
+                conn.execute(f"CREATE TRIGGER IF NOT EXISTS rev_{table}_{suffix} AFTER {event} ON {table} BEGIN INSERT INTO entity_revisions VALUES('{table}', {ref}.id, 1) ON CONFLICT(entity_type,entity_id) DO UPDATE SET revision=revision+1; END")
+    for table in ('memories','episodes','learnings'):
+        conn.execute(f"CREATE TRIGGER IF NOT EXISTS rev_{table}_rename AFTER UPDATE OF id ON {table} WHEN old.id != new.id BEGIN INSERT INTO entity_revisions VALUES('{table}', old.id, 1) ON CONFLICT(entity_type,entity_id) DO UPDATE SET revision=revision+1; END")
+    conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+
+
+@contextmanager
+def maintenance_lock(db_path, exclusive=False, timeout=5):
+    """Coordinate restore with all current engine connections across processes."""
+    lock_path = Path(db_path).expanduser().resolve().with_suffix('.maintenance.lock')
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with lock_path.open('a') as handle:
+        deadline = time.monotonic() + timeout
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        while True:
+            try:
+                fcntl.flock(handle, operation | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError('Memory maintenance busy; retry after active clients finish')
+                time.sleep(0.025)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 @contextmanager
 def db_session(db_path: str = None):
-    """Open a SQLite connection with WAL mode and ensure schema is initialized.
-
-    Schema DDL is only executed once per process per database path to avoid
-    unnecessary overhead on every call.
-    """
-    path = db_path or DB_PATH
+    """Close on every path, and serialize schema bootstrap across processes."""
+    path = os.path.abspath(os.path.expanduser(db_path or DB_PATH))
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    conn = sqlite3.connect(path)
-    conn.execute("PRAGMA journal_mode=WAL;")
-
-    if path not in _SCHEMA_INITIALIZED:
-        _init_schema(conn)
-        _SCHEMA_INITIALIZED.add(path)
-
+    lock = maintenance_lock(path)
+    lock.__enter__()
+    conn = None
     try:
+        conn = sqlite3.connect(path, timeout=5)
+        identity = (os.stat(path).st_dev, os.stat(path).st_ino)
+        version = conn.execute('PRAGMA user_version').fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise RuntimeError(f'Unsupported memory schema version {version}')
+        if path not in _SCHEMA_INITIALIZED or _SCHEMA_IDENTITIES.get(path) != identity or version < SCHEMA_VERSION:
+            conn.execute('PRAGMA journal_mode=WAL')
+            with conn:
+                conn.execute('BEGIN IMMEDIATE')
+                version = conn.execute('PRAGMA user_version').fetchone()[0]
+                _init_schema(conn)
+                if version < SCHEMA_VERSION:
+                    _upgrade_schema(conn)
+            _SCHEMA_INITIALIZED.add(path)
+            _SCHEMA_IDENTITIES[path] = identity
         yield conn
     finally:
-        conn.close()
+        if conn is not None:
+            conn.close()
+        lock.__exit__(None, None, None)
