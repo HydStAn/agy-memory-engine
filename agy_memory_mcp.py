@@ -4,6 +4,8 @@ AGY Memory Engine - MCP Server Layer (FastMCP)
 Allows AGY to explicitly query, store, link entities, and manage multi-layer memories (Facts, Episodes, Learnings).
 """
 
+import sys
+from contextlib import redirect_stdout
 import json
 from mcp.server.fastmcp import FastMCP
 
@@ -311,10 +313,12 @@ def optimize_memory(apply_changes: bool = True, consolidate: bool = False) -> st
         consolidate: Run semantic LLM deduplication across facts (default: False).
     """
     try:
-        optimize_db(apply_changes=apply_changes, age_decay=True, consolidate=consolidate)
+        with redirect_stdout(sys.stderr):
+            stats = optimize_db(apply_changes=apply_changes, age_decay=True, consolidate=consolidate)
         return json.dumps({
             "status": "success",
-            "message": "Database optimization and FTS index rebuild completed successfully."
+            "message": "Database optimization completed." if apply_changes else "Optimization preview; no maintenance changes applied.",
+            "stats": stats
         }, ensure_ascii=False)
     except Exception as e:
         return json.dumps({"error": str(e)}, ensure_ascii=False)

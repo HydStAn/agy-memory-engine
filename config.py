@@ -75,5 +75,9 @@ SEND_TELEGRAM_BIN = Path(os.path.expanduser(
 # --- Real-Time Debug Dashboard ---
 DASHBOARD_ENABLED = get_config("AGY_MEMORY_DEBUG_DASHBOARD", "false").lower() in ("true", "1", "yes", "on")
 DASHBOARD_PORT = int(get_config("AGY_MEMORY_DASHBOARD_PORT", "8085"))
-DASHBOARD_HOST = get_config("AGY_MEMORY_DASHBOARD_HOST", "0.0.0.0")
+DASHBOARD_HOST = get_config("AGY_MEMORY_DASHBOARD_HOST", "127.0.0.1")
+DASHBOARD_TOKEN = get_config("AGY_MEMORY_DASHBOARD_TOKEN", "")
+DASHBOARD_TOKEN_PATH = os.path.expanduser(
+    get_config("AGY_MEMORY_DASHBOARD_TOKEN_PATH", str(Path.home() / ".gemini" / "dashboard.token"))
+)
 

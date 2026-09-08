@@ -22,6 +22,76 @@ except ImportError:
     enqueue_turn = None
 
 
+def resolve_transcript_path(payload: dict) -> Path | None:
+    """Resolve transcript.jsonl path across multiple possible brain directory roots."""
+    transcript_path = payload.get("transcriptPath")
+    if transcript_path and os.path.exists(transcript_path):
+        return Path(transcript_path)
+
+    conv_id = payload.get("conversationId")
+    if conv_id:
+        candidates = [
+            Path.home() / ".gemini" / "antigravity" / "brain" / conv_id / ".system_generated" / "logs" / "transcript.jsonl",
+            Path.home() / ".gemini" / "antigravity-cli" / "brain" / conv_id / ".system_generated" / "logs" / "transcript.jsonl",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+    return None
+
+
+def extract_latest_turn(transcript_path: Path | str) -> tuple[str, str]:
+    """
+    Extract latest user prompt and associated assistant response.
+    Stops backward scan at the latest USER_INPUT boundary and only associates
+    assistant responses that belong to that user turn.
+    Returns (user_prompt, assistant_response). If unanswered, returns (user_prompt, '').
+    """
+    try:
+        with open(transcript_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+    except Exception:
+        return "", ""
+
+    assistant_parts = []
+    saw_assistant_response = False
+    last_user_prompt = ""
+
+    for line in reversed(lines):
+        line_str = line.strip()
+        if not line_str:
+            continue
+        try:
+            data = json.loads(line_str)
+            msg_type = data.get("type")
+
+            if not last_user_prompt:
+                if msg_type in ("PLANNER_RESPONSE", "MODEL_RESPONSE"):
+                    saw_assistant_response = True
+                    resp = (data.get("content") or "").strip()
+                    if resp:
+                        assistant_parts.append(resp)
+                elif msg_type == "USER_INPUT":
+                    content = data.get("content", "")
+                    if "<USER_REQUEST>" in content:
+                        start = content.find("<USER_REQUEST>") + len("<USER_REQUEST>")
+                        end = content.find("</USER_REQUEST>")
+                        if end != -1:
+                            content = content[start:end].strip()
+                    last_user_prompt = content.strip()
+                    # Stop backward scan immediately at latest USER_INPUT boundary
+                    break
+        except Exception:
+            continue
+
+    if not last_user_prompt or not saw_assistant_response:
+        return last_user_prompt, ""
+
+    last_model_response = "\n\n".join(reversed(assistant_parts)).strip()
+
+    return last_user_prompt, last_model_response
+
+
 def main():
     try:
         payload_raw = sys.stdin.read()
@@ -37,55 +107,12 @@ def main():
     print(json.dumps({}))
     sys.stdout.flush()
 
-    transcript_path = payload.get("transcriptPath")
-    if not transcript_path or not os.path.exists(transcript_path):
-        conv_id = payload.get("conversationId")
-        if conv_id:
-            candidate = Path.home() / ".gemini" / "antigravity-cli" / "brain" / conv_id / ".system_generated" / "logs" / "transcript.jsonl"
-            if candidate.exists():
-                transcript_path = str(candidate)
-
-    if not transcript_path or not os.path.exists(transcript_path):
+    t_path = resolve_transcript_path(payload)
+    if not t_path:
         return
 
-    last_user_prompt = ""
-    last_model_response = ""
-
-    try:
-        with open(transcript_path, "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        for line in reversed(lines):
-            line_str = line.strip()
-            if not line_str:
-                continue
-            try:
-                data = json.loads(line_str)
-                # Look for user input
-                if not last_user_prompt and data.get("type") == "USER_INPUT":
-                    content = data.get("content", "")
-                    if "<USER_REQUEST>" in content:
-                        start = content.find("<USER_REQUEST>") + len("<USER_REQUEST>")
-                        end = content.find("</USER_REQUEST>")
-                        if end != -1:
-                            content = content[start:end].strip()
-                    last_user_prompt = content.strip()
-
-                # Look for planner / model response text
-                if not last_model_response and data.get("type") in ("PLANNER_RESPONSE", "MODEL_RESPONSE"):
-                    resp = data.get("content", "")
-                    if resp:
-                        last_model_response = resp.strip()
-
-                if last_user_prompt and last_model_response:
-                    break
-            except Exception:
-                continue
-
-    except Exception:
-        return
-
-    if not last_user_prompt:
+    last_user_prompt, last_model_response = extract_latest_turn(t_path)
+    if not last_user_prompt or not last_model_response:
         return
 
     # Guard 0: If AGY is running as part of an internal memory worker or extraction script, ignore
@@ -128,7 +155,7 @@ def main():
             user_prompt=last_user_prompt[:4000],
             assistant_response=last_model_response[:4000] if last_model_response else "Action executed successfully.",
             source=source,
-            chat_id=chat_id
+            chat_id=chat_id or conv_id or str(t_path.resolve())
         )
 
 

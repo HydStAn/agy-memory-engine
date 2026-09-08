@@ -12,6 +12,7 @@ import sys
 import fcntl
 import argparse
 import datetime
+import uuid
 import subprocess
 from pathlib import Path
 
@@ -33,7 +34,9 @@ from config import (
     SEND_TELEGRAM_BIN
 )
 
-LOCK_FILE = Path.home() / ".gemini" / "memory_worker.lock"
+from agy_memory import SyncBusyError, SyncExtractionError
+
+LOCK_FILE = Path(os.environ.get("AGY_WORKER_LOCK_PATH", str(Path.home() / ".gemini" / "memory_worker.lock")))
 
 
 def send_telegram_notification(message: str, chat_id: str = None) -> bool:
@@ -100,12 +103,12 @@ def format_notification(changes: dict) -> str:
     return "\n\n".join(lines).strip()
 
 
-def should_process_queue(force: bool = False) -> tuple[bool, str]:
+def should_process_queue(force: bool = False, db_path: str = QUEUE_DB_PATH) -> tuple[bool, str]:
     """Check if the calm-memory threshold conditions are satisfied."""
     if force:
         return True, "Forced run"
 
-    stats = get_pending_stats()
+    stats = get_pending_stats(db_path=db_path, retry_delay_seconds=60)
     count = stats["count"]
     if count == 0:
         return False, "Queue is empty"
@@ -124,59 +127,77 @@ def should_process_queue(force: bool = False) -> tuple[bool, str]:
     return False, f"Chat actively in progress (last message {newest_age}s ago, waiting for 5m idle)"
 
 
-def process_queue(batch_size: int = 25, notify: bool = True) -> int:
-    """Process pending conversation turns in a unified, contextual batch."""
-    pending = get_pending_turns(limit=batch_size)
+def process_queue(batch_size: int = 25, notify: bool = True, db_path: str = QUEUE_DB_PATH) -> int:
+    """Process pending conversation turns partitioned strictly by (source, chat_id)."""
+    pending = get_pending_turns(limit=batch_size, db_path=db_path, retry_delay_seconds=60)
     if not pending:
         return 0
 
-    turn_ids = [t["id"] for t in pending]
-    notification_chat_id = pending[-1]["chat_id"] if pending[-1].get("chat_id") else None
-    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    batch_id = f"batch_{now_str}"
-
-    dialogue_blocks = []
+    # Group pending turns by (source, chat_id) to avoid cross-chat dialogue mixing
+    groups: dict[tuple[str, str | None], list[dict]] = {}
     for turn in pending:
-        u = turn["user_prompt"].strip()
-        a = turn["assistant_response"].strip()
-        if is_trivial_prompt(u):
+        source_key = turn.get("source")
+        raw_chat = turn.get("chat_id")
+        chat_key = str(raw_chat) if raw_chat is not None else None
+        groups.setdefault((source_key, chat_key), []).append(turn)
+
+    now_str = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    for (source, chat_id), group_turns in groups.items():
+        group_turn_ids = [t["id"] for t in group_turns]
+        batch_id = f"batch_{now_str}_{uuid.uuid4().hex}"
+
+        dialogue_blocks = []
+        for turn in group_turns:
+            u = turn["user_prompt"].strip()
+            a = turn["assistant_response"].strip()
+            if is_trivial_prompt(u):
+                continue
+            dialogue_blocks.append(f"User: {u}\nAssistant: {a}")
+
+        if not dialogue_blocks:
+            mark_turn_status(group_turn_ids, status="skipped", summary="All turns trivial", batch_id=batch_id, db_path=db_path)
             continue
-        dialogue_blocks.append(f"User: {u}\nAssistant: {a}")
 
-    if not dialogue_blocks:
-        mark_turn_status(turn_ids, status="skipped", summary="All turns trivial", batch_id=batch_id)
-        prune_processed_turns(days=7)
-        return len(turn_ids)
+        combined_dialogue = "\n\n---\n\n".join(dialogue_blocks)
 
-    combined_dialogue = "\n\n---\n\n".join(dialogue_blocks)
+        try:
+            changes = sync_turn(
+                user_prompt=combined_dialogue,
+                assistant_response="Conversation batch complete.",
+                dry_run=False
+            )
 
-    try:
-        changes = sync_turn(
-            user_prompt=combined_dialogue,
-            assistant_response="Conversation batch complete.",
-            dry_run=False
-        )
+            keys = ("facts", "episodes", "learnings", "entity_links")
+            if not isinstance(changes, dict) or any(not isinstance(changes.get(key), list) for key in keys):
+                raise SyncExtractionError("sync_turn did not confirm a successful extraction")
 
-        has_changes = any(bool(changes.get(k)) for k in ["facts", "episodes", "learnings", "entity_links"])
-        summary_parts = []
-        if changes.get("facts"): summary_parts.append(f"{len(changes['facts'])} facts")
-        if changes.get("episodes"): summary_parts.append(f"{len(changes['episodes'])} episodes")
-        if changes.get("learnings"): summary_parts.append(f"{len(changes['learnings'])} learnings")
-        if changes.get("entity_links"): summary_parts.append(f"{len(changes['entity_links'])} links")
+            has_changes = any(bool(changes.get(k)) for k in ["facts", "episodes", "learnings", "entity_links"])
+            summary_parts = []
+            if changes.get("facts"): summary_parts.append(f"{len(changes['facts'])} facts")
+            if changes.get("episodes"): summary_parts.append(f"{len(changes['episodes'])} episodes")
+            if changes.get("learnings"): summary_parts.append(f"{len(changes['learnings'])} learnings")
+            if changes.get("entity_links"): summary_parts.append(f"{len(changes['entity_links'])} links")
 
-        summary = ", ".join(summary_parts) if summary_parts else "No persistent entities found"
-        mark_turn_status(turn_ids, status="processed", summary=summary, batch_id=batch_id)
+            summary = ", ".join(summary_parts) if summary_parts else "No persistent entities found"
+            mark_turn_status(group_turn_ids, status="processed", summary=summary, batch_id=batch_id, db_path=db_path)
 
-        if has_changes and notify:
-            msg = format_notification(changes)
-            send_telegram_notification(msg, chat_id=notification_chat_id)
+            # Notification is sent ONLY for telegram source and when chat_id is present
+            if has_changes and notify and source == "telegram" and chat_id:
+                msg = format_notification(changes)
+                if msg:
+                    try:
+                        send_telegram_notification(msg, chat_id=str(chat_id))
+                    except Exception as error:
+                        sys.stderr.write(f"Notification delivery failed: {error}\n")
 
-    except Exception as e:
-        sys.stderr.write(f"Error during batch sync: {e}\n")
-        mark_turn_status(turn_ids, status="failed", error=str(e), batch_id=batch_id)
+        except Exception as e:
+            sys.stderr.write(f"Error during batch sync for ({source}, {chat_id}): {e}\n")
+            # F03: Retain pending status with error message and timestamp; do NOT discard or mark processed
+            mark_turn_status(group_turn_ids, status="pending", error=str(e), batch_id=batch_id, db_path=db_path)
 
-    prune_processed_turns(days=7)
-    return len(turn_ids)
+    prune_processed_turns(days=7, db_path=db_path)
+    return len(pending)
 
 
 def main():

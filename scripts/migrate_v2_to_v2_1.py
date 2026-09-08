@@ -15,7 +15,6 @@ comply with the canonical taxonomy standards introduced in v2.1.0:
 
 import argparse
 import os
-import shutil
 import sqlite3
 import sys
 from datetime import datetime
@@ -28,40 +27,17 @@ if PARENT_DIR not in sys.path:
     sys.path.insert(0, PARENT_DIR)
 
 from config import DB_PATH
+import schema
 from schema import db_session
 
-# v2.1 Canonical Taxonomies
-CANONICAL_FACT_CATEGORIES = frozenset({
-    "infra", "hardware", "software", "contacts", "family", "health", "fitness",
-    "finance", "insurance", "travel", "home", "media", "music", "work", "dev",
-    "preferences", "communication", "cloud", "security", "general"
-})
+from agy_memory import (
+    CANONICAL_FACT_CATEGORIES, CANONICAL_LEARNING_CATEGORIES,
+    CANONICAL_EPISODE_TOPICS, CANONICAL_RELATIONS,
+    _CATEGORY_ALIASES as CATEGORY_ALIASES, _normalize_category as normalize_category,
+    online_backup, rebuild_fts,
+)
+CANONICAL_EPISODE_STATUSES = frozenset({"active", "cooling", "historic", "resolved"})
 
-CANONICAL_LEARNING_CATEGORIES = frozenset({
-    "workflow", "communication", "finance", "health", "shopping", "travel",
-    "hardware", "safety", "architecture", "security", "automation", "general"
-})
-
-CANONICAL_EPISODE_TOPICS = frozenset({
-    "family", "health", "travel", "finance", "home", "dev", "infra",
-    "insurance", "music", "work", "realestate", "trading", "general"
-})
-
-CANONICAL_EPISODE_STATUSES = frozenset({
-    "active", "cooling", "historic", "resolved"
-})
-
-CANONICAL_RELATIONS = frozenset({
-    "hosted_on", "runs_on", "depends_on", "part_of", "member_of",
-    "owned_by", "managed_by", "monitors", "treats", "prescribed_for",
-    "insured_by", "finances", "communicates_via", "located_at", "uses",
-    "stores", "connects_to", "related_to", "maintains", "created_by",
-    "delivers_to", "advises", "works_at", "lives_at", "travels_to",
-    "subscribed_to"
-})
-
-# Direct semantic mapping for legacy relations (source, target, old_rel) -> (new_source, new_target, new_rel)
-# True in 2nd tuple element indicates inverted direction: (target, source, new_rel)
 RELATION_MAPPINGS: Dict[str, Tuple[str, bool]] = {
     # Direct mappings
     "runs_in": ("runs_on", False),
@@ -91,41 +67,12 @@ RELATION_MAPPINGS: Dict[str, Tuple[str, bool]] = {
     "subscribed": ("subscribed_to", False),
     "consults": ("advises", True),             # A consults B -> B advises A
     "treated_by": ("treats", True),            # A treated_by B -> B treats A
-    "prescribed_by": ("prescribed_for", True), # Med prescribed_by Doc -> Doc prescribed_for Med
+    "prescribed_by": ("prescribes", True), # Med prescribed_by Doc -> Doc prescribes Med
     "insured_at": ("insured_by", False),
     "stored_in": ("stores", True),             # Item stored_in Location -> Location stores Item
     "resides_in": ("located_at", False),
     "situated_at": ("located_at", False),
 }
-
-# Category Aliases
-CATEGORY_ALIASES = {
-    "contact": "contacts", "kontakte": "contacts",
-    "infrastructure": "infra", "system_architecture": "infra", "system_config": "infra",
-    "admin": "infra", "config": "infra",
-    "pref": "preferences", "user": "preferences",
-    "pension": "finance", "trading": "finance", "stweg": "home",
-    "gear": "hardware", "tesla": "hardware",
-    "devsecops": "dev", "dev.cron": "automation",
-    "heuristics": "general", "ai_tools": "software", "ai": "dev",
-    "ui_ux": "architecture", "network": "infra",
-    "realestate": "home", "calendar": "general",
-}
-
-
-def normalize_category(category: str, allowed: frozenset) -> str:
-    """Normalize a category string to the closest canonical taxonomy entry."""
-    if not category:
-        return "general"
-    cat = category.strip().lower()
-    if cat in allowed:
-        return cat
-    if cat in CATEGORY_ALIASES:
-        alias = CATEGORY_ALIASES[cat]
-        if alias in allowed:
-            return alias
-    return "general"
-
 
 def map_relation(source: str, target: str, rel: str) -> Tuple[str, str, str]:
     """
@@ -151,9 +98,9 @@ def create_safety_backup(db_path: str) -> str:
     """Create a safety snapshot backup before applying migration changes."""
     backup_dir = os.path.expanduser("~/.gemini/archive")
     os.makedirs(backup_dir, exist_ok=True)
-    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    ts = datetime.now().strftime("%Y-%m-%d_%H%M%S_%f")
     backup_path = os.path.join(backup_dir, f"memory_db_v2.0_to_v2.1_migration_{ts}.bak")
-    shutil.copy2(db_path, backup_path)
+    online_backup(db_path, backup_path)
     return backup_path
 
 
@@ -161,7 +108,7 @@ def run_migration(db_path: str = None, dry_run: bool = False, verbose: bool = Tr
     """
     Execute migration from v2.0 to v2.1.
     """
-    target_db = db_path or DB_PATH
+    target_db = db_path or schema.DB_PATH
     if not os.path.exists(target_db):
         raise FileNotFoundError(f"Database file not found: {target_db}")
 
@@ -276,10 +223,7 @@ def run_migration(db_path: str = None, dry_run: bool = False, verbose: bool = Tr
             cursor.execute("PRAGMA user_version = 210;")
             
             # Rebuild FTS5 virtual tables to ensure index coherence
-            cursor.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")
-            cursor.execute("INSERT INTO episodes_fts(episodes_fts) VALUES('rebuild');")
-            cursor.execute("INSERT INTO learnings_fts(learnings_fts) VALUES('rebuild');")
-            cursor.execute("INSERT INTO entity_links_fts(entity_links_fts) VALUES('rebuild');")
+            rebuild_fts(conn)
             conn.commit()
 
             cursor.execute("VACUUM;")

@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from config import DB_PATH
 
 # Protected categories that require explicit confirmation before overwrite in sync-turn
-PROTECTED_CATEGORIES = frozenset({"health", "finance", "pension", "insurance", "user"})
+PROTECTED_CATEGORIES = frozenset({"health", "finance", "pension", "insurance", "preferences", "user"})
 
 _SCHEMA_INITIALIZED = set()  # Track which DB paths have been initialized this process
 
