@@ -246,6 +246,70 @@ def enqueue_turn(
         with _get_connection(db_path, timeout=5.0, isolation_level=None) as conn:
             conn.execute("BEGIN IMMEDIATE")
             try:
+                # BR05: Atomically update unbatched pending turns on repeated Stop events,
+                # or record a continuation revision if earlier turn was already claimed/processed.
+                if event_id is not None:
+                    row = conn.execute(
+                        "SELECT id, status, batch_id, assistant_response, user_prompt FROM turn_queue WHERE hash = ?",
+                        (content_hash,)
+                    ).fetchone()
+                    if row:
+                        ex_id, ex_status, ex_batch_id, ex_resp, ex_prompt = row
+                        clean_user = user_prompt.strip()
+                        clean_resp = assistant_response.strip()
+                        # Exact duplicate - deduplicate cleanly
+                        if ex_resp == clean_resp and ex_prompt == clean_user:
+                            conn.execute("COMMIT")
+                            return True
+                        # Turn is still pending and unbatched - atomically update with expanded response
+                        if ex_status == 'pending' and ex_batch_id is None:
+                            conn.execute(
+                                "UPDATE turn_queue SET user_prompt = ?, assistant_response = ? WHERE id = ?",
+                                (clean_user, clean_resp, ex_id)
+                            )
+                            conn.execute("COMMIT")
+                            return True
+                        # Turn was already claimed or processed: record a continuation revision
+                        rev = 2
+                        while True:
+                            cont_event_id = f"{event_id}:rev{rev}"
+                            cont_hash = make_content_hash(
+                                source=source,
+                                chat_id=chat_id,
+                                user_prompt=user_prompt,
+                                assistant_response=assistant_response,
+                                event_id=cont_event_id
+                            )
+                            cont_row = conn.execute(
+                                "SELECT id, status, batch_id, assistant_response FROM turn_queue WHERE hash = ?",
+                                (cont_hash,)
+                            ).fetchone()
+                            if not cont_row:
+                                conn.execute("""
+                                    INSERT INTO turn_queue (hash, source, chat_id, user_prompt, assistant_response, status, event_id)
+                                    VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                                """, (
+                                    cont_hash,
+                                    source,
+                                    str(chat_id) if chat_id is not None else None,
+                                    clean_user,
+                                    clean_resp,
+                                    cont_event_id
+                                ))
+                                conn.execute("COMMIT")
+                                return True
+                            if cont_row[3] == clean_resp:
+                                conn.execute("COMMIT")
+                                return True
+                            if cont_row[1] == 'pending' and cont_row[2] is None:
+                                conn.execute(
+                                    "UPDATE turn_queue SET assistant_response = ? WHERE id = ?",
+                                    (clean_resp, cont_row[0])
+                                )
+                                conn.execute("COMMIT")
+                                return True
+                            rev += 1
+
                 conn.execute("""
                     INSERT INTO turn_queue (hash, source, chat_id, user_prompt, assistant_response, status, event_id)
                     VALUES (?, ?, ?, ?, ?, 'pending', ?)
@@ -273,11 +337,13 @@ def claim_batch(
     batch_size: int = 25,
     lease_duration_seconds: int = 300,
     retry_delay_seconds: int = 60,
+    prefer_fresh: bool = False,
+    exclude_batch_ids: list[str] | set[str] | None = None,
     db_path: str = QUEUE_DB_PATH
 ) -> BatchClaim | None:
     """Atomically claim a batch of turns partitioned strictly by (source, chat_id).
 
-    Expired claimed leases are recovered first with identical membership and batch_id.
+    Supports interleaving fresh turns and retry claims, and skipping specified batch IDs.
     """
     ensure_queue_db(db_path)
     with _get_connection(db_path, timeout=10.0, isolation_level=None) as conn:
@@ -286,19 +352,28 @@ def claim_batch(
             queue_id = _get_queue_identity_conn(conn)
             cursor = conn.cursor()
 
-            # 1. Check for expired claimed batches (crashed lease recovery)
-            cursor.execute("""
-                SELECT batch_id, source, chat_id
-                FROM turn_queue
-                WHERE batch_id IS NOT NULL AND (
-                    (status = 'claimed' AND lease_expires_at IS NOT NULL AND datetime(lease_expires_at) <= datetime('now'))
-                    OR (status = 'pending' AND processed_at <= datetime('now', '-' || ? || ' seconds'))
-                  )
-                ORDER BY lease_expires_at ASC
-                LIMIT 1;
-            """, (retry_delay_seconds,))
-            expired_row = cursor.fetchone()
-            if expired_row:
+            def _try_claim_retries():
+                exclude_sql = ""
+                params = [retry_delay_seconds]
+                if exclude_batch_ids:
+                    ph = ",".join("?" for _ in exclude_batch_ids)
+                    exclude_sql = f"AND batch_id NOT IN ({ph})"
+                    params.extend(list(exclude_batch_ids))
+
+                cursor.execute(f"""
+                    SELECT batch_id, source, chat_id
+                    FROM turn_queue
+                    WHERE batch_id IS NOT NULL AND (
+                        (status = 'claimed' AND lease_expires_at IS NOT NULL AND datetime(lease_expires_at) <= datetime('now'))
+                        OR (status = 'pending' AND (processed_at IS NULL OR datetime(processed_at) <= datetime('now', '-' || ? || ' seconds')))
+                      )
+                      {exclude_sql}
+                    ORDER BY lease_expires_at ASC, processed_at ASC
+                    LIMIT 1;
+                """, tuple(params))
+                expired_row = cursor.fetchone()
+                if not expired_row:
+                    return None
                 exp_batch_id, exp_source, exp_chat_id = expired_row
                 cursor.execute("""
                     SELECT id, hash, source, chat_id, user_prompt, assistant_response, created_at, batch_id, attempt_count
@@ -338,77 +413,100 @@ def claim_batch(
                         "chat_id": exp_chat_id,
                         "turns": turns
                     })
-
-            # 2. Find oldest eligible pending turn to identify target partition
-            cursor.execute("""
-                SELECT source, chat_id
-                FROM turn_queue
-                WHERE status = 'pending' AND batch_id IS NULL
-                  AND (error IS NULL OR processed_at IS NULL OR datetime(processed_at) <= datetime('now', '-' || ? || ' seconds'))
-                ORDER BY CASE WHEN error IS NULL THEN 0 ELSE 1 END, processed_at ASC, id ASC
-                LIMIT 1;
-            """, (retry_delay_seconds,))
-            target_row = cursor.fetchone()
-            if not target_row:
-                conn.execute("COMMIT")
                 return None
 
-            target_source, target_chat_id = target_row
+            def _try_claim_fresh():
+                cursor.execute("""
+                    SELECT source, chat_id
+                    FROM turn_queue
+                    WHERE status = 'pending' AND batch_id IS NULL
+                      AND (error IS NULL OR processed_at IS NULL OR datetime(processed_at) <= datetime('now', '-' || ? || ' seconds'))
+                    ORDER BY CASE WHEN error IS NULL THEN 0 ELSE 1 END, processed_at ASC, id ASC
+                    LIMIT 1;
+                """, (retry_delay_seconds,))
+                target_row = cursor.fetchone()
+                if not target_row:
+                    return None
 
-            # 3. Select eligible pending turns strictly for this partition
-            cursor.execute("""
-                SELECT id, hash, source, chat_id, user_prompt, assistant_response, created_at, batch_id, attempt_count
-                FROM turn_queue
-                WHERE status = 'pending' AND batch_id IS NULL
-                  AND source IS ?
-                  AND chat_id IS ?
-                  AND (error IS NULL OR processed_at IS NULL OR datetime(processed_at) <= datetime('now', '-' || ? || ' seconds'))
-                ORDER BY id ASC
-                LIMIT ?;
-            """, (target_source, target_chat_id, retry_delay_seconds, batch_size))
-            rows = cursor.fetchall()
-            if not rows:
+                target_source, target_chat_id = target_row
+
+                cursor.execute("""
+                    SELECT id, hash, source, chat_id, user_prompt, assistant_response, created_at, batch_id, attempt_count
+                    FROM turn_queue
+                    WHERE status = 'pending' AND batch_id IS NULL
+                      AND source IS ?
+                      AND chat_id IS ?
+                      AND (error IS NULL OR processed_at IS NULL OR datetime(processed_at) <= datetime('now', '-' || ? || ' seconds'))
+                    ORDER BY id ASC
+                    LIMIT ?;
+                """, (target_source, target_chat_id, retry_delay_seconds, batch_size))
+                rows = cursor.fetchall()
+                if not rows:
+                    return None
+
+                turns = [{
+                    "id": r[0],
+                    "hash": r[1],
+                    "source": r[2],
+                    "chat_id": r[3],
+                    "user_prompt": r[4],
+                    "assistant_response": r[5],
+                    "created_at": r[6],
+                    "batch_id": r[7],
+                    "attempt_count": r[8] or 0
+                } for r in rows]
+
+                batch_id = compute_batch_id(queue_id, turns)
+                new_lease_token = uuid.uuid4().hex
+                turn_ids = [t["id"] for t in turns]
+                placeholders = ",".join("?" for _ in turn_ids)
+
+                cursor.execute(f"""
+                    UPDATE turn_queue
+                    SET status = 'claimed',
+                        batch_id = ?,
+                        lease_token = ?,
+                        lease_expires_at = datetime('now', '+' || ? || ' seconds'),
+                        attempt_count = COALESCE(attempt_count, 0) + 1
+                    WHERE id IN ({placeholders})
+                      AND status = 'pending'
+                      AND batch_id IS NULL;
+                """, [batch_id, new_lease_token, lease_duration_seconds] + turn_ids)
+
+                if cursor.rowcount != len(turn_ids):
+                    conn.execute("ROLLBACK")
+                    return None
+
+                for t in turns:
+                    t["batch_id"] = batch_id
+                    t["attempt_count"] = (t["attempt_count"] or 0) + 1
+
                 conn.execute("COMMIT")
-                return None
+                return BatchClaim({
+                    "batch_id": batch_id,
+                    "lease_token": new_lease_token,
+                    "source": target_source,
+                    "chat_id": target_chat_id,
+                    "turns": turns
+                })
 
-            turns = [{
-                "id": r[0],
-                "hash": r[1],
-                "source": r[2],
-                "chat_id": r[3],
-                "user_prompt": r[4],
-                "assistant_response": r[5],
-                "created_at": r[6],
-                "batch_id": r[7],
-                "attempt_count": r[8] or 0
-            } for r in rows]
-
-            batch_id = compute_batch_id(queue_id, turns)
-            new_lease_token = uuid.uuid4().hex
-            turn_ids = [t["id"] for t in turns]
-            placeholders = ",".join("?" for _ in turn_ids)
-
-            cursor.execute(f"""
-                UPDATE turn_queue
-                SET status = 'claimed',
-                    batch_id = ?,
-                    lease_token = ?,
-                    lease_expires_at = datetime('now', '+' || ? || ' seconds'),
-                    attempt_count = COALESCE(attempt_count, 0) + 1
-                WHERE id IN ({placeholders});
-            """, [batch_id, new_lease_token, lease_duration_seconds] + turn_ids)
-
-            for t in turns:
-                t["batch_id"] = batch_id
+            if prefer_fresh:
+                claim = _try_claim_fresh()
+                if claim:
+                    return claim
+                claim = _try_claim_retries()
+                if claim:
+                    return claim
+            else:
+                claim = _try_claim_retries()
+                if claim:
+                    return claim
+                claim = _try_claim_fresh()
+                if claim:
+                    return claim
 
             conn.execute("COMMIT")
-            return BatchClaim({
-                "batch_id": batch_id,
-                "lease_token": new_lease_token,
-                "source": target_source,
-                "chat_id": target_chat_id,
-                "turns": turns
-            })
+            return None
         except Exception:
             conn.execute("ROLLBACK")
             raise
@@ -462,7 +560,7 @@ def release_batch(
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE turn_queue
-                SET status = 'pending',
+                SET status = CASE WHEN COALESCE(attempt_count, 0) >= 10 THEN 'failed' ELSE 'pending' END,
                     error = ?,
                     processed_at = CURRENT_TIMESTAMP,
                     lease_token = NULL,

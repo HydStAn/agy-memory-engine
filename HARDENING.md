@@ -47,7 +47,17 @@ The dashboard defaults to `127.0.0.1`. Mutations require the local bearer token 
 | F21 | Neutral owner prompts, consistent explicit consolidation, configured model/cache, database-specific locks/archives and loopback example config. |
 | F22 | Temporary test environment, unswallowed assertions, protocol tests, WAL recovery, claims and commit/ack crash checks. Hermetic actual-engine benchmark reports failures in its denominator and exits nonzero on failure. |
 
-The legacy `test_authoritative_verification.py` invokes 22 existing tests again. Its test count is not 22 independent demonstrations and its original finding names do not cover every audit requirement. The table above and actual regression assertions define the evidence. Test success does not establish live service wiring, production data parity, provider availability, browser rendering, power-loss recovery, or a production soak test.
+## Blind Review Remediations (BR01-BR05)
+
+| ID | Finding & Remediation | Test Coverage |
+|---|---|---|
+| BR01 | Padded consolidation target/source ID normalization, strict target exclusion from deletion sets, and post-merge target existence assertions. | `tests/test_blind_review_remediations.py` (`test_br01_*`) |
+| BR02 | Dashboard unauthenticated GET / returns 401 without disclosing token; authentication required before serving token-bearing HTML or mutating endpoints. | `tests/test_blind_review_remediations.py` (`test_br02_*`), `tests/test_dashboard_hook_hardening.py` |
+| BR03 | Interleaved claim scheduling and invocation-level retry tracking to reserve capacity for fresh unbatched turns under heavy retry backlogs. | `tests/test_blind_review_remediations.py` (`test_br03_*`) |
+| BR04 | Database generation token fencing across snapshot restores to reject in-flight stale extraction commits. | `tests/test_blind_review_remediations.py` (`test_br04_*`) |
+| BR05 | In-place atomic expansion of pending unbatched turns and versioned continuation revisions on repeated Stop hook events. | `tests/test_blind_review_remediations.py` (`test_br05_*`) |
+
+The legacy `test_authoritative_verification.py` invokes 22 existing tests again. Its test count is not 22 independent demonstrations and its original finding names do not cover every audit requirement. The tables above and actual regression assertions define the evidence. Test success does not establish live service wiring, production data parity, provider availability, browser rendering, power-loss recovery, or a production soak test.
 
 Run:
 
@@ -55,3 +65,4 @@ Run:
 .venv/bin/python -m unittest discover -s tests
 .venv/bin/python tests/benchmark_load_test.py
 ```
+

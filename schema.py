@@ -9,6 +9,7 @@ import os
 import sqlite3
 import fcntl
 import time
+import uuid
 from pathlib import Path
 from contextlib import contextmanager
 
@@ -190,11 +191,47 @@ def _init_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_consolidation_log_ts ON consolidation_log(timestamp DESC);
     """)
 
+    # --- Feature 6: Database Generation Fencing across Restores ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS meta_generation (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+    """)
+    conn.execute("INSERT OR IGNORE INTO meta_generation(key, value) VALUES ('generation', ?);", (uuid.uuid4().hex,))
+
+
+def get_db_generation(conn: sqlite3.Connection) -> str:
+    """Retrieve current database generation token for fencing stale extractions across restores."""
+    try:
+        row = conn.execute("SELECT value FROM meta_generation WHERE key='generation'").fetchone()
+        if row and row[0]:
+            return row[0]
+    except sqlite3.OperationalError:
+        pass
+    gen = uuid.uuid4().hex
+    try:
+        conn.execute("CREATE TABLE IF NOT EXISTS meta_generation (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+        conn.execute("INSERT OR REPLACE INTO meta_generation(key, value) VALUES ('generation', ?);", (gen,))
+    except Exception:
+        pass
+    return gen
+
+
+def bump_db_generation(conn: sqlite3.Connection) -> str:
+    """Increment/regenerate database generation token on database restore."""
+    gen = uuid.uuid4().hex
+    conn.execute("CREATE TABLE IF NOT EXISTS meta_generation (key TEXT PRIMARY KEY, value TEXT NOT NULL);")
+    conn.execute("INSERT OR REPLACE INTO meta_generation(key, value) VALUES ('generation', ?);", (gen,))
+    return gen
+
 
 def _upgrade_schema(conn):
     """Versioned, transactional migration to rowid mirrors and durable receipts."""
     conn.execute("CREATE TABLE IF NOT EXISTS batch_receipts (batch_id TEXT PRIMARY KEY, result_json TEXT NOT NULL, committed_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     conn.execute("CREATE TABLE IF NOT EXISTS entity_revisions (entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(entity_type, entity_id))")
+    conn.execute("CREATE TABLE IF NOT EXISTS meta_generation (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    conn.execute("INSERT OR IGNORE INTO meta_generation(key, value) VALUES ('generation', ?)", (uuid.uuid4().hex,))
     columns = {
         'memories': 'id, category, fact, keywords',
         'episodes': 'id, topic, title, narrative, entities, stance, keywords',

@@ -28,6 +28,7 @@ import unittest
 from http.server import HTTPServer
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError
+import urllib.parse
 
 # Add project root to sys.path
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -265,16 +266,23 @@ class TestDashboardHttpServer(unittest.TestCase):
     def test_token_is_safe_inside_script(self):
         payload = '</script><img src=x onerror=alert(1)>'
         with patch.dict(os.environ, {"AGY_MEMORY_DASHBOARD_TOKEN": payload}):
-            status, _, body = self._get("/")
+            status, _, body = self._get(f"/?token={urllib.parse.quote(payload)}")
         self.assertEqual(status, 200)
         self.assertNotIn(payload, body)
         self.assertIn('\\u003c/script>', body)
 
+    def test_unauthenticated_get_does_not_disclose_token(self):
+        """BR02: Unauthenticated GET / must return 401 and never disclose secret token."""
+        status, _, body = self._get("/")
+        self.assertEqual(status, 401)
+        self.assertNotIn(self.token, body)
+        self.assertNotIn("const DASHBOARD_TOKEN =", body)
+
     def test_browser_token_usability(self):
-        """F08: GET / serves HTML with embedded token and fetch POST calls supply token."""
-        status, _, html = self._get("/")
+        """F08 / BR02: Authenticated GET / serves HTML with embedded token and fetch POST calls supply token."""
+        status, _, html = self._get(f"/?token={self.token}")
         self.assertEqual(status, 200)
-        # Token must be embedded for dashboard browser scripts
+        # Token must be embedded for authenticated dashboard browser scripts
         self.assertIn(f'const DASHBOARD_TOKEN = "{self.token}";', html)
         self.assertNotIn("{{DASHBOARD_TOKEN}}", html)
 

@@ -1879,6 +1879,19 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             if token_list:
                 token = token_list[0].strip()
 
+        # Cookie: dashboard_token=<token>
+        if not token:
+            cookie_header = self.headers.get("Cookie", "")
+            if cookie_header:
+                import http.cookies
+                try:
+                    c = http.cookies.SimpleCookie()
+                    c.load(cookie_header)
+                    if "dashboard_token" in c:
+                        token = c["dashboard_token"].value.strip()
+                except Exception:
+                    pass
+
         if token and hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
             return True
 
@@ -1907,9 +1920,28 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
         params = urllib.parse.parse_qs(url.query)
 
         if path == "/" or path == "/index.html":
+            if not self._verify_auth():
+                self._send_html(
+                    "<!DOCTYPE html><html><head><title>401 Unauthorized</title></head>"
+                    "<body><h1>401 Unauthorized</h1>"
+                    "<p>Missing or invalid dashboard token. Provide token via ?token=&lt;token&gt; or Authorization header.</p>"
+                    "</body></html>",
+                    status=401
+                )
+                return
             token = get_or_create_dashboard_token()
             rendered = HTML_TEMPLATE.replace("{{DASHBOARD_TOKEN}}", json.dumps(token).replace("<", "\\u003c"))
-            self._send_html(rendered)
+            body = rendered.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Set-Cookie", f"dashboard_token={token}; Path=/; SameSite=Strict; HttpOnly")
+            self.send_header("Content-Length", str(len(body)))
+            self._set_cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         if path == "/favicon.ico":

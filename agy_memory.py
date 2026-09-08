@@ -840,6 +840,7 @@ def _sync_turn_inner(user_prompt: str, assistant_response: str, dry_run: bool = 
             if receipt:
                 return json.loads(receipt[0])
         revisions = {(kind, key): rev for kind, key, rev in conn.execute('SELECT * FROM entity_revisions')}
+        db_gen = schema.get_db_generation(conn)
     if is_trivial_prompt(user_prompt):
         if batch_id and not dry_run:
             with db_session() as conn, conn:
@@ -960,6 +961,8 @@ Output ONLY a single valid JSON object (or {{"facts":[], "episodes":[], "learnin
             with db_session() as transaction, transaction:
                 if not dry_run:
                     transaction.execute("BEGIN IMMEDIATE")
+                    if schema.get_db_generation(transaction) != db_gen:
+                        raise SyncExtractionError("Database generation changed during inference; aborting stale commit")
                     if batch_id:
                         receipt = transaction.execute('SELECT result_json FROM batch_receipts WHERE batch_id=?', (batch_id,)).fetchone()
                         if receipt:
@@ -1125,6 +1128,7 @@ def consolidate_memories(dry_run: bool = False) -> list:
         cursor.execute("SELECT id, category, fact, keywords FROM memories ORDER BY category, id")
         all_facts = cursor.fetchall()
         consolidation_revisions = dict(conn.execute("SELECT entity_id,revision FROM entity_revisions WHERE entity_type='memories'"))
+        consolidation_gen = schema.get_db_generation(conn)
 
     if not all_facts or len(all_facts) < 2:
         logger.info("[CONSOLIDATE] Less than 2 facts in database. Nothing to consolidate.")
@@ -1198,19 +1202,26 @@ Respond ONLY with valid JSON in this exact structure:
                 for field in ('target_id','category','fact'):
                     require_text(merge.get(field), field)
             for merge in data['merges']:
-                target_id = merge.get("target_id")
-                raw_cat = merge.get("category", "general")
+                target_id = require_text(merge.get("target_id"), "target_id")
+                raw_cat = require_text(merge.get("category", "general"), "category")
                 cat_name = _normalize_category(raw_cat, CANONICAL_FACT_CATEGORIES)
-                merged_ids = [m for m in merge.get("merged_ids", []) if m != target_id]
-                fact_text = merge.get("fact")
+                fact_text = require_text(merge.get("fact"), "fact")
                 kws = merge.get("keywords", "")
                 rationale = merge.get("rationale", "")
+
+                raw_merged = merge.get("merged_ids", [])
+                merged_ids = []
+                for m in raw_merged:
+                    mid = require_text(m, "merged_id")
+                    if mid != target_id and mid not in merged_ids:
+                        merged_ids.append(mid)
 
                 if not target_id or not merged_ids or not fact_text:
                     continue
 
                 category_facts = categories_to_check.get(raw_cat, categories_to_check.get(cat_name, []))
                 existing_merged = [m for m in merged_ids if any(f["id"] == m for f in category_facts)]
+                existing_merged = [m for m in existing_merged if m != target_id]
                 if not existing_merged:
                     continue
 
@@ -1219,6 +1230,9 @@ Respond ONLY with valid JSON in this exact structure:
                 with db_session() as conn, conn:
                     if not dry_run:
                         conn.execute("BEGIN IMMEDIATE")
+                    if schema.get_db_generation(conn) != consolidation_gen:
+                        logger.warning('Rejected stale consolidation proposal for %s: database generation changed', target_id)
+                        continue
                     stale = False
                     for entity_id in set(existing_merged + [target_id]):
                         row = conn.execute("SELECT revision FROM entity_revisions WHERE entity_type='memories' AND entity_id=?", (entity_id,)).fetchone()
@@ -1258,7 +1272,9 @@ Respond ONLY with valid JSON in this exact structure:
                                 conn.execute("INSERT OR IGNORE INTO entity_links VALUES (?, ?, ?)",
                                              (new_src, new_tgt, relation))
                         for mid in existing_merged:
-                            conn.execute("DELETE FROM memories WHERE id = ?", (mid,))
+                            if mid != target_id:
+                                conn.execute("DELETE FROM memories WHERE id = ?", (mid,))
+                        assert conn.execute("SELECT 1 FROM memories WHERE id = ?", (target_id,)).fetchone() is not None, f"Consolidated target fact '{target_id}' missing after merge"
                         preimage = json.dumps({"summary": diff_summary, "facts": sources, "target": target, "entity_links": links}, ensure_ascii=False)
                         conn.execute("""INSERT INTO consolidation_log
                             (action, category, target_id, merged_ids, diff_summary, rationale)
@@ -1554,6 +1570,7 @@ def _restore_snapshot_locked(filename: str, db_path: str = None) -> dict:
         with closing(sqlite3.connect(target_db, timeout=5)) as dst:
             _backup_connections(src, dst)
             with dst:
+                schema.bump_db_generation(dst)
                 if dst.execute('PRAGMA user_version').fetchone()[0] < schema.SCHEMA_VERSION:
                     schema._init_schema(dst)
                     schema._upgrade_schema(dst)

@@ -150,16 +150,29 @@ def process_queue(batch_size: int = 25, notify: bool = True, db_path: str | None
     remaining = batch_size
     max_iterations = max(batch_size, 50)
     iterations = 0
+    attempted_batch_ids = set()
 
     while remaining > 0 and iterations < max_iterations:
         iterations += 1
+        # Interleave fresh claims and retries to reserve capacity for fresh work (BR03)
+        prefer_fresh = (iterations % 2 == 0)
         claim = claim_batch(
             batch_size=min(remaining, 25),
             retry_delay_seconds=60,
+            prefer_fresh=prefer_fresh,
+            exclude_batch_ids=attempted_batch_ids,
             db_path=db_path
         )
         if not claim or not claim.turns:
-            break
+            claim = claim_batch(
+                batch_size=min(remaining, 25),
+                retry_delay_seconds=60,
+                prefer_fresh=not prefer_fresh,
+                exclude_batch_ids=attempted_batch_ids,
+                db_path=db_path
+            )
+            if not claim or not claim.turns:
+                break
 
         group_turns = claim.turns
         batch_id = claim.batch_id
@@ -243,6 +256,7 @@ def process_queue(batch_size: int = 25, notify: bool = True, db_path: str | None
         except Exception as e:
             sys.stderr.write(f"Error during batch sync for ({source}, {chat_id}): {e}\n")
             _LAST_RUN_FAILED_COUNT += len(group_turns)
+            attempted_batch_ids.add(batch_id)
             release_batch(batch_id=batch_id, lease_token=lease_token, error=str(e), db_path=db_path)
 
     prune_processed_turns(days=7, db_path=db_path)
