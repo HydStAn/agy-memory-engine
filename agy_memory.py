@@ -31,8 +31,14 @@ from config import (
     CACHE_PATH,
     AGY_BIN, MODEL_EXPLICIT, archive_path, sync_lock_path
 )
+try:
+    from embedder import upsert_vector, delete_vector, build_text_repr
+except ImportError:
+    upsert_vector = None
+    delete_vector = None
+    build_text_repr = None
 
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 
 logger = logging.getLogger("agy_memory")
 if not logger.handlers:
@@ -601,7 +607,7 @@ def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_le
 
 
 def upsert_fact(fact_id: str, category: str, fact: str, keywords: str = "", connection=None):
-    """Insert or update an atomic fact in the memories table."""
+    """Insert or update an atomic fact in the memories table and vector index."""
     fact_id = require_text(fact_id, "id")
     fact = require_text(fact, "fact")
     category = validate_category(category, CANONICAL_FACT_CATEGORIES)
@@ -617,9 +623,14 @@ def upsert_fact(fact_id: str, category: str, fact: str, keywords: str = "", conn
                 keywords = excluded.keywords,
                 updated_at = CURRENT_TIMESTAMP;
         """, (fact_id, category, fact, keywords))
+        if upsert_vector:
+            # Vector representation includes category, content and keywords
+            text_repr = build_text_repr("fact", {"category": category, "fact": fact, "keywords": keywords}) if build_text_repr else f"[{category}] {fact} {keywords or ''}".strip()
+            upsert_vector(conn, "vec_memories", fact_id, text_repr)
+
 
 def upsert_episode(episode_id: str, topic: str, title: str, narrative: str, period: str = "", status: str = "active", entities: str = "", stance: str = "", keywords: str = "", connection=None):
-    """Insert or update a narrative chronicle/episode."""
+    """Insert or update a narrative chronicle/episode and vector index."""
     episode_id = require_text(episode_id, 'id')
     title = require_text(title, 'title')
     narrative = require_text(narrative, 'narrative')
@@ -644,9 +655,13 @@ def upsert_episode(episode_id: str, topic: str, title: str, narrative: str, peri
                 keywords = excluded.keywords,
                 updated_at = CURRENT_TIMESTAMP;
         """, (episode_id, topic, title, period, status, narrative, entities, stance, keywords))
+        if upsert_vector:
+            text_repr = build_text_repr("episode", {"topic": topic, "title": title, "narrative": narrative, "stance": stance, "keywords": keywords}) if build_text_repr else f"[{topic}] {title}: {narrative} (Stance: {stance or 'neutral'}) {keywords or ''}".strip()
+            upsert_vector(conn, "vec_episodes", episode_id, text_repr)
+
 
 def upsert_learning(learning_id: str, category: str, insight: str, context: str = "", keywords: str = "", connection=None):
-    """Insert or update an experiential learning/heuristic."""
+    """Insert or update an experiential learning/heuristic and vector index."""
     learning_id = require_text(learning_id, "id")
     insight = require_text(insight, "insight")
     category = validate_category(category, CANONICAL_LEARNING_CATEGORIES)
@@ -663,6 +678,9 @@ def upsert_learning(learning_id: str, category: str, insight: str, context: str 
                 keywords = excluded.keywords,
                 updated_at = CURRENT_TIMESTAMP;
         """, (learning_id, category, insight, context, keywords))
+        if upsert_vector:
+            text_repr = build_text_repr("learning", {"category": category, "insight": insight, "context": context, "keywords": keywords}) if build_text_repr else f"[{category}] {insight} (Context: {context or ''}) {keywords or ''}".strip()
+            upsert_vector(conn, "vec_learnings", learning_id, text_repr)
 
 def list_all():
     """Print a formatted overview of all stored facts, episodes, learnings, and entity relations."""
@@ -850,7 +868,7 @@ def _sync_turn_inner(user_prompt: str, assistant_response: str, dry_run: bool = 
     inv = get_existing_database_inventory()
     inv_context = json.dumps(inv, ensure_ascii=False, indent=2)
 
-    prompt = f"""You are the Multi-Layer Cognitive Memory Engine for the current conversation owner.
+    prompt = f"""You are the Multi-Layer Cognitive Memory Engine for the user.
 Analyze the conversation turn below and extract ONLY genuinely persistent, reusable information.
 
 ## Layer Definitions
@@ -1154,7 +1172,7 @@ def consolidate_memories(dry_run: bool = False) -> list:
 
     canonical_cats = ", ".join(sorted(CANONICAL_FACT_CATEGORIES))
     facts_json = json.dumps(categories_to_check, ensure_ascii=False, indent=2)
-    prompt = f"""You are the Memory Consolidation Engine for the current database owner.
+    prompt = f"""You are the Memory Consolidation Engine for the user.
 Review the following atomic facts grouped by category.
 Identify any facts within each category that are duplicates, heavily overlapping, redundant, or represent the same information across different keys.
 
@@ -1434,10 +1452,10 @@ def optimize_db(apply_changes: bool = False, age_decay: bool = True, consolidate
 compact_all = optimize_db
 
 
-def list_snapshots() -> list:
-    """List all available snapshots from ~/.gemini/archive with file metadata and record counts."""
+def list_snapshots(archive_dir: str = None) -> list:
+    """List all available snapshots with file metadata and record counts."""
     import glob
-    archive_dir = str(archive_path(schema.DB_PATH))
+    archive_dir = archive_dir or str(archive_path(schema.DB_PATH))
     if not os.path.exists(archive_dir):
         return []
 

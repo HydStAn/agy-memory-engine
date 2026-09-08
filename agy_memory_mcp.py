@@ -19,6 +19,7 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from schema import db_session
+from config import VECTOR_SEARCH_ENABLED
 from agy_memory import (
     extract_multilingual_tokens,
     get_all_vocabulary,
@@ -33,6 +34,16 @@ from scripts.migrate_v2_to_v2_1 import (
     run_migration,
     CANONICAL_EPISODE_STATUSES,
 )
+try:
+    from embedder import embed_text, upsert_vector, reciprocal_rank_fusion, build_text_repr, log_vec_query_failure
+    HAS_EMBEDDER = True
+except ImportError:
+    embed_text = None
+    upsert_vector = None
+    reciprocal_rank_fusion = None
+    build_text_repr = None
+    log_vec_query_failure = None
+    HAS_EMBEDDER = False
 
 logger = logging.getLogger("agy_memory_mcp")
 
@@ -72,75 +83,154 @@ def search_memory(query: str, limit: int = 5) -> str:
         cursor = conn.cursor()
         vocab = get_all_vocabulary(cursor)
         words = extract_multilingual_tokens(str(query).strip(), vocab)
-        if not words:
-            # F20: Return consistent search envelope even for tokenless inputs
-            return json.dumps(empty_envelope, ensure_ascii=False, indent=2)
-        fts_terms = [f'"{w}"*' if len(w) >= 4 else f'"{w}"' for w in words]
-        fts_query = " OR ".join(fts_terms)
+        # --- Lexical Search (FTS5) ---
+        fts_facts = []
+        fts_episodes = []
+        fts_learnings = []
+        fts_query = None
+        if words:
+            fts_terms = [f'"{w}"*' if len(w) >= 4 else f'"{w}"' for w in words]
+            fts_query = " OR ".join(fts_terms)
 
-        # Facts via JOIN (ranked by relevance)
-        cursor.execute("""
-            SELECT m.id, m.category, m.fact
-            FROM memories m
-            JOIN memories_fts f ON m.id = f.id
-            WHERE memories_fts MATCH ?
-            ORDER BY f.rank
-            LIMIT ?
-        """, (fts_query, clamped_limit))
-        facts = [{"type": "fact", "id": r[0], "category": r[1], "content": r[2]} for r in cursor.fetchall()]
+            # Facts via JOIN (ranked by relevance)
+            cursor.execute("""
+                SELECT m.id, m.category, m.fact 
+                FROM memories m
+                JOIN memories_fts f ON m.id = f.id
+                WHERE memories_fts MATCH ?
+                ORDER BY f.rank
+                LIMIT ?
+            """, (fts_query, clamped_limit))
+            fts_facts = [{"type": "fact", "id": r[0], "category": r[1], "content": r[2]} for r in cursor.fetchall()]
 
-        # Episodes via JOIN (ranked with status weighting: active > cooling > historic/resolved)
-        cursor.execute("""
-            SELECT e.id, e.topic, e.title, e.period, e.status, e.narrative, e.stance
-            FROM episodes e
-            JOIN episodes_fts f ON e.id = f.id
-            WHERE episodes_fts MATCH ?
-            ORDER BY
-                CASE e.status
-                    WHEN 'active' THEN 1
-                    WHEN 'cooling' THEN 2
-                    ELSE 3
-                END ASC,
-                f.rank ASC
-            LIMIT ?
-        """, (fts_query, clamped_limit))
-        episodes = [{
-            "type": "episode",
-            "id": r[0],
-            "topic": r[1],
-            "title": r[2],
-            "period": r[3],
-            "status": r[4],
-            "narrative": r[5],
-            "stance": r[6]
-        } for r in cursor.fetchall()]
+            # Episodes via JOIN (ranked with status weighting: active > cooling > historic/resolved)
+            cursor.execute("""
+                SELECT e.id, e.topic, e.title, e.period, e.status, e.narrative, e.stance
+                FROM episodes e
+                JOIN episodes_fts f ON e.id = f.id
+                WHERE episodes_fts MATCH ?
+                ORDER BY 
+                    CASE e.status 
+                        WHEN 'active' THEN 1 
+                        WHEN 'cooling' THEN 2 
+                        ELSE 3 
+                    END ASC,
+                    f.rank ASC
+                LIMIT ?
+            """, (fts_query, clamped_limit))
+            fts_episodes = [{
+                "type": "episode",
+                "id": r[0],
+                "topic": r[1],
+                "title": r[2],
+                "period": r[3],
+                "status": r[4],
+                "narrative": r[5],
+                "stance": r[6]
+            } for r in cursor.fetchall()]
 
-        # Learnings via JOIN (ranked by relevance)
-        cursor.execute("""
-            SELECT l.id, l.category, l.insight, l.context
-            FROM learnings l
-            JOIN learnings_fts f ON l.id = f.id
-            WHERE learnings_fts MATCH ?
-            ORDER BY f.rank
-            LIMIT ?
-        """, (fts_query, clamped_limit))
-        learnings = [{
-            "type": "learning",
-            "id": r[0],
-            "category": r[1],
-            "insight": r[2],
-            "context": r[3]
-        } for r in cursor.fetchall()]
+            # Learnings via JOIN (ranked by relevance)
+            cursor.execute("""
+                SELECT l.id, l.category, l.insight, l.context
+                FROM learnings l
+                JOIN learnings_fts f ON l.id = f.id
+                WHERE learnings_fts MATCH ?
+                ORDER BY f.rank
+                LIMIT ?
+            """, (fts_query, clamped_limit))
+            fts_learnings = [{
+                "type": "learning",
+                "id": r[0],
+                "category": r[1],
+                "insight": r[2],
+                "context": r[3]
+            } for r in cursor.fetchall()]
 
-        # Entity links
-        cursor.execute("""
-            SELECT l.source_id, l.target_id, l.relation
-            FROM entity_links l
-            JOIN entity_links_fts f ON l.source_id = f.source_id AND l.target_id = f.target_id AND l.relation = f.relation
-            WHERE entity_links_fts MATCH ?
-            LIMIT ?
-        """, (fts_query, clamped_limit))
-        entity_links = [{"source": r[0], "target": r[1], "relation": r[2]} for r in cursor.fetchall()]
+        # --- Semantic Vector Search (sqlite-vec) ---
+        vec_facts = []
+        vec_episodes = []
+        vec_learnings = []
+        if HAS_EMBEDDER and VECTOR_SEARCH_ENABLED and embed_text:
+            query_emb = embed_text(str(query).strip())
+            if query_emb is not None:
+                # Semantic search in vec_memories
+                try:
+                    cursor.execute("""
+                        SELECT m.id, m.category, m.fact, v.distance
+                        FROM vec_memories v
+                        JOIN memories m ON m.id = v.id
+                        WHERE v.embedding MATCH ? AND k = ?
+                        ORDER BY v.distance ASC
+                    """, (query_emb, clamped_limit))
+                    vec_facts = [{"type": "fact", "id": r[0], "category": r[1], "content": r[2]} for r in cursor.fetchall()]
+                except Exception as e:
+                    if log_vec_query_failure:
+                        log_vec_query_failure("vec_memories", e)
+
+                # Semantic search in vec_episodes
+                try:
+                    cursor.execute("""
+                        SELECT e.id, e.topic, e.title, e.period, e.status, e.narrative, e.stance, v.distance
+                        FROM vec_episodes v
+                        JOIN episodes e ON e.id = v.id
+                        WHERE v.embedding MATCH ? AND k = ?
+                        ORDER BY v.distance ASC
+                    """, (query_emb, clamped_limit))
+                    vec_episodes = [{
+                        "type": "episode",
+                        "id": r[0],
+                        "topic": r[1],
+                        "title": r[2],
+                        "period": r[3],
+                        "status": r[4],
+                        "narrative": r[5],
+                        "stance": r[6]
+                    } for r in cursor.fetchall()]
+                except Exception as e:
+                    if log_vec_query_failure:
+                        log_vec_query_failure("vec_episodes", e)
+
+                # Semantic search in vec_learnings
+                try:
+                    cursor.execute("""
+                        SELECT l.id, l.category, l.insight, l.context, v.distance
+                        FROM vec_learnings v
+                        JOIN learnings l ON l.id = v.id
+                        WHERE v.embedding MATCH ? AND k = ?
+                        ORDER BY v.distance ASC
+                    """, (query_emb, clamped_limit))
+                    vec_learnings = [{
+                        "type": "learning",
+                        "id": r[0],
+                        "category": r[1],
+                        "insight": r[2],
+                        "context": r[3]
+                    } for r in cursor.fetchall()]
+                except Exception as e:
+                    if log_vec_query_failure:
+                        log_vec_query_failure("vec_learnings", e)
+
+        # --- Reciprocal Rank Fusion (RRF) ---
+        if HAS_EMBEDDER and reciprocal_rank_fusion:
+            facts = reciprocal_rank_fusion(fts_facts, vec_facts, limit=clamped_limit)
+            episodes = reciprocal_rank_fusion(fts_episodes, vec_episodes, limit=clamped_limit)
+            learnings = reciprocal_rank_fusion(fts_learnings, vec_learnings, limit=clamped_limit)
+        else:
+            facts = fts_facts[:clamped_limit]
+            episodes = fts_episodes[:clamped_limit]
+            learnings = fts_learnings[:clamped_limit]
+
+        # Entity links (lexical FTS query)
+        entity_links = []
+        if words and fts_query:
+            cursor.execute("""
+                SELECT l.source_id, l.target_id, l.relation
+                FROM entity_links l
+                JOIN entity_links_fts f ON l.source_id = f.source_id AND l.target_id = f.target_id AND l.relation = f.relation
+                WHERE entity_links_fts MATCH ?
+                LIMIT ?
+            """, (fts_query, clamped_limit))
+            entity_links = [{"source": r[0], "target": r[1], "relation": r[2]} for r in cursor.fetchall()]
 
         return json.dumps({
             "facts": facts,
@@ -156,7 +246,7 @@ def store_memory(id: str, fact: str, category: str = "general", keywords: str = 
     Args:
         id: Unique identifier / key for this memory (e.g. 'infra.server.ip').
         fact: Fact content or description.
-        category: Category classification (normalized to canonical taxonomy: infra, hardware, software, contacts, family, health, fitness, finance, insurance, travel, home, media, music, work, dev, preferences, communication, cloud, security, general).
+        category: Category classification (normalized to canonical taxonomy).
         keywords: Optional search keywords or synonyms.
     """
     clean_id = (id or "").strip()
@@ -234,7 +324,6 @@ def record_learning(id: str, category: str, insight: str, context: str = "", key
     norm_category = validate_category(category, CANONICAL_LEARNING_CATEGORIES)
     upsert_learning(clean_id, norm_category, clean_insight, context or "", keywords or "")
     return f"Successfully recorded learning '{clean_id}' (category: {norm_category})"
-
 
 def link_entities_mcp(source_id: str, target_id: str, relation: str) -> str:
     """Link two memory entities with a canonical semantic relationship.

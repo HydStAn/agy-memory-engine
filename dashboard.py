@@ -33,7 +33,45 @@ from config import (
     INACTIVITY_THRESHOLD_SECONDS,
     MAX_WAIT_THRESHOLD_SECONDS
 )
+
+def get_all_profiles() -> dict:
+    """Dynamically discover all configured AGY user profiles on the host."""
+    profiles = {
+        "ubuntu": {
+            "id": "ubuntu",
+            "label": "Stephan (Ubuntu)",
+            "db_path": os.path.expanduser("~/.gemini/memory.db"),
+            "queue_db_path": os.path.expanduser("~/.gemini/turn_queue.db"),
+            "archive_dir": os.path.expanduser("~/.gemini/archive"),
+        }
+    }
+    home_dir = Path("/home")
+    if home_dir.exists():
+        for udir in sorted(home_dir.iterdir()):
+            if not udir.is_dir() or udir.name in ("ubuntu", "opc"):
+                continue
+            try:
+                gemini_dir = udir / ".gemini"
+                db_path = gemini_dir / "memory.db"
+                if db_path.exists() or gemini_dir.exists():
+                    uname = udir.name
+                    profiles[uname] = {
+                        "id": uname,
+                        "label": uname.capitalize(),
+                        "db_path": str(db_path),
+                        "queue_db_path": str(gemini_dir / "turn_queue.db"),
+                        "archive_dir": str(gemini_dir / "archive"),
+                    }
+            except (PermissionError, OSError):
+                continue
+    return profiles
+
+def get_profile(user: str) -> dict:
+    profs = get_all_profiles()
+    return profs.get(user.lower().strip(), profs["ubuntu"])
+
 from schema import db_session
+from config import VECTOR_SEARCH_ENABLED
 from agy_memory import (
     extract_multilingual_tokens,
     get_all_vocabulary,
@@ -47,6 +85,14 @@ from queue_manager import (
     get_recent_turns,
     prune_processed_turns
 )
+try:
+    from embedder import embed_text, reciprocal_rank_fusion, log_vec_query_failure
+    HAS_DASHBOARD_EMBEDDER = True
+except ImportError:
+    embed_text = None
+    reciprocal_rank_fusion = None
+    log_vec_query_failure = None
+    HAS_DASHBOARD_EMBEDDER = False
 
 
 def get_or_create_dashboard_token(token_path: Optional[str] = None) -> str:
@@ -191,6 +237,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       font-family: monospace;
     }
     .badge b { color: var(--accent); }
+    .profile-select {
+      background: #1f242c;
+      border: 1px solid var(--accent);
+      color: var(--text-bright);
+      padding: 5px 12px;
+      border-radius: 6px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      outline: none;
+      transition: border-color 0.2s, box-shadow 0.2s;
+    }
+    .profile-select:hover, .profile-select:focus {
+      box-shadow: 0 0 10px var(--accent-glow);
+    }
 
     /* Clean 5-Metric Primary Navigation Bar */
     .stats-grid {
@@ -652,6 +713,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       <div class="pulse-badge"><div class="pulse-dot"></div> Live FTS5</div>
     </div>
     <div class="header-meta">
+      <div class="badge" style="display:flex; align-items:center; gap:6px; padding:2px 8px;">
+        <span>👤 Profile:</span>
+        <select id="sel-profile" class="profile-select" onchange="onProfileChange(this.value)">
+          <option value="ubuntu">Stephan (Ubuntu)</option>
+          <option value="henrik">Henrik</option>
+        </select>
+      </div>
       <div class="badge">Model: <b id="lbl-model">-</b></div>
       <div class="badge">DB: <b id="lbl-db-size">-</b></div>
       <button class="btn btn-secondary" onclick="switchTab('history')">📸 History & Snapshots</button>
@@ -807,6 +875,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
   <script>
     const DASHBOARD_TOKEN = {{DASHBOARD_TOKEN}};
+    let currentProfile = (new URLSearchParams(window.location.search)).get('user') || 'ubuntu';
     let rawData = null;
     let searchTimer = null;
     const openTurnDetails = new Set();
@@ -901,11 +970,37 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (rawData && rawData.links) renderGraph(rawData.links, true);
     }
 
+    function onProfileChange(val) {
+      currentProfile = val;
+      const url = new URL(window.location);
+      url.searchParams.set('user', val);
+      window.history.replaceState({}, '', url);
+      lastRenderedQueueHash = '';
+      lastRenderedFactsHash = '';
+      lastRenderedEpisodesHash = '';
+      lastRenderedLearningsHash = '';
+      lastRenderedGraphHash = '';
+      lastRenderedAuditHash = '';
+      lastRenderedSnapshotsHash = '';
+      fetchData(true);
+      showToast('Switched to profile: ' + (val === 'henrik' ? 'Henrik' : 'Stephan (Ubuntu)'), 'info', 2000);
+    }
+
     async function fetchData(forceDomRefresh = false) {
       try {
-        const res = await fetch('/api/stats');
+        const res = await fetch('/api/stats?user=' + encodeURIComponent(currentProfile));
         const data = await res.json();
         rawData = data;
+
+        const sel = document.getElementById('sel-profile');
+        if (sel && data.profiles && Array.isArray(data.profiles)) {
+          const currentOptions = Array.from(sel.options).map(o => o.value).join(',');
+          const newOptions = data.profiles.map(p => p.id).join(',');
+          if (currentOptions !== newOptions) {
+            sel.innerHTML = data.profiles.map(p => `<option value="${p.id}">${escapeHtml(p.label)}</option>`).join('');
+          }
+          sel.value = currentProfile;
+        }
 
         document.getElementById('lbl-model').innerText = data.model || 'gemini-3.7-flash-low';
         document.getElementById('lbl-db-size').innerText = data.db_size || '-';
@@ -1530,7 +1625,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       const t0 = performance.now();
       try {
-        const res = await fetch('/api/search?q=' + encodeURIComponent(q));
+        const res = await fetch('/api/search?q=' + encodeURIComponent(q) + '&user=' + encodeURIComponent(currentProfile));
         const data = await res.json();
         const t1 = performance.now();
         latLbl.innerText = `${(t1 - t0).toFixed(1)} ms (${data.tokens ? data.tokens.join(', ') : ''})`;
@@ -1586,7 +1681,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           try {
             const res = await fetch('/api/force-worker', {
               method: 'POST',
-              headers: { 'X-Dashboard-Token': DASHBOARD_TOKEN }
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Dashboard-Token': DASHBOARD_TOKEN
+              },
+              body: JSON.stringify({ user: currentProfile })
             });
             const data = await res.json();
             if (data.status === 'ok') {
@@ -1630,7 +1729,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           try {
             const res = await fetch('/api/clear-processed-queue', {
               method: 'POST',
-              headers: { 'X-Dashboard-Token': DASHBOARD_TOKEN }
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Dashboard-Token': DASHBOARD_TOKEN
+              },
+              body: JSON.stringify({ user: currentProfile })
             });
             const data = await res.json();
             showToast(data.message || 'Processed turns cleared from queue.', 'success', 3500);
@@ -1669,7 +1772,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           try {
             const res = await fetch('/api/optimize', {
               method: 'POST',
-              headers: { 'X-Dashboard-Token': DASHBOARD_TOKEN }
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Dashboard-Token': DASHBOARD_TOKEN
+              },
+              body: JSON.stringify({ user: currentProfile })
             });
             const data = await res.json();
             if (data.status === 'ok') {
@@ -1731,7 +1838,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 'Content-Type': 'application/json',
                 'X-Dashboard-Token': DASHBOARD_TOKEN
               },
-              body: JSON.stringify({ filename })
+              body: JSON.stringify({ filename, user: currentProfile })
             });
             const data = await res.json();
             if (data.status === 'ok') {
@@ -1771,7 +1878,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       try {
         const res = await fetch('/api/create-snapshot', {
           method: 'POST',
-          headers: { 'X-Dashboard-Token': DASHBOARD_TOKEN }
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Dashboard-Token': DASHBOARD_TOKEN
+          },
+          body: JSON.stringify({ user: currentProfile })
         });
         const data = await res.json();
         if (data.status === 'ok') {
@@ -1956,13 +2067,14 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        user = params.get("user", ["ubuntu"])[0]
         if path == "/api/stats":
-            self._handle_stats()
+            self._handle_stats(user)
             return
 
         if path == "/api/search":
             q = params.get("q", [""])[0]
-            self._handle_search(q)
+            self._handle_search(q, user)
             return
 
         self._send_json({"error": "Not Found"}, status=404)
@@ -1984,11 +2096,19 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             return
 
         url = urllib.parse.urlparse(self.path)
+        length = int(self.headers.get("Content-Length", 0))
+        req_data = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
+        user = req_data.get("user", "ubuntu")
+        prof = get_profile(user)
+
         if url.path == "/api/force-worker":
             import subprocess
             try:
                 worker_bin = BASE_DIR / "memory_worker.py"
-                res = subprocess.run([sys.executable, str(worker_bin), "--force"], capture_output=True, text=True, timeout=180)
+                env = os.environ.copy()
+                env["AGY_MEMORY_DB"] = prof["db_path"]
+                env["AGY_TURN_QUEUE_DB"] = prof["queue_db_path"]
+                res = subprocess.run([sys.executable, str(worker_bin), "--force"], env=env, capture_output=True, text=True, timeout=180)
                 output = (res.stdout or "").strip()
                 err = (res.stderr or "").strip()
                 if res.returncode == 0:
@@ -2010,7 +2130,7 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
 
         if url.path == "/api/clear-processed-queue":
             try:
-                prune_processed_turns(days=0)
+                prune_processed_turns(days=0, db_path=prof["queue_db_path"])
                 self._send_json({"status": "ok", "message": "All processed and skipped turns have been purged from the queue."})
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
@@ -2020,8 +2140,12 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             import subprocess
             try:
                 main_bin = BASE_DIR / "agy_memory.py"
+                env = os.environ.copy()
+                env["AGY_MEMORY_DB"] = prof["db_path"]
+                env["AGY_TURN_QUEUE_DB"] = prof["queue_db_path"]
                 res = subprocess.run(
                     [sys.executable, str(main_bin), "optimize", "--apply"],
+                    env=env,
                     capture_output=True,
                     text=True,
                     timeout=240
@@ -2047,7 +2171,7 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
 
         if url.path == "/api/create-snapshot":
             try:
-                res = create_snapshot(tag="manual")
+                res = create_snapshot(tag="manual", db_path=prof["db_path"])
                 status_code = 200 if res.get("status") == "ok" else 500
                 self._send_json(res, status=status_code)
             except Exception as e:
@@ -2056,12 +2180,11 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
 
         if url.path == "/api/restore-snapshot":
             try:
-                req_data = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
                 filename = req_data.get("filename")
                 if not filename:
                     self._send_json({"status": "error", "message": "Missing 'filename' in request."}, status=400)
                     return
-                res = restore_snapshot(filename)
+                res = restore_snapshot(filename, db_path=prof["db_path"])
                 status_code = 200 if res.get("status") == "ok" else 500
                 self._send_json(res, status=status_code)
             except Exception as e:
@@ -2070,9 +2193,14 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
 
         self._send_json({"error": "Not Found"}, status=404)
 
-    def _handle_stats(self):
+    def _handle_stats(self, user: str = "ubuntu"):
         try:
-            with db_session() as conn:
+            prof = get_profile(user)
+            target_db = prof["db_path"]
+            target_queue = prof["queue_db_path"]
+            target_archive = prof["archive_dir"]
+
+            with db_session(target_db) as conn:
                 cursor = conn.cursor()
                 cursor.execute("SELECT COUNT(*) FROM memories")
                 cnt_facts = cursor.fetchone()[0]
@@ -2107,21 +2235,25 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                 audit = [{"action": r[0], "category": r[1], "target_id": r[2], "diff_summary": r[3], "rationale": r[4], "timestamp": str(r[5])} for r in cursor.fetchall()]
 
             # Queue stats
-            q_stats = get_pending_stats()
-            q_turns = get_recent_turns(limit=50)
+            q_stats = get_pending_stats(db_path=target_queue) if os.path.exists(target_queue) else {"count": 0, "newest_age_seconds": 0, "oldest_age_seconds": 0}
+            q_turns = get_recent_turns(limit=50, db_path=target_queue) if os.path.exists(target_queue) else []
 
             # Snapshots
-            snapshots = list_snapshots()
+            snapshots = list_snapshots(archive_dir=target_archive) if os.path.exists(target_archive) else []
 
             # DB file size
             db_size = "-"
-            if os.path.exists(DB_PATH):
-                sz = os.path.getsize(DB_PATH)
+            if os.path.exists(target_db):
+                sz = os.path.getsize(target_db)
                 db_size = f"{sz / 1024:.1f} KB" if sz < 1024 * 1024 else f"{sz / (1024*1024):.2f} MB"
 
+            all_profs = get_all_profiles()
             self._send_json({
                 "model": MODEL_NAME,
-                "db_path": DB_PATH,
+                "profiles": [{"id": p["id"], "label": p["label"]} for p in all_profs.values()],
+                "profile": prof["id"],
+                "profile_label": prof["label"],
+                "db_path": target_db,
                 "db_size": db_size,
                 "counts": {
                     "facts": cnt_facts,
@@ -2146,13 +2278,14 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
         except Exception as e:
             self._send_json({"error": str(e)}, status=500)
 
-    def _handle_search(self, q: str):
+    def _handle_search(self, q: str, user: str = "ubuntu"):
         if not q.strip():
             self._send_json({"facts": [], "episodes": [], "learnings": [], "tokens": []})
             return
 
+        prof = get_profile(user)
         try:
-            with db_session() as conn:
+            with db_session(prof["db_path"]) as conn:
                 cursor = conn.cursor()
                 vocab = get_all_vocabulary(cursor)
                 words = extract_multilingual_tokens(q, vocab)
@@ -2160,38 +2293,99 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                     self._send_json({"facts": [], "episodes": [], "learnings": [], "tokens": []})
                     return
 
-                fts_terms = [f'"{w}"*' if len(w) >= 4 else f'"{w}"' for w in words]
-                fts_query = " OR ".join(fts_terms)
+                # --- Lexical Search (FTS5) ---
+                fts_facts = []
+                fts_episodes = []
+                fts_learnings = []
+                if words:
+                    fts_terms = [f'"{w}"*' if len(w) >= 4 else f'"{w}"' for w in words]
+                    fts_query = " OR ".join(fts_terms)
 
-                # Query Facts
-                cursor.execute("""
-                    SELECT m.id, m.category, m.fact 
-                    FROM memories m
-                    JOIN memories_fts f ON m.id = f.id
-                    WHERE memories_fts MATCH ?
-                    ORDER BY f.rank LIMIT 10;
-                """, (fts_query,))
-                facts = [{"id": r[0], "category": r[1], "fact": r[2]} for r in cursor.fetchall()]
+                    # Query Facts
+                    cursor.execute("""
+                        SELECT m.id, m.category, m.fact 
+                        FROM memories m
+                        JOIN memories_fts f ON m.id = f.id
+                        WHERE memories_fts MATCH ?
+                        ORDER BY f.rank LIMIT 10;
+                    """, (fts_query,))
+                    fts_facts = [{"id": r[0], "category": r[1], "fact": r[2]} for r in cursor.fetchall()]
 
-                # Query Episodes
-                cursor.execute("""
-                    SELECT e.id, e.topic, e.title, e.period, e.status, e.narrative 
-                    FROM episodes e
-                    JOIN episodes_fts f ON e.id = f.id
-                    WHERE episodes_fts MATCH ?
-                    ORDER BY f.rank LIMIT 10;
-                """, (fts_query,))
-                episodes = [{"id": r[0], "topic": r[1], "title": r[2], "period": r[3], "status": r[4], "narrative": r[5]} for r in cursor.fetchall()]
+                    # Query Episodes
+                    cursor.execute("""
+                        SELECT e.id, e.topic, e.title, e.period, e.status, e.narrative 
+                        FROM episodes e
+                        JOIN episodes_fts f ON e.id = f.id
+                        WHERE episodes_fts MATCH ?
+                        ORDER BY f.rank LIMIT 10;
+                    """, (fts_query,))
+                    fts_episodes = [{"id": r[0], "topic": r[1], "title": r[2], "period": r[3], "status": r[4], "narrative": r[5]} for r in cursor.fetchall()]
 
-                # Query Learnings
-                cursor.execute("""
-                    SELECT l.id, l.category, l.insight 
-                    FROM learnings l
-                    JOIN learnings_fts f ON l.id = f.id
-                    WHERE learnings_fts MATCH ?
-                    ORDER BY f.rank LIMIT 10;
-                """, (fts_query,))
-                learnings = [{"id": r[0], "category": r[1], "insight": r[2]} for r in cursor.fetchall()]
+                    # Query Learnings
+                    cursor.execute("""
+                        SELECT l.id, l.category, l.insight 
+                        FROM learnings l
+                        JOIN learnings_fts f ON l.id = f.id
+                        WHERE learnings_fts MATCH ?
+                        ORDER BY f.rank LIMIT 10;
+                    """, (fts_query,))
+                    fts_learnings = [{"id": r[0], "category": r[1], "insight": r[2]} for r in cursor.fetchall()]
+
+                # --- Semantic Vector Search ---
+                vec_facts = []
+                vec_episodes = []
+                vec_learnings = []
+                if HAS_DASHBOARD_EMBEDDER and VECTOR_SEARCH_ENABLED and embed_text:
+                    q_emb = embed_text(q)
+                    if q_emb is not None:
+                        try:
+                            cursor.execute("""
+                                SELECT m.id, m.category, m.fact
+                                FROM vec_memories v
+                                JOIN memories m ON m.id = v.id
+                                WHERE v.embedding MATCH ? AND k = 10
+                                ORDER BY v.distance ASC
+                            """, (q_emb,))
+                            vec_facts = [{"id": r[0], "category": r[1], "fact": r[2]} for r in cursor.fetchall()]
+                        except Exception as e:
+                            if log_vec_query_failure:
+                                log_vec_query_failure("vec_memories", e)
+
+                        try:
+                            cursor.execute("""
+                                SELECT e.id, e.topic, e.title, e.period, e.status, e.narrative
+                                FROM vec_episodes v
+                                JOIN episodes e ON e.id = v.id
+                                WHERE v.embedding MATCH ? AND k = 10
+                                ORDER BY v.distance ASC
+                            """, (q_emb,))
+                            vec_episodes = [{"id": r[0], "topic": r[1], "title": r[2], "period": r[3], "status": r[4], "narrative": r[5]} for r in cursor.fetchall()]
+                        except Exception as e:
+                            if log_vec_query_failure:
+                                log_vec_query_failure("vec_episodes", e)
+
+                        try:
+                            cursor.execute("""
+                                SELECT l.id, l.category, l.insight
+                                FROM vec_learnings v
+                                JOIN learnings l ON l.id = v.id
+                                WHERE v.embedding MATCH ? AND k = 10
+                                ORDER BY v.distance ASC
+                            """, (q_emb,))
+                            vec_learnings = [{"id": r[0], "category": r[1], "insight": r[2]} for r in cursor.fetchall()]
+                        except Exception as e:
+                            if log_vec_query_failure:
+                                log_vec_query_failure("vec_learnings", e)
+
+                # --- Reciprocal Rank Fusion ---
+                if HAS_DASHBOARD_EMBEDDER and reciprocal_rank_fusion:
+                    facts = reciprocal_rank_fusion(fts_facts, vec_facts, limit=10)
+                    episodes = reciprocal_rank_fusion(fts_episodes, vec_episodes, limit=10)
+                    learnings = reciprocal_rank_fusion(fts_learnings, vec_learnings, limit=10)
+                else:
+                    facts = fts_facts[:10]
+                    episodes = fts_episodes[:10]
+                    learnings = fts_learnings[:10]
 
                 self._send_json({
                     "tokens": words,

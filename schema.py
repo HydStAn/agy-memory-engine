@@ -13,7 +13,13 @@ import uuid
 from pathlib import Path
 from contextlib import contextmanager
 
-from config import DB_PATH
+from config import DB_PATH, EMBEDDING_DIM, VECTOR_SEARCH_ENABLED
+
+try:
+    import sqlite_vec
+    HAS_SQLITE_VEC = True
+except (ImportError, ModuleNotFoundError):
+    HAS_SQLITE_VEC = False
 
 # Protected categories that require explicit confirmation before overwrite in sync-turn
 PROTECTED_CATEGORIES = frozenset({"health", "finance", "pension", "insurance", "preferences", "user"})
@@ -200,6 +206,52 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     """)
     conn.execute("INSERT OR IGNORE INTO meta_generation(key, value) VALUES ('generation', ?);", (uuid.uuid4().hex,))
 
+    # --- Feature 7: Vector Tables & Triggers (sqlite-vec) ---
+    if HAS_SQLITE_VEC and VECTOR_SEARCH_ENABLED:
+        try:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+
+            conn.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_memories USING vec0(
+                    id TEXT PRIMARY KEY,
+                    embedding float[{EMBEDDING_DIM}]
+                );
+            """)
+            conn.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_episodes USING vec0(
+                    id TEXT PRIMARY KEY,
+                    embedding float[{EMBEDDING_DIM}]
+                );
+            """)
+            conn.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_learnings USING vec0(
+                    id TEXT PRIMARY KEY,
+                    embedding float[{EMBEDDING_DIM}]
+                );
+            """)
+
+            # Automatic deletion cascade from parent tables
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_vec_memories_ad AFTER DELETE ON memories BEGIN
+                    DELETE FROM vec_memories WHERE id = old.id;
+                END;
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_vec_episodes_ad AFTER DELETE ON episodes BEGIN
+                    DELETE FROM vec_episodes WHERE id = old.id;
+                END;
+            """)
+            conn.execute("""
+                CREATE TRIGGER IF NOT EXISTS trg_vec_learnings_ad AFTER DELETE ON learnings BEGIN
+                    DELETE FROM vec_learnings WHERE id = old.id;
+                END;
+            """)
+        except Exception:
+            # Non-blocking if extension cannot be loaded in current context
+            pass
+
 
 def get_db_generation(conn: sqlite3.Connection) -> str:
     """Retrieve current database generation token for fencing stale extractions across restores."""
@@ -288,6 +340,13 @@ def db_session(db_path: str = None):
     conn = None
     try:
         conn = sqlite3.connect(path, timeout=5)
+        if HAS_SQLITE_VEC and VECTOR_SEARCH_ENABLED:
+            try:
+                conn.enable_load_extension(True)
+                sqlite_vec.load(conn)
+                conn.enable_load_extension(False)
+            except Exception:
+                pass
         identity = (os.stat(path).st_dev, os.stat(path).st_ino)
         version = conn.execute('PRAGMA user_version').fetchone()[0]
         if version > SCHEMA_VERSION:

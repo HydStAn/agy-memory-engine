@@ -1,13 +1,32 @@
-# AGY Memory Engine (v2.1.0)
+# AGY Memory Engine (v2.2.0)
 
 > Hardening branch: see [runtime setup and audit coverage](HARDENING.md). Automatic extraction now requires an explicitly configured tool-free chat-completions endpoint. It no longer launches an unrestricted AGY agent. Failed extraction retains pending turns. Schema upgrades run on first engine access; restart all clients together for rollout.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests: 44/44 Passing](https://img.shields.io/badge/Tests-44%2F44%20Passed-brightgreen.svg)]()
+[![Tests: 49/49 Passing](https://img.shields.io/badge/Tests-49%2F49%20Passed-brightgreen.svg)]()
 
 > Lightweight, high-performance, standalone dynamic cognitive memory layer for Google Antigravity (`agy`) and autonomous agent frameworks.
 
 Inspired by Hermes Agent's multi-pillar memory architecture, using SQLite FTS5 for ultra-fast local retrieval (<2ms), multilingual compound sub-token decomposition & morphological stemming (DE, EN, FR, IT, ES, NL, SV), relational entity linking, and autonomous background queue workers with calm-memory session debouncing.
+
+---
+
+## 📑 Table of Contents
+
+- [The Big Picture: Autonomous Omni-Channel Stack](#-the-big-picture-autonomous-omni-channel-stack)
+- [The 4-Layer Cognitive Memory Model](#️-the-4-layer-cognitive-memory-model)
+- [Evolution: From Pure Tokenizer to In-Process Hybrid Search](#-evolution-from-pure-tokenizer-to-in-process-hybrid-search)
+- [5-Minute Quickstart Guide for Newbies](#-5-minute-quickstart-guide-for-newbies)
+- [CLI Reference & Quick Commands](#-cli-reference--quick-commands)
+- [Model Context Protocol (MCP) Server](#-model-context-protocol-mcp-server)
+- [Seamless Integration with Antigravity Telegram Bot](#-seamless-integration-with-antigravity-telegram-bot)
+- [Configuration (`.env`)](#️-configuration-env)
+- [Real-Time Debug Web Dashboard](#-real-time-debug-web-dashboard)
+- [Autonomous Background Pipeline (Cron & Lifecycle Hooks)](#-autonomous-background-pipeline-cron--lifecycle-hooks)
+- [Testing](#-testing)
+- [Release Notes](#-release-notes)
+- [Roadmap](#️-roadmap)
+- [License](#-license)
 
 ---
 
@@ -65,16 +84,20 @@ Inspired by Hermes Agent's multi-pillar memory architecture, using SQLite FTS5 f
 
 ---
 
-## 🔍 Hybrid Multilingual Tokenizer vs. Vector Databases
-
-Rather than requiring heavyweight PyTorch / ONNX vector libraries (~500MB RAM, 150ms latency), `agy-memory-engine` implements an in-process **Hybrid Multilingual Semantic Tokenizer**:
-
-1. **Multilingual Compound Sub-Token Decomposition:** Automatically decomposes composite nouns across German, Dutch, Scandinavian and Romance languages (e.g. `Hundeversicherung` ➔ `hund` + `versicherung`, `Zweitwohnungssteuer` ➔ `zweitwohnung` + `steuer`, `hondenverzekering` ➔ `hond` + `verzekering`) with Fugenmorpheme handling (`-s-`, `-en-`, `-n-`, `-er-`, `-e-`) and database vocabulary validation.
-2. **Morphological Suffix & Stemming Normalizer:** Normalizes inflectional endings across 8 European languages (DE, EN, FR, IT, ES, NL, SV/NO/DA) so inflected queries (e.g. `insurances`, `voitures`, `prenotazioni`, `reservaciones`) match stored canonical records.
-3. **BM25 Relevance Scoring:** Fast native SQLite FTS5 rank over facts, episodes, and learnings.
-4. **Status-Aware Aging:** Weights `active` topics above `cooling` and `historic` dossiers.
-5. **1-Hop Entity Expansion:** Resolves linked hardware/services automatically during prefetch.
-6. **Exact Match Guarantee:** 100% precision on IP addresses, ports, IDs, and serial numbers.
+## 🔍 Evolution: From Pure Tokenizer to In-Process Hybrid Search
+ 
+In version 2.0/2.1, `agy-memory-engine` deliberately avoided external, resource-heavy vector databases (such as Chroma, Milvus, or Qdrant) and PyTorch bloat (~500MB RAM, 150ms latency) to stay ultra-lightweight.
+ 
+**The limitation of pure keyword / FTS5 search:**
+Pure FTS5 struggles with *vocabulary mismatch*: If a user asks in everyday conversational language about *"preventing data loss during disk cleanup"*, while the database stores the heuristic *"Deletions of any kind require explicit approval (deletion protection)"*, pure FTS5 keyword matching returns exactly **0 results**.
+ 
+**The solution starting in v2.2.0: In-Process Hybrid Search (sqlite-vec + FastEmbed)**
+Instead of introducing a heavy server backend, v2.2.0 combines the best of both worlds:
+1. **Ultra-fast CLI Prefetch (< 2ms):** The synchronous pre-invocation hook remains unchanged on pure FTS5 + trigram decomposition for compound words — zero perceptible latency in chat.
+2. **In-Process Vector Extension (`sqlite-vec`):** Runs natively in C directly inside the SQLite process (SIMD-accelerated, zero daemon, zero network hop).
+3. **Lightweight Local Embeddings (`fastembed`):** Powered by ONNX Runtime with `sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2` (384 dimensions, ~9ms inference time, outstanding multilingual semantics).
+4. **Reciprocal Rank Fusion (RRF):** Mathematically blends BM25 results (100% precision for IPs, IDs, exact names) and vector distance (understanding vague concepts and synonyms).
+5. **Automatic Synchronization:** Background workers (`memory_worker.py`) and MCP storage tools index vectors transparently in the background; SQLite cascade triggers handle deletions automatically.
 
 ---
 
@@ -307,7 +330,7 @@ AGY_MEMORY_DASHBOARD_HOST=127.0.0.1
 A zero-dependency, standalone live web dashboard is included to inspect, search, and monitor memory state in real time:
 
 * **Live FTS5 Search Sandbox:** Test hybrid multilingual queries with sub-millisecond latency metrics.
-* **Turn Queue & Debounce Monitor:** Visual countdown bar for active conversation debouncing (5m idle / 15m timeout) with an instant *"Batch jetzt verarbeiten"* trigger.
+* **Turn Queue & Debounce Monitor:** Visual countdown bar for active conversation debouncing (5m idle / 15m timeout) with an instant *"Process batch now"* trigger.
 * **4-Layer Visualizer:** Browse Facts (Layer 1), Thematic Episodes with status badges (Layer 2), Experiential Learnings (Layer 3), and Knowledge Graph Entity Links (Layer 4).
 * **Consolidation Audit Log:** Review automated background merges, deduplications, and semantic rationale.
 
@@ -374,6 +397,16 @@ python3 -m unittest discover tests/ -v
 
 ## 🚀 Release Notes
 
+### v2.2.0 (2026-09-07)
+- **Semantic Recall & In-Process Hybrid Search (FTS5 + `sqlite-vec`)**:
+  - In-process vector extension via `sqlite-vec` (C-extension, SIMD-accelerated, zero external daemon).
+  - Dense 384-dimensional multilingual embeddings via `fastembed` with `paraphrase-multilingual-MiniLM-L12-v2`.
+  - Reciprocal Rank Fusion (RRF) combining BM25 lexical precision with semantic cosine similarity in `search_memory`.
+  - Zero latency impact on CLI prefetch: Pre-invocation prefetch remains strictly < 2ms (FTS5 + Trigram).
+  - Background vector indexing of 175 facts, 37 episodes, and 92 learnings in `~/.gemini/memory.db`.
+  - Automatic cascade deletion triggers from SQLite parent tables to virtual vector tables (`vec_memories`, `vec_episodes`, `vec_learnings`).
+  - Standalone reindexing utility `scripts/reindex_vectors.py`.
+
 ### v2.1.0 (2026-09-03)
 - **Quality-First Extraction & Consolidation Pipeline**:
   - Strict litmust test and exclusion rules for experiential learnings (no transient bug fixes, UI tweaks or code-internal details; strictly reusable heuristics and behavioral insights).
@@ -392,6 +425,26 @@ python3 -m unittest discover tests/ -v
 
 ---
 
+## 🗺️ Roadmap
+
+- [x] **Semantic Recall & Hybrid Search (FTS5 + `sqlite-vec`)**:
+  - In-process vector extension via `sqlite-vec` alongside FTS5.
+  - Multilingual embedding model (`sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2`) via `fastembed` for vague natural language queries.
+  - Reciprocal Rank Fusion (RRF) to combine BM25 keyword precision with semantic vector similarity for on-demand queries (`search_memory`).
+  - Keep pre-invocation prefetch strictly < 2ms (FTS5 + Trigram).
+- [x] **Hermes-Style 3-Tier Memory Architecture**:
+  - **Tier 1 (Profile/Preferences)**: Lean, fixed identity facts injected directly into agent system prompt (0ms latency, ~150-250 tokens max).
+  - **Tier 2 (Episodic & Semantic Store)**: 4-Layer SQLite `memory.db` with Hybrid Search on-demand.
+  - **Tier 3 (Working Memory)**: Active session context & scratchpad.
+- [ ] **Pluggable LLM Backends for Background Worker**:
+  - Abstract extraction & consolidation caller (`call_llm`) beyond `agy --print`.
+  - **Claude Code Compatibility**: Support Claude CLI (`claude -p`) as background extraction engine.
+  - **Direct Provider APIs**: Native lightweight connectors for Anthropic (e.g. Claude 3.5 Haiku) and OpenAI-compatible endpoints without external CLI dependencies.
+- [ ] **Multi-Agent Session Routing**: Dynamic extraction profile tagging per client/agent session.
+- [ ] **Selective Synced Subgraphs**: Export and sync filtered memory subsets across distributed nodes.
+
+---
+
 ## 📄 License
 
-MIT License © 2026 Stephan Bolten
+MIT License © 2026 HydStAn
