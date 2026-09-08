@@ -32,7 +32,7 @@ class TestQueueManager(unittest.TestCase):
         self.db_path = os.path.join(self.temp_dir, "test_queue.db")
 
     def tearDown(self):
-        shutil.rmtree(self.temp_dir)
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_init_and_enqueue(self):
         init_queue_db(self.db_path)
