@@ -401,7 +401,7 @@ python3 -m unittest discover tests/ -v
   - Dense 384-dimensional multilingual embeddings via `fastembed` with `paraphrase-multilingual-MiniLM-L12-v2`.
   - Reciprocal Rank Fusion (RRF) combining BM25 lexical precision with semantic cosine similarity in `search_memory`.
   - Zero latency impact on CLI prefetch: Pre-invocation prefetch remains strictly < 2ms (FTS5 + Trigram).
-  - Background vector indexing of 175 facts, 37 episodes, and 92 learnings in `~/.gemini/memory.db`.
+  - Background vector indexing of facts, episodes and learnings in `~/.gemini/memory.db`.
   - Automatic cascade deletion triggers from SQLite parent tables to virtual vector tables (`vec_memories`, `vec_episodes`, `vec_learnings`).
   - Standalone reindexing utility `scripts/reindex_vectors.py`.
 
