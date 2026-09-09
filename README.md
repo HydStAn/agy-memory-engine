@@ -108,7 +108,7 @@ Get up and running from zero to autonomous memory in 5 minutes.
 Clone the repository and install the lightweight Python dependencies (no PyTorch, no heavyweight vector DBs needed):
 
 ```bash
-git clone https://github.com/sbolten/agy-memory-engine.git
+git clone https://github.com/HydStAn/agy-memory-engine.git
 cd agy-memory-engine
 
 # Optional: set up your environment configuration
