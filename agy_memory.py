@@ -1684,6 +1684,8 @@ def main():
     ui_p = subparsers.add_parser("ui", help="Launch real-time debug web dashboard")
     ui_p.add_argument("--port", type=int, default=None, help="Port to listen on (default from .env)")
     ui_p.add_argument("--host", type=str, default=None, help="Host to bind to (default from .env)")
+    ui_p.add_argument("--allowed-hosts", type=str, default=None, help="Comma-separated list of allowed Host header values")
+    ui_p.add_argument("--allow-private-networks", action="store_true", default=None, help="Permit private and mesh network Host headers")
 
     mg = subparsers.add_parser("migrate", help="Run database migrations (e.g. v2.0 -> v2.1)")
     mg.add_argument("--dry-run", action="store_true", help="Simulate migration without modifying database")
@@ -1749,7 +1751,8 @@ def main():
         from config import DASHBOARD_HOST, DASHBOARD_PORT
         port = args.port or DASHBOARD_PORT
         host = args.host or DASHBOARD_HOST
-        run_dashboard(host=host, port=port)
+        allowed = [h.strip().lower() for h in args.allowed_hosts.split(",")] if getattr(args, "allowed_hosts", None) else None
+        run_dashboard(host=host, port=port, allowed_hosts=allowed, allow_private=getattr(args, "allow_private_networks", None))
     elif args.command == "migrate":
         from scripts.migrate_v2_to_v2_1 import run_migration
         db_target = args.db or DB_PATH

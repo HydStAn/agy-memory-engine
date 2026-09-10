@@ -39,6 +39,9 @@ import dashboard
 from dashboard import (
     get_or_create_dashboard_token,
     is_local_origin,
+    is_ip_in_private_or_mesh_range,
+    is_trusted_host,
+    is_trusted_origin,
     MemoryDashboardHandler,
     HTML_TEMPLATE,
 )
@@ -124,6 +127,74 @@ class TestDashboardHardening(unittest.TestCase):
         self.assertFalse(is_local_origin("http://127.0.0.1.evil.com"))
         self.assertFalse(is_local_origin("null"))
         self.assertFalse(is_local_origin(""))
+
+    def test_is_ip_in_private_or_mesh_range(self):
+        """Verify IP detection for private networks, loopback, link-local, and Tailscale mesh."""
+        # Loopback
+        self.assertTrue(is_ip_in_private_or_mesh_range("127.0.0.1"))
+        self.assertTrue(is_ip_in_private_or_mesh_range("::1"))
+        self.assertTrue(is_ip_in_private_or_mesh_range("[::1]"))
+
+        # RFC 1918 Private IPv4
+        self.assertTrue(is_ip_in_private_or_mesh_range("10.0.0.1"))
+        self.assertTrue(is_ip_in_private_or_mesh_range("172.16.0.1"))
+        self.assertTrue(is_ip_in_private_or_mesh_range("192.168.1.100"))
+
+        # Tailscale / RFC 6598 CGNAT IPv4 (100.64.0.0/10)
+        self.assertTrue(is_ip_in_private_or_mesh_range("100.64.0.1"))
+        self.assertTrue(is_ip_in_private_or_mesh_range("100.115.92.5"))
+        self.assertTrue(is_ip_in_private_or_mesh_range("100.127.255.254"))
+
+        # IPv6 ULA (Tailscale IPv6) and link-local
+        self.assertTrue(is_ip_in_private_or_mesh_range("fd7a:115c:a1e0:ab12:4843:cd96:6276:1234"))
+        self.assertTrue(is_ip_in_private_or_mesh_range("fe80::1"))
+        self.assertTrue(is_ip_in_private_or_mesh_range("[fe80::1%eth0]"))
+
+        # Non-private public IPs and invalid inputs
+        self.assertFalse(is_ip_in_private_or_mesh_range("8.8.8.8"))
+        self.assertFalse(is_ip_in_private_or_mesh_range("1.1.1.1"))
+        self.assertFalse(is_ip_in_private_or_mesh_range("evil.com"))
+        self.assertFalse(is_ip_in_private_or_mesh_range(""))
+        self.assertFalse(is_ip_in_private_or_mesh_range(None))
+
+    def test_trusted_host_default_loopback(self):
+        """Default loopback host binding strictly rejects foreign and non-local hosts."""
+        self.assertTrue(is_trusted_host("localhost", server_host="127.0.0.1", allowed_hosts=[]))
+        self.assertTrue(is_trusted_host("127.0.0.1", server_host="127.0.0.1", allowed_hosts=[]))
+        self.assertTrue(is_trusted_host("::1", server_host="127.0.0.1", allowed_hosts=[]))
+
+        # Rejects private IPs and foreign domains when bound strictly to loopback
+        self.assertFalse(is_trusted_host("192.168.1.50", server_host="127.0.0.1", allowed_hosts=[]))
+        self.assertFalse(is_trusted_host("100.64.1.2", server_host="127.0.0.1", allowed_hosts=[]))
+        self.assertFalse(is_trusted_host("evil.com", server_host="127.0.0.1", allowed_hosts=[]))
+        self.assertFalse(is_trusted_host("attacker.invalid", server_host="127.0.0.1", allowed_hosts=[]))
+
+    def test_trusted_host_wildcard_bind_permits_private_and_mesh(self):
+        """When bound to 0.0.0.0, private LAN and Tailscale mesh IPs are permitted while DNS rebinding is blocked."""
+        # Permitted on 0.0.0.0
+        self.assertTrue(is_trusted_host("127.0.0.1", server_host="0.0.0.0", allowed_hosts=[]))
+        self.assertTrue(is_trusted_host("localhost", server_host="0.0.0.0", allowed_hosts=[]))
+        self.assertTrue(is_trusted_host("192.168.1.100", server_host="0.0.0.0", allowed_hosts=[]))
+        self.assertTrue(is_trusted_host("10.0.0.5", server_host="0.0.0.0", allowed_hosts=[]))
+        self.assertTrue(is_trusted_host("100.64.1.2", server_host="0.0.0.0", allowed_hosts=[]))
+        self.assertTrue(is_trusted_host("100.115.92.5", server_host="0.0.0.0", allowed_hosts=[]))
+        self.assertTrue(is_trusted_host("fd7a:115c:a1e0::1", server_host="0.0.0.0", allowed_hosts=[]))
+
+        # Public IPs and arbitrary domains are still blocked (retaining DNS rebinding protection)
+        self.assertFalse(is_trusted_host("8.8.8.8", server_host="0.0.0.0", allowed_hosts=[]))
+        self.assertFalse(is_trusted_host("evil.com", server_host="0.0.0.0", allowed_hosts=[]))
+        self.assertFalse(is_trusted_host("attacker.invalid", server_host="0.0.0.0", allowed_hosts=[]))
+
+    def test_trusted_host_configured_allowed_hosts(self):
+        """Configured allowed hosts (exact and wildcard) are accepted across bindings."""
+        allowed = ["my-box.ts.net", "*.tailnet.ts.net", "custom.internal"]
+        self.assertTrue(is_trusted_host("my-box.ts.net", server_host="127.0.0.1", allowed_hosts=allowed))
+        self.assertTrue(is_trusted_host("node1.tailnet.ts.net", server_host="127.0.0.1", allowed_hosts=allowed))
+        self.assertTrue(is_trusted_host("custom.internal", server_host="127.0.0.1", allowed_hosts=allowed))
+
+        # Unmatched domains rejected
+        self.assertFalse(is_trusted_host("other.ts.net", server_host="127.0.0.1", allowed_hosts=allowed))
+        self.assertFalse(is_trusted_host("evil.com", server_host="127.0.0.1", allowed_hosts=allowed))
 
 
 class TestDashboardHttpServer(unittest.TestCase):
@@ -262,6 +333,31 @@ class TestDashboardHttpServer(unittest.TestCase):
         status, _, _ = self._post("/api/clear-processed-queue", headers={
             "X-Dashboard-Token": self.token, "Origin": "https://attacker.invalid"})
         self.assertEqual(status, 403)
+
+    def test_server_allowed_hosts_and_private_network(self):
+        """Verify server responds to allowed hosts and private IPs when configured."""
+        try:
+            self.server.allowed_hosts = ["my-mac.ts.net"]
+            self.server.allow_private = True
+
+            # Configured allowed host accepted (reaches auth check, returns 401 instead of 403)
+            status, _, _ = self._get("/", headers={"Host": f"my-mac.ts.net:{self.port}"})
+            self.assertEqual(status, 401)
+
+            # Private IP accepted
+            status, _, _ = self._get("/", headers={"Host": f"192.168.1.100:{self.port}"})
+            self.assertEqual(status, 401)
+
+            # Tailscale CGNAT IP accepted
+            status, _, _ = self._get("/", headers={"Host": f"100.64.1.2:{self.port}"})
+            self.assertEqual(status, 401)
+
+            # Foreign domain rejected with 403 Forbidden
+            status, _, _ = self._get("/", headers={"Host": f"attacker.invalid:{self.port}"})
+            self.assertEqual(status, 403)
+        finally:
+            self.server.allowed_hosts = []
+            self.server.allow_private = False
 
     def test_token_is_safe_inside_script(self):
         payload = '</script><img src=x onerror=alert(1)>'

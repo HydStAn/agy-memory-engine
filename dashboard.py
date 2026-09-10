@@ -13,6 +13,7 @@ import sqlite3
 import secrets
 import hmac
 import fcntl
+import ipaddress
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -30,6 +31,8 @@ from config import (
     DASHBOARD_HOST,
     DASHBOARD_TOKEN,
     DASHBOARD_TOKEN_PATH,
+    DASHBOARD_ALLOWED_HOSTS,
+    DASHBOARD_ALLOW_PRIVATE_NETWORKS,
     INACTIVITY_THRESHOLD_SECONDS,
     MAX_WAIT_THRESHOLD_SECONDS
 )
@@ -130,6 +133,102 @@ def is_local_origin(origin: str) -> bool:
             return False
         hostname = (parsed.hostname or "").lower()
         return hostname in ("127.0.0.1", "localhost", "::1")
+    except Exception:
+        return False
+
+
+def is_ip_in_private_or_mesh_range(ip_str: str) -> bool:
+    """Check if an IP string is within private, loopback, link-local, or mesh/CGNAT ranges."""
+    if not ip_str:
+        return False
+    clean_ip = ip_str.strip("[]").split("%")[0]
+    try:
+        ip = ipaddress.ip_address(clean_ip)
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return True
+        # Tailscale / RFC 6598 Shared Address Space (100.64.0.0/10)
+        tailscale_cgnat = ipaddress.ip_network("100.64.0.0/10")
+        if ip in tailscale_cgnat:
+            return True
+        return False
+    except ValueError:
+        return False
+
+
+def is_trusted_host(
+    hostname: str,
+    server_host: str = None,
+    allowed_hosts: list = None,
+    allow_private: bool = None,
+) -> bool:
+    """Validate whether a Host header hostname is permitted.
+
+    Protects against DNS rebinding while permitting loopback, explicitly configured
+    allowed hosts, and private/mesh IP ranges when bound to 0.0.0.0 or ::.
+    """
+    if not hostname:
+        return False
+
+    hostname = hostname.lower().strip("[]").split("%")[0]
+    host_binding = (server_host if server_host is not None else DASHBOARD_HOST).lower()
+
+    # 1. Standard loopback hostnames and IPs are always permitted
+    if hostname in ("localhost", "127.0.0.1", "::1"):
+        return True
+
+    # 2. Permitted if matches explicit non-wildcard server bind host
+    if host_binding not in ("0.0.0.0", "::") and hostname == host_binding:
+        return True
+
+    # 3. Permitted if matches explicitly configured allowed hosts
+    configured_allowed = allowed_hosts if allowed_hosts is not None else DASHBOARD_ALLOWED_HOSTS
+    for allowed in configured_allowed:
+        allowed = allowed.strip().lower()
+        if not allowed:
+            continue
+        if allowed == "*":
+            return True
+        if allowed.startswith("*."):
+            suffix = allowed[1:]  # e.g. .ts.net or .local
+            if hostname.endswith(suffix):
+                return True
+        elif hostname == allowed:
+            return True
+
+    # 4. Permitted if private / mesh IP ranges are enabled
+    effective_allow_private = allow_private
+    if effective_allow_private is None:
+        if DASHBOARD_ALLOW_PRIVATE_NETWORKS is not None:
+            effective_allow_private = DASHBOARD_ALLOW_PRIVATE_NETWORKS
+        else:
+            effective_allow_private = host_binding in ("0.0.0.0", "::")
+
+    if effective_allow_private and is_ip_in_private_or_mesh_range(hostname):
+        return True
+
+    return False
+
+
+def is_trusted_origin(
+    origin: str,
+    server_host: str = None,
+    allowed_hosts: list = None,
+    allow_private: bool = None,
+) -> bool:
+    """Check if an Origin header refers to a trusted origin."""
+    if not origin:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(origin)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = (parsed.hostname or "").lower()
+        return is_trusted_host(
+            hostname,
+            server_host=server_host,
+            allowed_hosts=allowed_hosts,
+            allow_private=allow_private,
+        )
     except Exception:
         return False
 
@@ -1927,20 +2026,28 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
         """Reject foreign Host headers (including DNS rebinding) and origins."""
         host = self.headers.get("Host", "")
         parsed = urllib.parse.urlparse("http://" + host)
-        allowed = {"localhost", "127.0.0.1", "::1"}
-        if DASHBOARD_HOST not in ("0.0.0.0", "::"):
-            allowed.add(DASHBOARD_HOST.lower())
-        if (parsed.hostname or "").lower() not in allowed:
+        hostname = parsed.hostname or ""
+        server_host = getattr(self.server, "server_host", DASHBOARD_HOST)
+        allowed_hosts = getattr(self.server, "allowed_hosts", DASHBOARD_ALLOWED_HOSTS)
+        allow_private = getattr(self.server, "allow_private", DASHBOARD_ALLOW_PRIVATE_NETWORKS)
+        if not is_trusted_host(hostname, server_host=server_host, allowed_hosts=allowed_hosts, allow_private=allow_private):
             return False
         origin = self.headers.get("Origin")
         if origin:
             parsed_origin = urllib.parse.urlparse(origin)
-            return parsed_origin.scheme in ("http", "https") and parsed_origin.netloc.lower() == host.lower()
+            return (
+                parsed_origin.scheme in ("http", "https")
+                and parsed_origin.netloc.lower() == host.lower()
+                and is_trusted_origin(origin, server_host=server_host, allowed_hosts=allowed_hosts, allow_private=allow_private)
+            )
         return True
 
     def _set_cors_headers(self):
         origin = self.headers.get("Origin")
-        if origin and is_local_origin(origin) and self._trusted_request():
+        server_host = getattr(self.server, "server_host", DASHBOARD_HOST)
+        allowed_hosts = getattr(self.server, "allowed_hosts", DASHBOARD_ALLOWED_HOSTS)
+        allow_private = getattr(self.server, "allow_private", DASHBOARD_ALLOW_PRIVATE_NETWORKS)
+        if origin and is_trusted_origin(origin, server_host=server_host, allowed_hosts=allowed_hosts, allow_private=allow_private) and self._trusted_request():
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Access-Control-Allow-Credentials", "true")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -2013,7 +2120,10 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": "Untrusted request origin or host"}, status=403)
             return
         origin = self.headers.get("Origin")
-        if origin and not is_local_origin(origin):
+        server_host = getattr(self.server, "server_host", DASHBOARD_HOST)
+        allowed_hosts = getattr(self.server, "allowed_hosts", DASHBOARD_ALLOWED_HOSTS)
+        allow_private = getattr(self.server, "allow_private", DASHBOARD_ALLOW_PRIVATE_NETWORKS)
+        if origin and not is_trusted_origin(origin, server_host=server_host, allowed_hosts=allowed_hosts, allow_private=allow_private):
             self.send_response(403)
             self.end_headers()
             return
@@ -2397,9 +2507,25 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(e)}, status=500)
 
 
-def run_dashboard(host: str = DASHBOARD_HOST, port: int = DASHBOARD_PORT):
+def run_dashboard(
+    host: str = DASHBOARD_HOST,
+    port: int = DASHBOARD_PORT,
+    allowed_hosts: Optional[list] = None,
+    allow_private: Optional[bool] = None,
+):
     """Start the multi-threaded HTTP server."""
     server = ThreadingHTTPServer((host, port), MemoryDashboardHandler)
+    server.server_host = host
+    server.allowed_hosts = (
+        [h.strip().lower() for h in allowed_hosts if h.strip()]
+        if allowed_hosts is not None
+        else DASHBOARD_ALLOWED_HOSTS
+    )
+    server.allow_private = (
+        allow_private
+        if allow_private is not None
+        else DASHBOARD_ALLOW_PRIVATE_NETWORKS
+    )
     print(f"🚀 AGY Memory Debug Dashboard running at http://{host}:{port}")
     try:
         server.serve_forever()
@@ -2413,5 +2539,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AGY Memory Real-Time Debug Dashboard")
     parser.add_argument("--port", type=int, default=DASHBOARD_PORT, help=f"Server port (default: {DASHBOARD_PORT})")
     parser.add_argument("--host", default=DASHBOARD_HOST, help=f"Server host (default: {DASHBOARD_HOST})")
+    parser.add_argument("--allowed-hosts", default=None, help="Comma-separated list of allowed Host header values")
+    parser.add_argument("--allow-private-networks", action="store_true", default=None, help="Permit private and mesh network Host headers")
     args = parser.parse_args()
-    run_dashboard(host=args.host, port=args.port)
+    allowed = [h.strip().lower() for h in args.allowed_hosts.split(",")] if args.allowed_hosts else None
+    run_dashboard(host=args.host, port=args.port, allowed_hosts=allowed, allow_private=args.allow_private_networks)

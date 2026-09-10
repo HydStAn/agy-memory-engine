@@ -321,6 +321,10 @@ AGY_BIN=agy
 AGY_MEMORY_DEBUG_DASHBOARD=true
 AGY_MEMORY_DASHBOARD_PORT=8085
 AGY_MEMORY_DASHBOARD_HOST=127.0.0.1
+# Remote access (VPN, Tailscale, LAN): set HOST=0.0.0.0 or specify allowed hostnames
+# When bound to 0.0.0.0, private (RFC 1918) and Tailscale/mesh (RFC 6598 / 100.64.0.0/10) IPs are allowed by default
+AGY_MEMORY_DASHBOARD_ALLOWED_HOSTS=my-node.ts.net,*.ts.net
+AGY_MEMORY_DASHBOARD_ALLOW_PRIVATE_NETWORKS=true
 ```
 
 ---
