@@ -10,7 +10,6 @@ AGY Memory Engine - Multi-Layer Cognitive Memory Component
 
 import sys
 import os
-import shutil
 import sqlite3
 import argparse
 import re
@@ -18,7 +17,11 @@ import subprocess
 import json
 import difflib
 import datetime
-from contextlib import contextmanager
+import logging
+import tempfile
+import time
+from pathlib import Path
+from contextlib import contextmanager, nullcontext, closing
 
 import schema
 from schema import db_session, DB_PATH, PROTECTED_CATEGORIES
@@ -26,7 +29,7 @@ from config import (
     MODEL_NAME,
     DEFAULT_MODEL,
     CACHE_PATH,
-    AGY_BIN
+    AGY_BIN, MODEL_EXPLICIT, archive_path, sync_lock_path
 )
 try:
     from embedder import upsert_vector, delete_vector, build_text_repr
@@ -37,31 +40,39 @@ except ImportError:
 
 __version__ = "2.2.0"
 
-# Canonical taxonomies — single source of truth for extraction prompt AND runtime validation
-CANONICAL_FACT_CATEGORIES = frozenset({
-    "infra", "hardware", "software", "contacts", "family", "health", "fitness",
-    "finance", "insurance", "travel", "home", "media", "music", "work", "dev",
-    "preferences", "communication", "cloud", "security", "general"
-})
+logger = logging.getLogger("agy_memory")
+if not logger.handlers:
+    logger.addHandler(logging.StreamHandler(sys.stderr))
+logger.setLevel(logging.INFO)
+logger.propagate = False
+_VOCABULARY_CACHE = {}
 
-CANONICAL_LEARNING_CATEGORIES = frozenset({
-    "workflow", "communication", "finance", "health", "shopping", "travel",
-    "hardware", "safety", "architecture", "security", "automation", "general"
-})
 
-CANONICAL_EPISODE_TOPICS = frozenset({
-    "family", "health", "travel", "finance", "home", "dev", "infra",
-    "insurance", "music", "work", "realestate", "trading", "general"
-})
+class SyncBusyError(RuntimeError):
+    """Extraction could not acquire its lock; the turn must be retried."""
 
-CANONICAL_RELATIONS = frozenset({
-    "hosted_on", "runs_on", "depends_on", "part_of", "member_of",
-    "owned_by", "managed_by", "monitors", "treats", "prescribed_for",
-    "insured_by", "finances", "communicates_via", "located_at", "uses",
-    "stores", "connects_to", "related_to", "maintains", "created_by",
-    "delivers_to", "advises", "works_at", "lives_at", "travels_to",
-    "subscribed_to"
-})
+
+class SyncExtractionError(RuntimeError):
+    """Extraction or persistence failed; the turn must not be acknowledged."""
+
+
+@contextmanager
+def _writer(connection=None):
+    """Reuse the caller's transaction, or commit one standalone operation."""
+    if connection is not None:
+        yield connection
+    else:
+        with db_session() as conn, conn:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+    _VOCABULARY_CACHE.clear()
+
+
+from taxonomy import (
+    CANONICAL_FACT_CATEGORIES, CANONICAL_LEARNING_CATEGORIES,
+    CANONICAL_EPISODE_TOPICS, CANONICAL_RELATIONS, CANONICAL_EPISODE_STATUSES,
+    _CATEGORY_ALIASES, _normalize_category, validate_category, require_text, map_relation,
+)
 
 
 STOPWORDS = {
@@ -131,7 +142,7 @@ def extract_multilingual_tokens(query: str, vocab: set = None) -> list[str]:
     and decompose compound nouns with Fugenmorphemes & database vocabulary validation.
     """
     raw_words = re.findall(r'[\w]+', query.lower(), re.UNICODE)
-    base_words = [w for w in raw_words if len(w) > 2 and w not in STOPWORDS]
+    base_words = [w for w in raw_words if len(w) >= 2 and w not in STOPWORDS]
 
     expanded_words = set(base_words)
 
@@ -206,7 +217,7 @@ def get_existing_database_inventory() -> dict:
 
 def get_cached_model() -> str:
     """Read model from config (.env/env var) or cached file on disk, otherwise return default."""
-    if MODEL_NAME and MODEL_NAME != DEFAULT_MODEL:
+    if MODEL_EXPLICIT or (MODEL_NAME and MODEL_NAME != DEFAULT_MODEL):
         return MODEL_NAME
     if os.path.exists(CACHE_PATH):
         try:
@@ -221,7 +232,8 @@ def get_cached_model() -> str:
 def discover_and_cache_latest_flash_low_model() -> str:
     """Scan agy models list for the newest Gemini Flash model and persist it to disk."""
     try:
-        res = subprocess.run([AGY_BIN, "models"], capture_output=True, text=True, timeout=10)
+        res = subprocess.run([AGY_BIN, "models"], capture_output=True, text=True, timeout=10,
+                             env=dict(os.environ, AGY_INTERNAL_INVOCATION="1", AGY_SAGE_DISABLED="1"))
         lines = res.stdout.splitlines()
         for line in lines:
             parts = line.strip().split()
@@ -243,50 +255,70 @@ def is_trivial_prompt(text: str) -> bool:
     if not text or not text.strip():
         return True
     stripped = text.strip()
-    if stripped.startswith("/"):
+    if stripped.split(maxsplit=1)[0] in {"/help", "/clear", "/status", "/model", "/compact", "/new"}:
         return True
     return bool(TRIVIAL_PROMPT_RE.match(stripped))
 
 def get_all_vocabulary(cursor) -> set:
     """Retrieve indexed vocabulary tokens from all tables for fast fuzzy/typo correction and compound validation."""
+    path = cursor.execute("PRAGMA database_list").fetchone()[2]
+    # File identity prevents cache reuse after a DB is replaced at the same path.
+    identity = (path, os.stat(path).st_ino) if path else None
+    cached = _VOCABULARY_CACHE.get(identity) if identity else None
+    if cached and time.monotonic() - cached[0] < 60:
+        return set(cached[1])
     vocab = set()
     cursor.execute("SELECT id, category, fact, keywords FROM memories")
     for fid, cat, fact, kws in cursor.fetchall():
-        tokens = re.findall(r'[\w]{3,}', f"{fid} {cat or ''} {fact} {kws or ''}".lower(), re.UNICODE)
+        tokens = re.findall(r'[\w]{2,}', f"{fid} {cat or ''} {fact} {kws or ''}".lower(), re.UNICODE)
         vocab.update(tokens)
     
     cursor.execute("SELECT id, topic, title, narrative, entities, stance, keywords FROM episodes")
     for row in cursor.fetchall():
         text = " ".join([str(x) for x in row if x])
-        tokens = re.findall(r'[\w]{3,}', text.lower(), re.UNICODE)
+        tokens = re.findall(r'[\w]{2,}', text.lower(), re.UNICODE)
         vocab.update(tokens)
 
     cursor.execute("SELECT id, category, insight, context, keywords FROM learnings")
     for row in cursor.fetchall():
         text = " ".join([str(x) for x in row if x])
-        tokens = re.findall(r'[\w]{3,}', text.lower(), re.UNICODE)
+        tokens = re.findall(r'[\w]{2,}', text.lower(), re.UNICODE)
         vocab.update(tokens)
 
     cursor.execute("SELECT source_id, target_id, relation FROM entity_links")
     for row in cursor.fetchall():
-        tokens = re.findall(r'[\w]{3,}', f"{row[0]} {row[1]} {row[2]}".lower(), re.UNICODE)
+        tokens = re.findall(r'[\w]{2,}', f"{row[0]} {row[1]} {row[2]}".lower(), re.UNICODE)
         vocab.update(tokens)
 
+    if identity:
+        _VOCABULARY_CACHE[identity] = (time.monotonic(), frozenset(vocab))
     return vocab
 
-def link_entities(source_id: str, target_id: str, relation: str):
+def _assert_entity_identity(conn, table, entity_id):
+    for other in ('memories','episodes','learnings'):
+        if other != table and conn.execute(f'SELECT 1 FROM {other} WHERE id=?', (entity_id,)).fetchone():
+            raise ValueError(f'Entity ID already belongs to {other}: {entity_id}')
+
+
+def link_entities(source_id: str, target_id: str, relation: str, connection=None):
     """Create or update a directional entity link / relationship."""
-    with db_session() as conn:
+    source_id, target_id, relation = map_relation(require_text(source_id, 'source'), require_text(target_id, 'target'), relation)
+    with _writer(connection) as conn:
+        for endpoint in (source_id,target_id):
+            count = sum(bool(conn.execute(f'SELECT 1 FROM {table} WHERE id=?', (endpoint,)).fetchone()) for table in ('memories','episodes','learnings'))
+            if count != 1:
+                raise ValueError(f'Graph endpoint must identify exactly one content entity: {endpoint}')
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO entity_links (source_id, target_id, relation)
             VALUES (?, ?, ?)
             ON CONFLICT(source_id, target_id, relation) DO NOTHING;
         """, (source_id.strip(), target_id.strip(), relation.strip()))
-        conn.commit()
 
 def unlink_entities(source_id: str, target_id: str, relation: str = None):
     """Remove entity link(s) between two IDs."""
+    if relation is not None:
+        source_id, target_id, relation = map_relation(source_id.strip(), target_id.strip(), relation)
     with db_session() as conn:
         cursor = conn.cursor()
         if relation:
@@ -346,12 +378,16 @@ def age_episodes(days_to_cooling: int = 30, days_to_historic: int = 90) -> dict:
 
     return {"cooled": cooled, "historied": historied}
 
-def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_learnings: int = 2, quiet: bool = False):
+def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_learnings: int = 2, quiet: bool = False, max_context_bytes: int = 24000):
     """Multi-layer prefetch with:
     1. Persistent preferences & rules (Layer 1)
     2. FTS5 exact + typo fuzzy search (Facts, Episodes with status weighting, Learnings)
     3. Entity Graph Expansion (1-hop linked facts/episodes/learnings)
     """
+    if not isinstance(query, str) or len(query) > 16000:
+        raise ValueError('Query must be text up to 16000 characters')
+    limit_facts, limit_episodes, limit_learnings = [max(0, min(int(n), 100)) for n in (limit_facts, limit_episodes, limit_learnings)]
+    max_context_bytes = max(256, min(int(max_context_bytes), 1_000_000))
     if is_trivial_prompt(query):
         return {} if quiet else None
 
@@ -363,7 +399,7 @@ def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_le
             SELECT id, category, fact 
             FROM memories 
             WHERE category IN ('preference', 'rule', 'preferences')
-            ORDER BY id ASC
+            ORDER BY id ASC LIMIT 100
         """)
         pref_rows = cursor.fetchall()
         seen_fact_ids = {r[0] for r in pref_rows}
@@ -372,7 +408,7 @@ def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_le
 
         # 2. Extract search terms & multilingual compound sub-tokens with vocabulary validation
         vocab = get_all_vocabulary(cursor)
-        words = extract_multilingual_tokens(query, vocab)
+        words = extract_multilingual_tokens(query, vocab)[:32]
 
         fact_rows = []
         episode_rows = []
@@ -507,7 +543,7 @@ def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_le
                 links = cursor.fetchall()
                 for src, tgt, rel in links:
                     linked_target = tgt if src in matched_ids else src
-                    if linked_target not in seen_fact_ids and linked_target not in seen_episode_ids:
+                    if linked_target not in seen_fact_ids | seen_episode_ids | seen_learning_ids:
                         cursor.execute("SELECT id, category, fact FROM memories WHERE id = ?", (linked_target,))
                         mf = cursor.fetchone()
                         if mf:
@@ -519,80 +555,64 @@ def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_le
                             if me:
                                 linked_context.append(f"Linked Episode via '{rel}': [{me[1]} | {me[2]}] {me[3]}")
                                 seen_episode_ids.add(me[0])
+                            else:
+                                ml = cursor.execute("SELECT id, category, insight, context FROM learnings WHERE id = ?", (linked_target,)).fetchone()
+                                if ml:
+                                    linked_context.append(f"Linked Learning via '{rel}': ({ml[1]}) {ml[2]} [Context: {ml[3] or ''}]")
+                                    seen_learning_ids.add(ml[0])
 
-        # Output Generation
-        total_facts = pref_rows + fact_rows
+        # Bound the serialized context, including always-loaded preferences.
+        result = {'facts': [], 'episodes': [], 'learnings': [], 'linked_context': []}
+        for key, rows in (('facts', pref_rows + fact_rows), ('episodes', episode_rows),
+                          ('learnings', learning_rows), ('linked_context', locals().get('linked_context', []))):
+            for row in rows:
+                result[key].append(row)
+                if len(json.dumps(result, ensure_ascii=False).encode('utf-8')) > max_context_bytes:
+                    result[key].pop()
+        total_facts, episode_rows, learning_rows, linked_context = (result[key] for key in ('facts','episodes','learnings','linked_context'))
         if quiet:
-            return {
-                "facts": total_facts,
-                "episodes": episode_rows,
-                "learnings": learning_rows,
-                "linked_context": linked_context if 'linked_context' in locals() else []
-            }
+            return result
 
         if total_facts or episode_rows or learning_rows or (words and 'linked_context' in locals() and linked_context):
             if total_facts:
-                print("[🧠 Memory Context - Facts]")
+                logger.info("[🧠 Memory Context - Facts]")
                 for _, cat, fact in total_facts:
                     prefix = f"({cat}) " if cat else ""
-                    print(f"• {prefix}{fact}")
+                    logger.info(f"• {prefix}{fact}")
 
             if episode_rows:
-                print("\n[📖 Narrative Context - Episodic Memory]")
+                logger.info("\n[📖 Narrative Context - Episodic Memory]")
                 for eid, topic, title, period, status, narrative, entities, stance in episode_rows:
                     period_str = f" | {period}" if period else ""
                     status_str = f" | {status}" if status else ""
-                    print(f"• [{title}{period_str}{status_str}]")
-                    print(f"  Kontext: {narrative}")
+                    logger.info(f"• [{title}{period_str}{status_str}]")
+                    logger.info(f"  Kontext: {narrative}")
                     if stance:
-                        print(f"  Haltung/Stance: {stance}")
+                        logger.info(f"  Haltung/Stance: {stance}")
                     if entities:
-                        print(f"  Beteiligte/Entitäten: {entities}")
+                        logger.info(f"  Beteiligte/Entitäten: {entities}")
 
             if learning_rows:
-                print("\n[💡 Learnings & Heuristics]")
+                logger.info("\n[💡 Learnings & Heuristics]")
                 for lid, cat, insight, context in learning_rows:
                     prefix = f"({cat}) " if cat else ""
                     ctx_str = f" [Kontext: {context}]" if context else ""
-                    print(f"• {prefix}{insight}{ctx_str}")
+                    logger.info(f"• {prefix}{insight}{ctx_str}")
 
             if 'linked_context' in locals() and linked_context:
-                print("\n[🔗 Linked Entity Relations]")
+                logger.info("\n[🔗 Linked Entity Relations]")
                 for lc in linked_context:
-                    print(f"• {lc}")
-
-# Common LLM-generated category variants → canonical mapping
-_CATEGORY_ALIASES = {
-    "contact": "contacts", "kontakte": "contacts",
-    "infrastructure": "infra", "system_architecture": "infra", "system_config": "infra",
-    "admin": "infra", "config": "infra",
-    "pref": "preferences", "user": "preferences",
-    "pension": "finance", "trading": "finance", "stweg": "home",
-    "gear": "hardware", "tesla": "hardware",
-    "devsecops": "dev", "dev.cron": "automation",
-    "heuristics": "general", "ai_tools": "software", "ai": "dev",
-    "ui_ux": "architecture", "network": "infra",
-    "realestate": "home", "calendar": "general",
-}
+                    logger.info(f"• {lc}")
 
 
-def _normalize_category(category: str, allowed: frozenset) -> str:
-    """Normalize a category string to the closest canonical category."""
-    if not category:
-        return "general"
-    cat = category.strip().lower()
-    if cat in allowed:
-        return cat
-    if cat in _CATEGORY_ALIASES:
-        alias = _CATEGORY_ALIASES[cat]
-        if alias in allowed:
-            return alias
-    return "general"
 
-
-def upsert_fact(fact_id: str, category: str, fact: str, keywords: str = ""):
+def upsert_fact(fact_id: str, category: str, fact: str, keywords: str = "", connection=None):
     """Insert or update an atomic fact in the memories table and vector index."""
-    with db_session() as conn:
+    fact_id = require_text(fact_id, "id")
+    fact = require_text(fact, "fact")
+    category = validate_category(category, CANONICAL_FACT_CATEGORIES)
+    with _writer(connection) as conn:
+        _assert_entity_identity(conn, "memories", fact_id)
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO memories (id, category, fact, keywords, updated_at)
@@ -607,11 +627,19 @@ def upsert_fact(fact_id: str, category: str, fact: str, keywords: str = ""):
             # Vector representation includes category, content and keywords
             text_repr = build_text_repr("fact", {"category": category, "fact": fact, "keywords": keywords}) if build_text_repr else f"[{category}] {fact} {keywords or ''}".strip()
             upsert_vector(conn, "vec_memories", fact_id, text_repr)
-        conn.commit()
 
-def upsert_episode(episode_id: str, topic: str, title: str, narrative: str, period: str = "", status: str = "active", entities: str = "", stance: str = "", keywords: str = ""):
+
+def upsert_episode(episode_id: str, topic: str, title: str, narrative: str, period: str = "", status: str = "active", entities: str = "", stance: str = "", keywords: str = "", connection=None):
     """Insert or update a narrative chronicle/episode and vector index."""
-    with db_session() as conn:
+    episode_id = require_text(episode_id, 'id')
+    title = require_text(title, 'title')
+    narrative = require_text(narrative, 'narrative')
+    topic = validate_category(topic, CANONICAL_EPISODE_TOPICS)
+    status = require_text(status, 'status').lower()
+    if status not in CANONICAL_EPISODE_STATUSES:
+        raise ValueError(f'Unknown episode status: {status}')
+    with _writer(connection) as conn:
+        _assert_entity_identity(conn, "episodes", episode_id)
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO episodes (id, topic, title, period, status, narrative, entities, stance, keywords, updated_at)
@@ -630,11 +658,15 @@ def upsert_episode(episode_id: str, topic: str, title: str, narrative: str, peri
         if upsert_vector:
             text_repr = build_text_repr("episode", {"topic": topic, "title": title, "narrative": narrative, "stance": stance, "keywords": keywords}) if build_text_repr else f"[{topic}] {title}: {narrative} (Stance: {stance or 'neutral'}) {keywords or ''}".strip()
             upsert_vector(conn, "vec_episodes", episode_id, text_repr)
-        conn.commit()
 
-def upsert_learning(learning_id: str, category: str, insight: str, context: str = "", keywords: str = ""):
+
+def upsert_learning(learning_id: str, category: str, insight: str, context: str = "", keywords: str = "", connection=None):
     """Insert or update an experiential learning/heuristic and vector index."""
-    with db_session() as conn:
+    learning_id = require_text(learning_id, "id")
+    insight = require_text(insight, "insight")
+    category = validate_category(category, CANONICAL_LEARNING_CATEGORIES)
+    with _writer(connection) as conn:
+        _assert_entity_identity(conn, "learnings", learning_id)
         cursor = conn.cursor()
         cursor.execute("""
             INSERT INTO learnings (id, category, insight, context, keywords, updated_at)
@@ -649,7 +681,6 @@ def upsert_learning(learning_id: str, category: str, insight: str, context: str 
         if upsert_vector:
             text_repr = build_text_repr("learning", {"category": category, "insight": insight, "context": context, "keywords": keywords}) if build_text_repr else f"[{category}] {insight} (Context: {context or ''}) {keywords or ''}".strip()
             upsert_vector(conn, "vec_learnings", learning_id, text_repr)
-        conn.commit()
 
 def list_all():
     """Print a formatted overview of all stored facts, episodes, learnings, and entity relations."""
@@ -664,44 +695,52 @@ def list_all():
         cursor.execute("SELECT source_id, target_id, relation FROM entity_links ORDER BY source_id, target_id")
         links = cursor.fetchall()
 
-        print("=" * 80)
-        print(f"SEMANTIC FACTS ({len(facts)})")
-        print("=" * 80)
+        logger.info("=" * 80)
+        logger.info(f"SEMANTIC FACTS ({len(facts)})")
+        logger.info("=" * 80)
         for fid, cat, fact in facts:
-            print(f"{fid:<25} | {(cat or ''):<12} | {fact}")
+            logger.info(f"{fid:<25} | {(cat or ''):<12} | {fact}")
 
-        print("\n" + "=" * 80)
-        print(f"NARRATIVE CHRONICLES & EPISODES ({len(episodes)})")
-        print("=" * 80)
+        logger.info("\n" + "=" * 80)
+        logger.info(f"NARRATIVE CHRONICLES & EPISODES ({len(episodes)})")
+        logger.info("=" * 80)
         for eid, topic, title, period, status, narrative, stance in episodes:
             p_str = f" ({period})" if period else ""
             s_str = f" [{status}]" if status else ""
-            print(f"\n▶ [{eid}] {title}{p_str}{s_str} (Topic: {topic})")
-            print(f"  Narrative: {narrative}")
+            logger.info(f"\n▶ [{eid}] {title}{p_str}{s_str} (Topic: {topic})")
+            logger.info(f"  Narrative: {narrative}")
             if stance:
-                print(f"  Stance:    {stance}")
+                logger.info(f"  Stance:    {stance}")
 
-        print("\n" + "=" * 80)
-        print(f"EXPERIENTIAL LEARNINGS & HEURISTICS ({len(learnings)})")
-        print("=" * 80)
+        logger.info("\n" + "=" * 80)
+        logger.info(f"EXPERIENTIAL LEARNINGS & HEURISTICS ({len(learnings)})")
+        logger.info("=" * 80)
         for lid, cat, insight, context in learnings:
             ctx = f" (Context: {context})" if context else ""
-            print(f"{lid:<25} | {(cat or ''):<12} | {insight}{ctx}")
+            logger.info(f"{lid:<25} | {(cat or ''):<12} | {insight}{ctx}")
 
-        print("\n" + "=" * 80)
-        print(f"ENTITY GRAPH LINKS & RELATIONS ({len(links)})")
-        print("=" * 80)
+        logger.info("\n" + "=" * 80)
+        logger.info(f"ENTITY GRAPH LINKS & RELATIONS ({len(links)})")
+        logger.info("=" * 80)
         for src, tgt, rel in links:
-            print(f"{src:<30} --[{rel}]--> {tgt}")
+            logger.info(f"{src:<30} --[{rel}]--> {tgt}")
 
-def _is_protected_key(key_id: str) -> bool:
-    """Check if a key falls under a protected category (health, finance, etc.)."""
-    parts = key_id.split(".")
-    return any(part in PROTECTED_CATEGORIES for part in parts)
-
-def _get_existing_value(key_id: str, table: str) -> dict | None:
-    """Retrieve existing entry from a table by ID for diff comparison."""
+def _is_protected_key(key_id: str, existing: dict = None) -> bool:
+    """Protect persisted categories as well as category tokens in an ID."""
+    if any(part in PROTECTED_CATEGORIES for part in re.split(r"[._-]", key_id.lower())):
+        return True
+    if existing is not None:
+        return (existing.get("category") or existing.get("topic") or "").lower() in PROTECTED_CATEGORIES
     with db_session() as conn:
+        for table, column in (("memories", "category"), ("learnings", "category"), ("episodes", "topic")):
+            row = conn.execute(f"SELECT {column} FROM {table} WHERE id = ?", (key_id,)).fetchone()
+            if row and (row[0] or "").lower() in PROTECTED_CATEGORIES:
+                return True
+    return False
+
+def _get_existing_value(key_id: str, table: str, connection=None) -> dict | None:
+    """Retrieve existing entry from a table by ID for diff comparison."""
+    with nullcontext(connection) if connection is not None else db_session() as conn:
         cursor = conn.cursor()
         if table == "memories":
             cursor.execute("SELECT id, category, fact, keywords FROM memories WHERE id = ?", (key_id,))
@@ -730,11 +769,11 @@ def _format_diff(old: dict | None, new: dict, label: str) -> str:
             changes.append(f"    {key}: \"{old_val}\" → \"{new_val}\"")
     
     if changes:
-        protected_marker = " 🔒 PROTECTED" if _is_protected_key(new.get("id", "")) else ""
+        protected_marker = " 🔒 PROTECTED" if _is_protected_key(new.get("id", ""), old) else ""
         return f"  [UPDATE{protected_marker}] {label}: {new.get('id', '?')}\n" + "\n".join(changes)
     return ""
 
-def sync_turn(user_prompt: str, assistant_response: str, dry_run: bool = False) -> dict:
+def sync_turn(user_prompt: str, assistant_response: str, dry_run: bool = False, batch_id: str = None) -> dict:
     """Extract persistent information from a conversation turn and sync to memory.
     
     Args:
@@ -748,26 +787,82 @@ def sync_turn(user_prompt: str, assistant_response: str, dry_run: bool = False) 
     import fcntl
     import tempfile
 
-    lock_path = os.path.join(tempfile.gettempdir(), "agy_memory_sync_turn.lock")
+    lock_path = sync_lock_path(schema.DB_PATH)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
     try:
         lock_fd = open(lock_path, "w")
         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        # Another sync-turn is already running — skip silently to avoid parallel agy spawns
-        sys.stderr.write("agy_memory: sync-turn already running, skipping.\n")
-        return {"facts": [], "episodes": [], "learnings": [], "entity_links": []}
+        # Preserve the turn for retry rather than reporting an empty extraction.
+        sys.stderr.write("agy_memory: sync-turn already running; retry required.\n")
+        lock_fd.close()
+        raise SyncBusyError("sync-turn already running")
 
     try:
-        return _sync_turn_inner(user_prompt, assistant_response, dry_run)
+        return _sync_turn_inner(user_prompt, assistant_response, dry_run, batch_id=batch_id)
+    except (SyncBusyError, SyncExtractionError):
+        raise
+    except sqlite3.OperationalError as error:
+        if getattr(error, "sqlite_errorcode", 0) & 255 in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+            raise SyncBusyError(str(error)) from error
+        raise SyncExtractionError(str(error)) from error
+    except Exception as error:
+        raise SyncExtractionError(str(error)) from error
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         lock_fd.close()
 
 
-def _sync_turn_inner(user_prompt: str, assistant_response: str, dry_run: bool = False) -> dict:
+def _infer_json(prompt, timeout):
+    """A bounded subprocess with no tools; never launch an unrestricted agent."""
+    try:
+        result = subprocess.run(
+            [sys.executable, str(Path(__file__).with_name('memory_inference.py')), '--model', get_cached_model()],
+            input=prompt, capture_output=True, text=True, timeout=timeout,
+            env=dict(os.environ, AGY_INTERNAL_INVOCATION='1', AGY_SAGE_DISABLED='1'))
+    except subprocess.TimeoutExpired as error:
+        raise SyncExtractionError('Inference timed out; retry required') from error
+    except OSError as error:
+        raise SyncExtractionError('Cannot launch inference process') from error
+    if result.returncode != 0 or not result.stdout.strip():
+        raise SyncExtractionError('Tool-free inference failed; check AGY_MEMORY_INFERENCE_URL/model/key configuration')
+    return result.stdout.strip()
+
+
+def _validate_extraction(data):
+    """Reject malformed items before any database write or queue acknowledgement."""
+    required = {"facts": ("id", "fact"), "episodes": ("id", "narrative"),
+                "learnings": ("id", "insight"), "entity_links": ("source", "target", "relation")}
+    if not isinstance(data, dict) or not any(key in data for key in required):
+        raise SyncExtractionError("Extraction must contain recognized entity lists")
+    for key, fields in required.items():
+        items = data.get(key, [])
+        if not isinstance(items, list):
+            raise SyncExtractionError(f"{key} must be a list")
+        for item in items:
+            if not isinstance(item, dict) or any(not isinstance(item.get(f), str) or not item[f].strip() for f in fields):
+                raise SyncExtractionError(f"Invalid {key} item")
+            if any(not isinstance(value, str) for value in item.values()):
+                raise SyncExtractionError(f"Non-text field in {key}")
+            for field in ("id", "source", "target"):
+                if field in item:
+                    item[field] = item[field].strip()
+
+
+def _sync_turn_inner(user_prompt: str, assistant_response: str, dry_run: bool = False, batch_id: str = None) -> dict:
     """Inner implementation of sync_turn, called only when lock is held."""
     empty_res = {"facts": [], "episodes": [], "learnings": [], "entity_links": []}
+    with db_session() as conn:
+        if batch_id and not dry_run:
+            receipt = conn.execute('SELECT result_json FROM batch_receipts WHERE batch_id=?', (batch_id,)).fetchone()
+            if receipt:
+                return json.loads(receipt[0])
+        revisions = {(kind, key): rev for kind, key, rev in conn.execute('SELECT * FROM entity_revisions')}
+        db_gen = schema.get_db_generation(conn)
     if is_trivial_prompt(user_prompt):
+        if batch_id and not dry_run:
+            with db_session() as conn, conn:
+                conn.execute('INSERT OR IGNORE INTO batch_receipts(batch_id,result_json) VALUES (?,?)', (batch_id, json.dumps(empty_res)))
         return empty_res
 
     inv = get_existing_database_inventory()
@@ -779,14 +874,14 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
 ## Layer Definitions
 
 1. ATOMIC FACTS ("facts"): Hard facts, IPs, specs, master data, device IDs, account names, medications, config parameters, definite dates/appointments, contact details.
-   ALLOWED CATEGORIES: infra, hardware, software, contacts, family, health, fitness, finance, insurance, travel, home, media, music, work, dev, preferences, communication, cloud, security, general
+   ALLOWED CATEGORIES: {', '.join(sorted(CANONICAL_FACT_CATEGORIES))}
 
 2. NARRATIVE CHRONICLES & EPISODES ("episodes"): Background histories, disputes, social/relationship dynamics, sentiment/stances, multi-event story arcs.
    - Status: "active" (ongoing), "cooling" (cooling down), "historic" (concluded past), "resolved" (fixed/completed).
    ALLOWED TOPICS: family, health, travel, finance, home, dev, infra, insurance, music, work, realestate, trading, general
 
 3. EXPERIENTIAL LEARNINGS ("learnings"): ONLY personal heuristics, behavioral insights, and reusable rules of thumb that will help in FUTURE similar situations.
-   ALLOWED CATEGORIES: workflow, communication, finance, health, shopping, travel, hardware, safety, architecture, security, automation, general
+   ALLOWED CATEGORIES: {', '.join(sorted(CANONICAL_LEARNING_CATEGORIES))}
 
    ✅ GOOD learnings (store these):
    - "Karin prefers bullet-point summaries for financial topics" (personal communication insight)
@@ -805,11 +900,8 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
 
 4. ENTITY LINKS ("entity_links"): Structural relationships between existing entities.
    You MUST use ONLY these canonical relation types:
-   hosted_on, runs_on, depends_on, part_of, member_of, owned_by, managed_by, monitors,
-   treats, prescribed_for, insured_by, finances, communicates_via, located_at, uses,
-   stores, connects_to, related_to, maintains, created_by, delivers_to, advises,
-   works_at, lives_at, travels_to, subscribed_to
-   DO NOT invent new relation types. If none of the above fits, use "related_to".
+   {', '.join(sorted(CANONICAL_RELATIONS))}
+   Do not invent relation types. Omit ambiguous relations.
 
 ## Existing Database Keys & Topics:
 {inv_context}
@@ -868,34 +960,7 @@ Output ONLY a single valid JSON object (or {{"facts":[], "episodes":[], "learnin
 }}
 """
 
-    model_name = get_cached_model()
-    out = ""
-    run_env = dict(os.environ)
-    run_env["AGY_INTERNAL_INVOCATION"] = "1"
-
-    try:
-        res = subprocess.run(
-            [AGY_BIN, "--print", prompt, "--model", model_name, "--dangerously-skip-permissions"],
-            capture_output=True, text=True, timeout=90, env=run_env
-        )
-        out = res.stdout.strip()
-    except Exception:
-        out = ""
-
-    if not out:
-        model_name = discover_and_cache_latest_flash_low_model()
-        try:
-            res = subprocess.run(
-                [AGY_BIN, "--print", prompt, "--model", model_name, "--dangerously-skip-permissions"],
-                capture_output=True, text=True, timeout=90, env=run_env
-            )
-            out = res.stdout.strip()
-        except Exception as e:
-            sys.stderr.write(f"Sync failed: {e}\n")
-            return empty_res
-
-    if not out:
-        return empty_res
+    out = _infer_json(prompt, timeout=90)
 
     applied_changes = {
         "facts": [],
@@ -904,18 +969,35 @@ Output ONLY a single valid JSON object (or {{"facts":[], "episodes":[], "learnin
         "entity_links": []
     }
 
-    json_match = re.search(r'\{.*\}', out, re.DOTALL)
+    json_match = re.fullmatch(r'\{.*\}', out.strip(), re.DOTALL)
+    if not json_match:
+        raise SyncExtractionError("Model output contains no JSON object")
     if json_match:
         try:
             data = json.loads(json_match.group(0))
-            if isinstance(data, dict):
+            _validate_extraction(data)
+            with db_session() as transaction, transaction:
+                if not dry_run:
+                    transaction.execute("BEGIN IMMEDIATE")
+                    if schema.get_db_generation(transaction) != db_gen:
+                        raise SyncExtractionError("Database generation changed during inference; aborting stale commit")
+                    if batch_id:
+                        receipt = transaction.execute('SELECT result_json FROM batch_receipts WHERE batch_id=?', (batch_id,)).fetchone()
+                        if receipt:
+                            return json.loads(receipt[0])
+                    for layer, table in (('facts','memories'), ('episodes','episodes'), ('learnings','learnings')):
+                        for item in data.get(layer, []):
+                            row = transaction.execute('SELECT revision FROM entity_revisions WHERE entity_type=? AND entity_id=?', (table,item['id'])).fetchone()
+                            if (row[0] if row else None) != revisions.get((table,item['id'])):
+                                raise SyncExtractionError(f"Concurrent edit conflict: {table}/{item['id']}")
                 diff_lines = []
                 skipped_protected = []
 
                 # --- Facts ---
                 for f in data.get("facts", []):
                     if isinstance(f, dict) and "id" in f and "fact" in f:
-                        existing = _get_existing_value(f["id"], "memories")
+                        existing = _get_existing_value(f["id"], "memories", connection=transaction)
+                        f = dict(existing or {}, **f)
                         diff = _format_diff(existing, f, "Fact")
                         if diff:
                             diff_lines.append(diff)
@@ -924,25 +1006,25 @@ Output ONLY a single valid JSON object (or {{"facts":[], "episodes":[], "learnin
                             continue
                         
                         # Protected category guard: skip updates to existing protected entries
-                        if existing and _is_protected_key(f["id"]):
+                        if existing and _is_protected_key(f["id"], existing):
                             skipped_protected.append(f["id"])
                             sys.stderr.write(f"[PROTECTED] Skipping update to protected fact '{f['id']}' — use manual 'add' to update.\n")
                             continue
                         
-                        norm_cat = _normalize_category(f.get("category", "general"), CANONICAL_FACT_CATEGORIES)
-                        upsert_fact(f["id"], norm_cat, f["fact"], f.get("keywords", ""))
+                        norm_cat = validate_category(f.get("category", "general"), CANONICAL_FACT_CATEGORIES)
+                        upsert_fact(f["id"], norm_cat, f["fact"], f.get("keywords", ""), connection=transaction)
                         applied_changes["facts"].append({
                             "id": f["id"],
-                            "category": f.get("category", "general"),
+                            "category": norm_cat,
                             "fact": f["fact"],
                             "is_update": existing is not None
                         })
-                        print(f"Fact synced: {f['id']}")
 
                 # --- Episodes ---
                 for ep in data.get("episodes", []):
                     if isinstance(ep, dict) and "id" in ep and "narrative" in ep:
-                        existing = _get_existing_value(ep["id"], "episodes")
+                        existing = _get_existing_value(ep["id"], "episodes", connection=transaction)
+                        ep = dict(existing or {}, **ep)
                         diff = _format_diff(existing, ep, "Episode")
                         if diff:
                             diff_lines.append(diff)
@@ -950,12 +1032,12 @@ Output ONLY a single valid JSON object (or {{"facts":[], "episodes":[], "learnin
                         if dry_run:
                             continue
                         
-                        if existing and _is_protected_key(ep["id"]):
+                        if existing and _is_protected_key(ep["id"], existing):
                             skipped_protected.append(ep["id"])
                             sys.stderr.write(f"[PROTECTED] Skipping update to protected episode '{ep['id']}' — use manual 'add-episode' to update.\n")
                             continue
                         
-                        norm_topic = _normalize_category(ep.get("topic", "general"), CANONICAL_EPISODE_TOPICS)
+                        norm_topic = validate_category(ep.get("topic", "general"), CANONICAL_EPISODE_TOPICS)
                         upsert_episode(
                             ep["id"],
                             norm_topic,
@@ -965,21 +1047,21 @@ Output ONLY a single valid JSON object (or {{"facts":[], "episodes":[], "learnin
                             status=ep.get("status", "active"),
                             entities=ep.get("entities", ""),
                             stance=ep.get("stance", ""),
-                            keywords=ep.get("keywords", "")
+                            keywords=ep.get("keywords", ""), connection=transaction
                         )
                         applied_changes["episodes"].append({
                             "id": ep["id"],
-                            "topic": ep.get("topic", "general"),
+                            "topic": norm_topic,
                             "title": ep.get("title", ep["id"]),
                             "status": ep.get("status", "active"),
                             "is_update": existing is not None
                         })
-                        print(f"Episode synced: {ep['id']}")
 
                 # --- Learnings ---
                 for lr in data.get("learnings", []):
                     if isinstance(lr, dict) and "id" in lr and "insight" in lr:
-                        existing = _get_existing_value(lr["id"], "learnings")
+                        existing = _get_existing_value(lr["id"], "learnings", connection=transaction)
+                        lr = dict(existing or {}, **lr)
                         diff = _format_diff(existing, lr, "Learning")
                         if diff:
                             diff_lines.append(diff)
@@ -987,59 +1069,71 @@ Output ONLY a single valid JSON object (or {{"facts":[], "episodes":[], "learnin
                         if dry_run:
                             continue
                         
-                        norm_lcat = _normalize_category(lr.get("category", "general"), CANONICAL_LEARNING_CATEGORIES)
+                        if existing and _is_protected_key(lr["id"], existing):
+                            skipped_protected.append(lr["id"])
+                            continue
+                        norm_lcat = validate_category(lr.get("category", "general"), CANONICAL_LEARNING_CATEGORIES)
                         upsert_learning(
                             lr["id"],
                             norm_lcat,
                             lr["insight"],
                             context=lr.get("context", ""),
-                            keywords=lr.get("keywords", "")
+                            keywords=lr.get("keywords", ""), connection=transaction
                         )
                         applied_changes["learnings"].append({
                             "id": lr["id"],
-                            "category": lr.get("category", "general"),
+                            "category": norm_lcat,
                             "insight": lr["insight"],
                             "is_update": existing is not None
                         })
-                        print(f"Learning synced: {lr['id']}")
 
                 # --- Entity Links ---
                 for el in data.get("entity_links", []):
                     if isinstance(el, dict) and "source" in el and "target" in el and "relation" in el:
-                        relation = el["relation"].strip().lower()
-                        # Normalize non-canonical relations to 'related_to'
-                        if relation not in CANONICAL_RELATIONS:
-                            sys.stderr.write(f"[NORM] Non-canonical relation '{el['relation']}' normalized to 'related_to' for {el['source']} -> {el['target']}\n")
-                            relation = "related_to"
+                        source, target, relation = map_relation(el['source'], el['target'], el['relation'])
+                        el = dict(el, source=source, target=target)
                         if dry_run:
                             diff_lines.append(f"  [NEW] Entity Link: {el['source']} --[{relation}]--> {el['target']}")
                             continue
-                        link_entities(el["source"], el["target"], relation)
+                        for endpoint in (el["source"], el["target"]):
+                            if not any(transaction.execute(f"SELECT 1 FROM {table} WHERE id = ?", (endpoint,)).fetchone()
+                                       for table in ("memories", "episodes", "learnings")):
+                                raise SyncExtractionError(f"Unknown graph endpoint: {endpoint}")
+                        link_entities(el["source"], el["target"], relation, connection=transaction)
                         applied_changes["entity_links"].append({
                             "source": el["source"],
                             "target": el["target"],
                             "relation": relation
                         })
-                        print(f"Entity link synced: {el['source']} ->{el['target']} [{relation}]")
+
+                if batch_id and not dry_run:
+                    transaction.execute('INSERT INTO batch_receipts(batch_id,result_json) VALUES (?,?)', (batch_id,json.dumps(applied_changes)))
 
                 # Print diff summary
                 if dry_run and diff_lines:
-                    print("\n[DRY-RUN] Proposed changes:")
+                    logger.info("\n[DRY-RUN] Proposed changes:")
                     for dl in diff_lines:
-                        print(dl)
+                        logger.info(dl)
                     if not diff_lines:
-                        print("  (no changes detected)")
+                        logger.info("  (no changes detected)")
                 elif dry_run:
-                    print("[DRY-RUN] No changes detected.")
+                    logger.info("[DRY-RUN] No changes detected.")
 
                 if skipped_protected:
-                    print(f"\n[INFO] {len(skipped_protected)} protected entry/entries skipped: {', '.join(skipped_protected)}")
+                    logger.info(f"\n[INFO] {len(skipped_protected)} protected entry/entries skipped: {', '.join(skipped_protected)}")
 
         except json.JSONDecodeError as e:
-            sys.stderr.write(f"JSON decode error during memory sync: {e}\n")
+            raise SyncExtractionError("Invalid extraction JSON") from e
+        except sqlite3.OperationalError as e:
+            if getattr(e, "sqlite_errorcode", 0) & 255 in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+                raise SyncBusyError(f"Database contention: {e}") from e
+            raise SyncExtractionError(f"Extraction transaction failed: {e}") from e
         except Exception as e:
-            sys.stderr.write(f"Unexpected error during memory sync: {e}\n")
+            raise SyncExtractionError(f"Extraction transaction failed: {e}") from e
 
+    _VOCABULARY_CACHE.clear()
+    if not dry_run:
+        logger.info("Memory sync committed: %s", {key: len(items) for key, items in applied_changes.items()})
     return applied_changes
 
 def consolidate_memories(dry_run: bool = False) -> list:
@@ -1051,9 +1145,11 @@ def consolidate_memories(dry_run: bool = False) -> list:
         cursor = conn.cursor()
         cursor.execute("SELECT id, category, fact, keywords FROM memories ORDER BY category, id")
         all_facts = cursor.fetchall()
+        consolidation_revisions = dict(conn.execute("SELECT entity_id,revision FROM entity_revisions WHERE entity_type='memories'"))
+        consolidation_gen = schema.get_db_generation(conn)
 
     if not all_facts or len(all_facts) < 2:
-        print("[CONSOLIDATE] Less than 2 facts in database. Nothing to consolidate.")
+        logger.info("[CONSOLIDATE] Less than 2 facts in database. Nothing to consolidate.")
         return []
 
     # Group facts by category with at least 2 entries
@@ -1071,7 +1167,7 @@ def consolidate_memories(dry_run: bool = False) -> list:
     categories_to_check = {k: v for k, v in categories_to_check.items() if len(v) >= 2}
 
     if not categories_to_check:
-        print("[CONSOLIDATE] No categories with 2+ facts to consolidate.")
+        logger.info("[CONSOLIDATE] No categories with 2+ facts to consolidate.")
         return []
 
     canonical_cats = ", ".join(sorted(CANONICAL_FACT_CATEGORIES))
@@ -1107,81 +1203,101 @@ Respond ONLY with valid JSON in this exact structure:
   ]
 }}
 """
-    model_name = get_cached_model()
-    out = ""
-    try:
-        res = subprocess.run(
-            [AGY_BIN, "--print", prompt, "--model", model_name, "--dangerously-skip-permissions"],
-            capture_output=True, text=True, timeout=120
-        )
-        out = res.stdout.strip()
-    except Exception:
-        out = ""
-
-    if not out:
-        model_name = discover_and_cache_latest_flash_low_model()
-        try:
-            res = subprocess.run(
-                [AGY_BIN, "--print", prompt, "--model", model_name, "--dangerously-skip-permissions"],
-                capture_output=True, text=True, timeout=120
-            )
-            out = res.stdout.strip()
-        except Exception as e:
-            sys.stderr.write(f"Consolidation LLM call failed: {e}\n")
-            return []
-
-    if not out:
-        return []
+    out = _infer_json(prompt, timeout=120)
 
     consolidations = []
-    json_match = re.search(r'\{.*\}', out, re.DOTALL)
+    json_match = re.fullmatch(r'\{.*\}', out.strip(), re.DOTALL)
+    if not json_match:
+        raise SyncExtractionError("Consolidation output must be a JSON object")
     if json_match:
         try:
             data = json.loads(json_match.group(0))
-            for merge in data.get("merges", []):
-                target_id = merge.get("target_id")
-                raw_cat = merge.get("category", "general")
+            if not isinstance(data, dict) or not isinstance(data.get('merges'), list):
+                raise SyncExtractionError('Consolidation requires a merges list')
+            for merge in data['merges']:
+                if not isinstance(merge,dict) or not isinstance(merge.get('merged_ids'),list) or any(not isinstance(mid,str) or not mid.strip() for mid in merge['merged_ids']):
+                    raise SyncExtractionError('Malformed consolidation proposal')
+                for field in ('target_id','category','fact'):
+                    require_text(merge.get(field), field)
+            for merge in data['merges']:
+                target_id = require_text(merge.get("target_id"), "target_id")
+                raw_cat = require_text(merge.get("category", "general"), "category")
                 cat_name = _normalize_category(raw_cat, CANONICAL_FACT_CATEGORIES)
-                merged_ids = [m for m in merge.get("merged_ids", []) if m != target_id]
-                fact_text = merge.get("fact")
+                fact_text = require_text(merge.get("fact"), "fact")
                 kws = merge.get("keywords", "")
                 rationale = merge.get("rationale", "")
+
+                raw_merged = merge.get("merged_ids", [])
+                merged_ids = []
+                for m in raw_merged:
+                    mid = require_text(m, "merged_id")
+                    if mid != target_id and mid not in merged_ids:
+                        merged_ids.append(mid)
 
                 if not target_id or not merged_ids or not fact_text:
                     continue
 
                 category_facts = categories_to_check.get(raw_cat, categories_to_check.get(cat_name, []))
                 existing_merged = [m for m in merged_ids if any(f["id"] == m for f in category_facts)]
+                existing_merged = [m for m in existing_merged if m != target_id]
                 if not existing_merged:
                     continue
 
                 diff_summary = f"Merged [{', '.join(existing_merged)}] into [{target_id}]"
 
-                if not dry_run:
-                    with db_session() as conn:
-                        cursor = conn.cursor()
-                        # 1. Update / upsert target record with normalized category
-                        cursor.execute("""
-                            INSERT INTO memories (id, category, fact, keywords, updated_at)
-                            VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
-                            ON CONFLICT(id) DO UPDATE SET
-                                category = excluded.category,
-                                fact = excluded.fact,
-                                keywords = excluded.keywords,
-                                updated_at = CURRENT_TIMESTAMP;
-                        """, (target_id, cat_name, fact_text, kws))
-
-                        # 2. Delete redundant merged IDs
+                with db_session() as conn, conn:
+                    if not dry_run:
+                        conn.execute("BEGIN IMMEDIATE")
+                    if schema.get_db_generation(conn) != consolidation_gen:
+                        logger.warning('Rejected stale consolidation proposal for %s: database generation changed', target_id)
+                        continue
+                    stale = False
+                    for entity_id in set(existing_merged + [target_id]):
+                        row = conn.execute("SELECT revision FROM entity_revisions WHERE entity_type='memories' AND entity_id=?", (entity_id,)).fetchone()
+                        if (row[0] if row else None) != consolidation_revisions.get(entity_id):
+                            stale = True
+                    if stale:
+                        logger.warning('Rejected stale consolidation proposal for %s', target_id)
+                        continue
+                    target = conn.execute("SELECT id, category, fact, keywords FROM memories WHERE id = ?", (target_id,)).fetchone()
+                    allowed_ids = {f["id"] for f in category_facts}
+                    if target and (target_id not in allowed_ids or _is_protected_key(target_id, {"category": target[1]})):
+                        continue
+                    # A new fact ID must not collide with another entity layer.
+                    if not target and any(conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (target_id,)).fetchone() for table in ("episodes", "learnings")):
+                        continue
+                    sources = []
+                    for mid in existing_merged:
+                        row = conn.execute("SELECT id, category, fact, keywords FROM memories WHERE id = ?", (mid,)).fetchone()
+                        if not row or row[1] != raw_cat or _is_protected_key(mid, {"category": row[1]}):
+                            break
+                        sources.append(row)
+                    if len(sources) != len(existing_merged) or (target and target[1] != raw_cat):
+                        continue
+                    # Reject stale model proposals if a fact changed during inference.
+                    proposed = {f["id"]: f for f in category_facts}
+                    if any(row[2] != proposed[row[0]]["fact"] or (row[3] or "") != proposed[row[0]]["keywords"] for row in sources + ([target] if target else [])):
+                        continue
+                    placeholders = ",".join("?" for _ in existing_merged)
+                    links = conn.execute(f"SELECT source_id, target_id, relation FROM entity_links WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})", existing_merged * 2).fetchall()
+                    if not dry_run:
+                        upsert_fact(target_id, cat_name, fact_text, kws, connection=conn)
+                        for src, tgt, relation in links:
+                            conn.execute("DELETE FROM entity_links WHERE source_id=? AND target_id=? AND relation=?", (src, tgt, relation))
+                            new_src = target_id if src in existing_merged else src
+                            new_tgt = target_id if tgt in existing_merged else tgt
+                            if new_src != new_tgt:
+                                conn.execute("INSERT OR IGNORE INTO entity_links VALUES (?, ?, ?)",
+                                             (new_src, new_tgt, relation))
                         for mid in existing_merged:
-                            cursor.execute("DELETE FROM memories WHERE id = ?", (mid,))
-
-                        # 3. Insert audit log record
-                        cursor.execute("""
-                            INSERT INTO consolidation_log (action, category, target_id, merged_ids, diff_summary, rationale, timestamp)
-                            VALUES ('merge', ?, ?, ?, ?, ?, CURRENT_TIMESTAMP);
-                        """, (cat_name, target_id, json.dumps(existing_merged, ensure_ascii=False), diff_summary, rationale))
-
-                        conn.commit()
+                            if mid != target_id:
+                                conn.execute("DELETE FROM memories WHERE id = ?", (mid,))
+                        assert conn.execute("SELECT 1 FROM memories WHERE id = ?", (target_id,)).fetchone() is not None, f"Consolidated target fact '{target_id}' missing after merge"
+                        preimage = json.dumps({"summary": diff_summary, "facts": sources, "target": target, "entity_links": links}, ensure_ascii=False)
+                        conn.execute("""INSERT INTO consolidation_log
+                            (action, category, target_id, merged_ids, diff_summary, rationale)
+                            VALUES ('merge', ?, ?, ?, ?, ?)""",
+                            (cat_name, target_id, json.dumps(existing_merged), preimage, rationale))
 
                 consolidations.append({
                     "category": cat_name,
@@ -1191,9 +1307,9 @@ Respond ONLY with valid JSON in this exact structure:
                     "rationale": rationale,
                     "diff_summary": diff_summary
                 })
-                print(f"[CONSOLIDATE] {diff_summary} (Rationale: {rationale})")
+                logger.info(f"[CONSOLIDATE] {diff_summary} (Rationale: {rationale})")
         except Exception as e:
-            sys.stderr.write(f"Error parsing consolidation JSON: {e}\n")
+            raise SyncExtractionError(f"Consolidation failed: {e}") from e
 
     return consolidations
 
@@ -1232,163 +1348,105 @@ def prune_orphan_links(dry_run: bool = False) -> int:
 
 
 def normalize_existing_categories() -> dict:
-    """Batch-normalize all categories/topics to canonical taxonomies. Returns counts."""
+    """Apply only known mappings; preserve unknown legacy values for review."""
     counts = {"facts": 0, "learnings": 0, "episodes": 0, "links": 0}
-    with db_session() as conn:
-        cursor = conn.cursor()
-
-        # Facts
-        for fid, cat in cursor.execute("SELECT id, category FROM memories").fetchall():
-            norm = _normalize_category(cat, CANONICAL_FACT_CATEGORIES)
-            if norm != cat:
-                cursor.execute("UPDATE memories SET category = ? WHERE id = ?", (norm, fid))
-                counts["facts"] += 1
-
-        # Learnings
-        for lid, cat in cursor.execute("SELECT id, category FROM learnings").fetchall():
-            norm = _normalize_category(cat, CANONICAL_LEARNING_CATEGORIES)
-            if norm != cat:
-                cursor.execute("UPDATE learnings SET category = ? WHERE id = ?", (norm, lid))
-                counts["learnings"] += 1
-
-        # Episodes
-        for eid, topic in cursor.execute("SELECT id, topic FROM episodes").fetchall():
-            norm = _normalize_category(topic, CANONICAL_EPISODE_TOPICS)
-            if norm != topic:
-                cursor.execute("UPDATE episodes SET topic = ? WHERE id = ?", (norm, eid))
-                counts["episodes"] += 1
-
-        # Entity link relations
-        for src, tgt, rel in cursor.execute("SELECT source_id, target_id, relation FROM entity_links").fetchall():
-            rel_lower = rel.strip().lower()
-            if rel_lower not in CANONICAL_RELATIONS:
-                cursor.execute(
-                    "DELETE FROM entity_links WHERE source_id = ? AND target_id = ? AND relation = ?",
-                    (src, tgt, rel)
-                )
-                cursor.execute(
-                    "INSERT OR IGNORE INTO entity_links (source_id, target_id, relation) VALUES (?, ?, ?)",
-                    (src, tgt, "related_to")
-                )
-                counts["links"] += 1
-
-        conn.commit()
+    with db_session() as conn, conn:
+        conn.execute('BEGIN IMMEDIATE')
+        for table, column, allowed, key in (
+            ('memories','category',CANONICAL_FACT_CATEGORIES,'facts'),
+            ('learnings','category',CANONICAL_LEARNING_CATEGORIES,'learnings'),
+            ('episodes','topic',CANONICAL_EPISODE_TOPICS,'episodes')):
+            for entity_id, value in conn.execute(f'SELECT id,{column} FROM {table}').fetchall():
+                try:
+                    normalized = validate_category(value, allowed)
+                except ValueError:
+                    logger.warning('Preserving unknown taxonomy: %s/%s category=%r', table, entity_id, value)
+                    continue
+                if normalized != value:
+                    conn.execute(f'UPDATE {table} SET {column}=? WHERE id=?', (normalized,entity_id))
+                    counts[key] += 1
+        for src, tgt, rel in conn.execute('SELECT source_id,target_id,relation FROM entity_links').fetchall():
+            try:
+                normalized = map_relation(src,tgt,rel)
+            except ValueError:
+                logger.warning('Preserving ambiguous legacy relation %r', rel)
+                continue
+            if normalized != (src,tgt,rel):
+                conn.execute('DELETE FROM entity_links WHERE source_id=? AND target_id=? AND relation=?', (src,tgt,rel))
+                conn.execute('INSERT OR IGNORE INTO entity_links VALUES (?,?,?)', normalized)
+                counts['links'] += 1
     return counts
 
 
+FTS_COLUMNS = {
+    "memories": "id, category, fact, keywords",
+    "episodes": "id, topic, title, narrative, entities, stance, keywords",
+    "learnings": "id, category, insight, context, keywords",
+    "entity_links": "source_id, target_id, relation",
+}
+
+
+def rebuild_fts(conn):
+    """Resynchronize standalone FTS tables from authoritative base rows."""
+    for table, columns in FTS_COLUMNS.items():
+        conn.execute(f"DELETE FROM {table}_fts")
+        conn.execute(f"INSERT INTO {table}_fts (rowid, {columns}) SELECT rowid, {columns} FROM {table}")
+    _VOCABULARY_CACHE.clear()
+
+
+@contextmanager
+def _readonly_db(path):
+    with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as conn:
+        yield conn
+
+
 def optimize_db(apply_changes: bool = False, age_decay: bool = True, consolidate: bool = False):
-    """Rebuild FTS5 indexes, execute automatic episode aging, optionally consolidate duplicate facts, run VACUUM, and report stats."""
-    backup_dir = os.path.expanduser("~/.gemini/archive")
-    os.makedirs(backup_dir, exist_ok=True)
-    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    backup_file = os.path.join(backup_dir, f"memory_db_backup_{ts}.bak")
-    shutil.copy2(DB_PATH, backup_file)
-    print(f"[BACKUP] Snapshot created: {backup_file}")
-
-    # Prune old snapshot backups (keep last 20 snapshots)
-    try:
-        backups = sorted(
-            [os.path.join(backup_dir, f) for f in os.listdir(backup_dir) if f.startswith("memory_db_backup_") and f.endswith(".bak")],
-            key=lambda p: os.path.getmtime(p),
-            reverse=True
-        )
-        if len(backups) > 20:
-            for old_bak in backups[20:]:
-                try:
-                    os.remove(old_bak)
-                    print(f"[BACKUP] Pruned old snapshot: {os.path.basename(old_bak)}")
-                except Exception:
-                    pass
-    except Exception as e:
-        sys.stderr.write(f"[WARN] Error during backup retention pruning: {e}\n")
-
+    """Preview without writes, or back up and apply maintenance explicitly."""
+    target_db = schema.DB_PATH
+    if not os.path.exists(target_db) and apply_changes:
+        with db_session(target_db):
+            pass
+    if not os.path.exists(target_db):
+        stats = {table: 0 for table in FTS_COLUMNS}
+        stats["aging"] = {"cooling": 0, "historic": 0}
+    else:
+        with _readonly_db(target_db) as conn:
+            stats = {table: conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                     for table in FTS_COLUMNS}
+            stats["aging"] = {
+                "cooling": conn.execute("SELECT COUNT(*) FROM episodes WHERE status = 'active' AND updated_at < datetime('now', '-30 days')").fetchone()[0] if age_decay else 0,
+                "historic": conn.execute("SELECT COUNT(*) FROM episodes WHERE status IN ('active', 'cooling') AND updated_at < datetime('now', '-90 days')").fetchone()[0] if age_decay else 0,
+            }
+    stats["applied"] = apply_changes
+    stats["planned"] = ["normalize", "prune_orphan_links", "prune_queue", "rebuild_fts", "vacuum"]
     if age_decay:
-        aging_res = age_episodes(days_to_cooling=30, days_to_historic=90)
-        if aging_res["cooled"]:
-            print(f"[AGING] {len(aging_res['cooled'])} episode(s) transitioned active -> cooling:")
-            for eid, title, upd in aging_res["cooled"]:
-                print(f"  • {eid}: {title} (last update: {upd})")
-        if aging_res["historied"]:
-            print(f"[AGING] {len(aging_res['historied'])} episode(s) transitioned cooling -> historic:")
-            for eid, title, upd in aging_res["historied"]:
-                print(f"  • {eid}: {title} (last update: {upd})")
-
+        stats["planned"].append("age_episodes")
     if consolidate:
-        print("[CONSOLIDATE] Running semantic fact consolidation & deduplication...")
-        merges = consolidate_memories(dry_run=not apply_changes)
-        if merges:
-            print(f"[CONSOLIDATE] Successfully consolidated {len(merges)} cluster(s).")
-        else:
-            print("[CONSOLIDATE] No redundant facts detected across categories.")
+        stats["planned"].append("consolidate")
+    if not apply_changes:
+        logger.info("[PREVIEW] Planned optimization: %s", stats)
+        return stats
 
-    # Normalize all categories/topics/relations to canonical taxonomies
-    if apply_changes:
-        norm_counts = normalize_existing_categories()
-        total_norm = sum(norm_counts.values())
-        if total_norm > 0:
-            print(f"[NORMALIZE] Normalized {total_norm} entries: {norm_counts}")
-        else:
-            print("[NORMALIZE] All categories/topics/relations already canonical.")
-
-        # Prune orphan entity links (both sides point to non-existent entities)
-        orphan_count = prune_orphan_links(dry_run=False)
-        if orphan_count > 0:
-            print(f"[PRUNE] Removed {orphan_count} orphan entity link(s).")
-
-    # Prune old processed queue turns (> 7 days)
-    try:
-        from queue_manager import prune_processed_turns
-        prune_processed_turns(days=7)
-    except Exception:
-        pass
-
-    with db_session() as conn:
-        cursor = conn.cursor()
-
-        # Report database stats
-        cursor.execute("SELECT COUNT(*) FROM memories")
-        n_facts = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM episodes")
-        n_episodes = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM learnings")
-        n_learnings = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM entity_links")
-        n_links = cursor.fetchone()[0]
-        print(f"[STATS] Facts: {n_facts}, Episodes: {n_episodes}, Learnings: {n_learnings}, Entity Links: {n_links}")
-
-        # Check for facts without keywords (poorly searchable)
-        cursor.execute("SELECT id FROM memories WHERE keywords IS NULL OR keywords = ''")
-        no_kw_facts = [r[0] for r in cursor.fetchall()]
-        if no_kw_facts:
-            print(f"[WARN] {len(no_kw_facts)} facts without keywords (poorly searchable): {', '.join(no_kw_facts[:5])}{'...' if len(no_kw_facts) > 5 else ''}")
-
-        # Check for resolved/historic episodes older than 6 months
-        cursor.execute("""
-            SELECT id, title, status, updated_at FROM episodes 
-            WHERE status IN ('resolved', 'historic') 
-            AND updated_at < datetime('now', '-6 months')
-        """)
-        stale_episodes = cursor.fetchall()
-        if stale_episodes:
-            print(f"[INFO] {len(stale_episodes)} resolved/historic episodes older than 6 months:")
-            for eid, title, status, updated in stale_episodes:
-                print(f"  • {eid}: {title} [{status}] (last updated: {updated})")
-
-        # Rebuild FTS5 indexes
-        print("[OPTIMIZE] Rebuilding FTS5 indexes...")
-        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")
-        conn.execute("INSERT INTO episodes_fts(episodes_fts) VALUES('rebuild');")
-        conn.execute("INSERT INTO learnings_fts(learnings_fts) VALUES('rebuild');")
-        conn.execute("INSERT INTO entity_links_fts(entity_links_fts) VALUES('rebuild');")
-        conn.commit()
-
-    # VACUUM must run outside the context manager (no active transactions)
-    conn_raw = sqlite3.connect(DB_PATH)
-    conn_raw.execute("VACUUM;")
-    conn_raw.close()
-
-    db_size = os.path.getsize(DB_PATH)
-    print(f"[SUCCESS] Optimized! DB size: {db_size:,} bytes ({db_size / 1024:.1f} KB)")
+    snapshot = create_snapshot(tag="optimization", db_path=target_db)
+    logger.info("[BACKUP] Snapshot created: %s", snapshot["filename"])
+    archive = archive_path(target_db)
+    backups = sorted(archive.glob("memory_db_backup_*_optimization.bak"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in backups[20:]:
+        old.unlink()
+    if age_decay:
+        age_episodes()
+    if consolidate:
+        stats["merges"] = consolidate_memories()
+    stats["normalized"] = normalize_existing_categories()
+    stats["orphan_links"] = prune_orphan_links()
+    from queue_manager import prune_processed_turns
+    prune_processed_turns(days=7)
+    with db_session() as conn, conn:
+        rebuild_fts(conn)
+    with closing(sqlite3.connect(target_db, timeout=5)) as conn:
+        conn.execute("VACUUM")
+    logger.info("[SUCCESS] Optimized! Stats: %s", stats)
+    return stats
 
 # Keep backward compatibility alias
 compact_all = optimize_db
@@ -1397,7 +1455,7 @@ compact_all = optimize_db
 def list_snapshots(archive_dir: str = None) -> list:
     """List all available snapshots with file metadata and record counts."""
     import glob
-    archive_dir = archive_dir or os.path.expanduser("~/.gemini/archive")
+    archive_dir = archive_dir or str(archive_path(schema.DB_PATH))
     if not os.path.exists(archive_dir):
         return []
 
@@ -1445,86 +1503,103 @@ def list_snapshots(archive_dir: str = None) -> list:
     return snapshots
 
 
+def _backup_connections(source, destination, timeout=30):
+    """Bound SQLite's internal busy retries, which outlive connect(timeout)."""
+    deadline = time.monotonic() + timeout
+
+    def progress(status, remaining, total):
+        if time.monotonic() > deadline:
+            raise TimeoutError("SQLite online backup timed out")
+
+    source.backup(destination, pages=256, progress=progress, sleep=0.05)
+
+
+def online_backup(source_path: str, destination_path: str):
+    """Capture committed WAL frames, validate, and atomically publish a backup."""
+    destination = Path(destination_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".memory-backup-", dir=destination.parent)
+    os.close(fd)
+    try:
+        with _readonly_db(source_path) as src, closing(sqlite3.connect(temporary, timeout=5)) as dst:
+            _backup_connections(src, dst)
+            _verify_snapshot(dst)
+        with open(temporary, "rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _verify_snapshot(conn):
+    version = conn.execute('PRAGMA user_version').fetchone()[0]
+    if version > schema.SCHEMA_VERSION:
+        raise ValueError(f'Unsupported snapshot schema: {version}')
+    result = conn.execute("PRAGMA integrity_check").fetchall()
+    if result != [("ok",)]:
+        raise ValueError(f"Snapshot integrity check failed: {result}")
+    for table, columns in FTS_COLUMNS.items():
+        conn.execute(f"SELECT {columns} FROM {table} LIMIT 0")
+        conn.execute(f"SELECT {columns} FROM {table}_fts LIMIT 0")
+
+
 def create_snapshot(tag: str = "manual", db_path: str = None) -> dict:
-    """Create an immediate snapshot backup of the current database state."""
+    """Create a consistent online snapshot, including committed WAL data."""
     target_db = db_path or schema.DB_PATH
-    archive_dir = os.path.expanduser("~/.gemini/archive")
-    os.makedirs(archive_dir, exist_ok=True)
-    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    if not re.fullmatch(r"[a-zA-Z0-9_-]*", tag):
+        raise ValueError("Invalid snapshot tag")
+    archive_dir = str(archive_path(target_db))
+    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S_%f")
     suffix = f"_{tag}" if tag else ""
     backup_file = os.path.join(archive_dir, f"memory_db_backup_{ts}{suffix}.bak")
-
-    # Ensure DB schema exists
     if not os.path.exists(target_db):
         with db_session(target_db):
             pass
-
-    shutil.copy2(target_db, backup_file)
-    return {
-        "status": "ok",
-        "filename": os.path.basename(backup_file),
-        "message": f"Snapshot created: {os.path.basename(backup_file)}"
-    }
+    online_backup(target_db, backup_file)
+    return {"status": "ok", "filename": os.path.basename(backup_file),
+            "message": f"Snapshot created: {os.path.basename(backup_file)}"}
 
 
 def restore_snapshot(filename: str, db_path: str = None) -> dict:
-    """Restore the memory database from a selected backup snapshot in ~/.gemini/archive."""
     target_db = db_path or schema.DB_PATH
-    archive_dir = os.path.expanduser("~/.gemini/archive")
-    # Security check: strict filename validation to prevent path traversal
-    if not re.match(r"^memory_db_backup_[a-zA-Z0-9_\-\.]+\.bak$", filename):
+    with schema.maintenance_lock(target_db, exclusive=True):
+        return _restore_snapshot_locked(filename, target_db)
+
+
+def _restore_snapshot_locked(filename: str, db_path: str = None) -> dict:
+    """Restore through SQLite locking, preserving active connection coherence."""
+    target_db = db_path or schema.DB_PATH
+    archive_dir = archive_path(target_db)
+    if not re.fullmatch(r"memory_db_backup_[a-zA-Z0-9_.-]+\.bak", filename):
         raise ValueError("Invalid snapshot filename format.")
-
-    source_path = os.path.join(archive_dir, filename)
-    if not os.path.exists(source_path):
+    source_path = archive_dir / filename
+    if source_path.is_symlink() or not source_path.is_file():
         raise FileNotFoundError(f"Snapshot '{filename}' not found in archive directory.")
-
-    # 1. Take safety snapshot of current state before overwrite
-    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    safety_backup = os.path.join(archive_dir, f"memory_db_backup_{ts}_pre_restore.bak")
-    if os.path.exists(target_db):
-        shutil.copy2(target_db, safety_backup)
-
-    # 2. Overwrite target_db with target snapshot
-    shutil.copy2(source_path, target_db)
-
-    # 3. Rebuild FTS5 indexes and count records
-    with db_session(target_db) as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM memories")
-        cnt_facts = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM episodes")
-        cnt_episodes = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM learnings")
-        cnt_learnings = cursor.fetchone()[0]
-        cursor.execute("SELECT COUNT(*) FROM entity_links")
-        cnt_links = cursor.fetchone()[0]
-
-        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('rebuild');")
-        conn.execute("INSERT INTO episodes_fts(episodes_fts) VALUES('rebuild');")
-        conn.execute("INSERT INTO learnings_fts(learnings_fts) VALUES('rebuild');")
-        conn.execute("INSERT INTO entity_links_fts(entity_links_fts) VALUES('rebuild');")
-        conn.commit()
-
-    # 4. Run VACUUM
-    conn_raw = sqlite3.connect(target_db)
-    conn_raw.execute("VACUUM;")
-    conn_raw.close()
-
-    db_size = os.path.getsize(target_db)
-    return {
-        "status": "ok",
-        "message": f"Successfully restored to snapshot {filename}.",
-        "restored_snapshot": filename,
-        "safety_backup": os.path.basename(safety_backup),
-        "db_size": f"{db_size / 1024:.1f} KB",
-        "counts": {
-            "facts": cnt_facts,
-            "episodes": cnt_episodes,
-            "learnings": cnt_learnings,
-            "links": cnt_links
-        }
-    }
+    safety_backup = None
+    with _readonly_db(source_path) as src:
+        _verify_snapshot(src)
+        if os.path.exists(target_db):
+            try:
+                safety_backup = create_snapshot("pre_restore", target_db)["filename"]
+            except (sqlite3.DatabaseError, ValueError) as error:
+                raise RuntimeError("Cannot safely back up the current database. Stop all database clients and perform offline recovery; no live files were replaced.") from error
+        Path(target_db).parent.mkdir(parents=True, exist_ok=True)
+        with closing(sqlite3.connect(target_db, timeout=5)) as dst:
+            _backup_connections(src, dst)
+            with dst:
+                schema.bump_db_generation(dst)
+                if dst.execute('PRAGMA user_version').fetchone()[0] < schema.SCHEMA_VERSION:
+                    schema._init_schema(dst)
+                    schema._upgrade_schema(dst)
+                rebuild_fts(dst)
+            counts = {key: dst.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                      for key, table in (("facts", "memories"), ("episodes", "episodes"),
+                                         ("learnings", "learnings"), ("links", "entity_links"))}
+    schema._SCHEMA_INITIALIZED.discard(target_db)
+    return {"status": "ok", "message": f"Successfully restored to snapshot {filename}.",
+            "restored_snapshot": filename, "safety_backup": safety_backup,
+            "db_size": f"{os.path.getsize(target_db) / 1024:.1f} KB", "counts": counts}
 
 
 def main():
@@ -1588,13 +1663,13 @@ def main():
     op = subparsers.add_parser("optimize", help="Run episode aging, rebuild FTS indexes, VACUUM, report stats")
     op.add_argument("--apply", action="store_true", help="Apply optimization")
     op.add_argument("--no-age", action="store_true", help="Skip episode aging")
-    op.add_argument("--consolidate", action="store_true", default=True, help="Run semantic deduplication (default: True)")
+    op.add_argument("--consolidate", action="store_true", default=False, help="Explicitly enable semantic deduplication")
     op.add_argument("--no-consolidate", action="store_false", dest="consolidate", help="Skip semantic deduplication")
 
     # Keep backward compatibility
     cp = subparsers.add_parser("compact", help="(Alias for 'optimize') Rebuild FTS indexes & VACUUM")
     cp.add_argument("--apply", action="store_true")
-    cp.add_argument("--consolidate", action="store_true", default=True, help="Run semantic deduplication (default: True)")
+    cp.add_argument("--consolidate", action="store_true", default=False, help="Explicitly enable semantic deduplication")
     cp.add_argument("--no-consolidate", action="store_false", dest="consolidate", help="Skip semantic deduplication")
 
     # Snapshot management CLI commands
@@ -1609,12 +1684,18 @@ def main():
     ui_p = subparsers.add_parser("ui", help="Launch real-time debug web dashboard")
     ui_p.add_argument("--port", type=int, default=None, help="Port to listen on (default from .env)")
     ui_p.add_argument("--host", type=str, default=None, help="Host to bind to (default from .env)")
+    ui_p.add_argument("--allowed-hosts", type=str, default=None, help="Comma-separated list of allowed Host header values")
+    ui_p.add_argument("--allow-private-networks", action="store_true", default=None, help="Permit private and mesh network Host headers")
 
     mg = subparsers.add_parser("migrate", help="Run database migrations (e.g. v2.0 -> v2.1)")
     mg.add_argument("--dry-run", action="store_true", help="Simulate migration without modifying database")
     mg.add_argument("--db", type=str, default=None, help="Path to SQLite database")
 
     args = parser.parse_args()
+
+    if args.command in ("prefetch", "list"):
+        for handler in logger.handlers:
+            handler.setStream(sys.stdout)
 
     if args.command == "prefetch":
         prefetch(args.query)
@@ -1645,7 +1726,7 @@ def main():
         optimize_db(
             apply_changes=getattr(args, 'apply', True),
             age_decay=not getattr(args, 'no_age', False),
-            consolidate=getattr(args, 'consolidate', True)
+            consolidate=getattr(args, 'consolidate', False)
         )
     elif args.command == "snapshots":
         if args.create:
@@ -1670,7 +1751,8 @@ def main():
         from config import DASHBOARD_HOST, DASHBOARD_PORT
         port = args.port or DASHBOARD_PORT
         host = args.host or DASHBOARD_HOST
-        run_dashboard(host=host, port=port)
+        allowed = [h.strip().lower() for h in args.allowed_hosts.split(",")] if getattr(args, "allowed_hosts", None) else None
+        run_dashboard(host=host, port=port, allowed_hosts=allowed, allow_private=getattr(args, "allow_private_networks", None))
     elif args.command == "migrate":
         from scripts.migrate_v2_to_v2_1 import run_migration
         db_target = args.db or DB_PATH

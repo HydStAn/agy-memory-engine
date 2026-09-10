@@ -1,12 +1,17 @@
+
+# Set temporary paths before importing modules that capture configuration defaults.
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _test_environment  # noqa: F401
+
 import unittest
 import unittest.mock
 import os
 import tempfile
 import sqlite3
 import shutil
-from pathlib import Path
 
-import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from queue_manager import (
@@ -27,7 +32,7 @@ class TestQueueManager(unittest.TestCase):
         self.db_path = os.path.join(self.temp_dir, "test_queue.db")
 
     def tearDown(self):
-        shutil.rmtree(self.temp_dir)
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_init_and_enqueue(self):
         init_queue_db(self.db_path)

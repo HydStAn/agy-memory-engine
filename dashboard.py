@@ -10,9 +10,14 @@ import sys
 import json
 import time
 import sqlite3
+import secrets
+import hmac
+import fcntl
+import ipaddress
 import urllib.parse
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from typing import Optional
 
 # Add project root to sys.path
 BASE_DIR = Path(__file__).resolve().parent
@@ -24,6 +29,10 @@ from config import (
     MODEL_NAME,
     DASHBOARD_PORT,
     DASHBOARD_HOST,
+    DASHBOARD_TOKEN,
+    DASHBOARD_TOKEN_PATH,
+    DASHBOARD_ALLOWED_HOSTS,
+    DASHBOARD_ALLOW_PRIVATE_NETWORKS,
     INACTIVITY_THRESHOLD_SECONDS,
     MAX_WAIT_THRESHOLD_SECONDS
 )
@@ -87,6 +96,142 @@ except ImportError:
     reciprocal_rank_fusion = None
     log_vec_query_failure = None
     HAS_DASHBOARD_EMBEDDER = False
+
+
+def get_or_create_dashboard_token(token_path: Optional[str] = None) -> str:
+    """Load or create the authentication token for mutating dashboard endpoints."""
+    env_token = os.environ.get("AGY_MEMORY_DASHBOARD_TOKEN") or DASHBOARD_TOKEN
+    if env_token and env_token.strip():
+        return env_token.strip()
+
+    target_path = Path(token_path or os.environ.get("AGY_MEMORY_DASHBOARD_TOKEN_PATH") or DASHBOARD_TOKEN_PATH)
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    # Serialize concurrent first requests and fail closed on persistence errors.
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(str(target_path), flags, 0o600)
+    with os.fdopen(fd, "r+", encoding="utf-8") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        os.fchmod(handle.fileno(), 0o600)
+        token = handle.read().strip()
+        if not token:
+            token = secrets.token_urlsafe(32)
+            handle.seek(0)
+            handle.write(token)
+            handle.truncate()
+            handle.flush()
+            os.fsync(handle.fileno())
+        return token
+
+
+def is_local_origin(origin: str) -> bool:
+    """Check if an Origin header refers to a local host / loopback address."""
+    if not origin:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(origin)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = (parsed.hostname or "").lower()
+        return hostname in ("127.0.0.1", "localhost", "::1")
+    except Exception:
+        return False
+
+
+def is_ip_in_private_or_mesh_range(ip_str: str) -> bool:
+    """Check if an IP string is within private, loopback, link-local, or mesh/CGNAT ranges."""
+    if not ip_str:
+        return False
+    clean_ip = ip_str.strip("[]").split("%")[0]
+    try:
+        ip = ipaddress.ip_address(clean_ip)
+        if ip.is_private or ip.is_loopback or ip.is_link_local:
+            return True
+        # Tailscale / RFC 6598 Shared Address Space (100.64.0.0/10)
+        tailscale_cgnat = ipaddress.ip_network("100.64.0.0/10")
+        if ip in tailscale_cgnat:
+            return True
+        return False
+    except ValueError:
+        return False
+
+
+def is_trusted_host(
+    hostname: str,
+    server_host: str = None,
+    allowed_hosts: list = None,
+    allow_private: bool = None,
+) -> bool:
+    """Validate whether a Host header hostname is permitted.
+
+    Protects against DNS rebinding while permitting loopback, explicitly configured
+    allowed hosts, and private/mesh IP ranges when bound to 0.0.0.0 or ::.
+    """
+    if not hostname:
+        return False
+
+    hostname = hostname.lower().strip("[]").split("%")[0]
+    host_binding = (server_host if server_host is not None else DASHBOARD_HOST).lower()
+
+    # 1. Standard loopback hostnames and IPs are always permitted
+    if hostname in ("localhost", "127.0.0.1", "::1"):
+        return True
+
+    # 2. Permitted if matches explicit non-wildcard server bind host
+    if host_binding not in ("0.0.0.0", "::") and hostname == host_binding:
+        return True
+
+    # 3. Permitted if matches explicitly configured allowed hosts
+    configured_allowed = allowed_hosts if allowed_hosts is not None else DASHBOARD_ALLOWED_HOSTS
+    for allowed in configured_allowed:
+        allowed = allowed.strip().lower()
+        if not allowed:
+            continue
+        if allowed == "*":
+            return True
+        if allowed.startswith("*."):
+            suffix = allowed[1:]  # e.g. .ts.net or .local
+            if hostname.endswith(suffix):
+                return True
+        elif hostname == allowed:
+            return True
+
+    # 4. Permitted if private / mesh IP ranges are enabled
+    effective_allow_private = allow_private
+    if effective_allow_private is None:
+        if DASHBOARD_ALLOW_PRIVATE_NETWORKS is not None:
+            effective_allow_private = DASHBOARD_ALLOW_PRIVATE_NETWORKS
+        else:
+            effective_allow_private = host_binding in ("0.0.0.0", "::")
+
+    if effective_allow_private and is_ip_in_private_or_mesh_range(hostname):
+        return True
+
+    return False
+
+
+def is_trusted_origin(
+    origin: str,
+    server_host: str = None,
+    allowed_hosts: list = None,
+    allow_private: bool = None,
+) -> bool:
+    """Check if an Origin header refers to a trusted origin."""
+    if not origin:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(origin)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        hostname = (parsed.hostname or "").lower()
+        return is_trusted_host(
+            hostname,
+            server_host=server_host,
+            allowed_hosts=allowed_hosts,
+            allow_private=allow_private,
+        )
+    except Exception:
+        return False
+
 
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
@@ -828,6 +973,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <div id="toast-container" class="toast-container"></div>
 
   <script>
+    const DASHBOARD_TOKEN = {{DASHBOARD_TOKEN}};
     let currentProfile = (new URLSearchParams(window.location.search)).get('user') || 'ubuntu';
     let rawData = null;
     let searchTimer = null;
@@ -1051,10 +1197,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           return `
             <div class="item-card" style="border-left: 3px solid var(--warning); margin-bottom:14px;">
               <div class="item-header">
-                <span class="item-id">Turn #${t.id} <span style="font-weight:normal; color:var(--text-muted)">[${t.source || 'telegram'}]</span></span>
+                <span class="item-id">Turn #${escapeHtml(t.id)} <span style="font-weight:normal; color:var(--text-muted)">[${escapeHtml(t.source || 'telegram')}]</span></span>
                 <div style="display:flex; gap:8px; align-items:center;">
                   <span class="pill cooling">PENDING</span>
-                  <span style="font-size:0.75rem; color:var(--text-muted);">${t.created_at}</span>
+                  <span style="font-size:0.75rem; color:var(--text-muted);">${escapeHtml(t.created_at)}</span>
                 </div>
               </div>
               
@@ -1063,9 +1209,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <div style="color:var(--text-bright); font-size:0.9rem; white-space:pre-wrap;">${escapeHtml(t.user_prompt)}</div>
               </div>
 
-              <details ${isOpen ? 'open' : ''} ontoggle="onTurnDetailToggle(${t.id}, this.open)" style="background:rgba(255, 255, 255, 0.03); border-radius:6px; padding:8px 12px; margin-bottom:10px;">
+              <details ${isOpen ? 'open' : ''} ontoggle="onTurnDetailToggle(parseInt(this.dataset.turnId, 10), this.open)" data-turn-id="${escapeHtml(t.id)}" style="background:rgba(255, 255, 255, 0.03); border-radius:6px; padding:8px 12px; margin-bottom:10px;">
                 <summary style="cursor:pointer; font-size:0.8rem; color:var(--text-muted); font-weight:500;">
-                  🤖 Assistant Response (${(t.assistant_response || '').length} chars) — Click to view
+                  🤖 Assistant Response (${escapeHtml(String((t.assistant_response || '').length))} chars) — Click to view
                 </summary>
                 <div style="color:var(--text); font-size:0.85rem; margin-top:8px; white-space:pre-wrap; max-height:280px; overflow-y:auto; border-top:1px solid rgba(255,255,255,0.06); padding-top:8px;">
                   ${escapeHtml(t.assistant_response || '')}
@@ -1073,7 +1219,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               </details>
 
               <div class="item-meta">
-                <span><b>Chat ID:</b> ${t.chat_id || '-'}</span>
+                <span><b>Chat ID:</b> ${escapeHtml(t.chat_id || '-')}</span>
                 <span><b>Status:</b> Waiting for calm-memory debounce</span>
               </div>
             </div>
@@ -1087,7 +1233,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           if (b.status === 'processed') { statusClass = 'active'; borderCol = 'var(--success)'; }
           if (b.status === 'failed') { statusClass = 'danger'; borderCol = 'var(--danger)'; }
 
-          const turnIdsStr = b.turns.map(t => '#' + t.id).join(', ');
+          const turnIdsStr = b.turns.map(t => '#' + escapeHtml(t.id)).join(', ');
 
           return `
             <div class="item-card" style="border-left: 4px solid ${borderCol}; margin-bottom:18px; background:rgba(22, 27, 34, 0.95); padding:16px;">
@@ -1097,12 +1243,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     📦 Batch <span style="color:var(--accent); font-family:monospace;">${escapeHtml(b.batch_id)}</span>
                   </span>
                   <span class="pill" style="background:rgba(88, 166, 255, 0.12); color:var(--accent); border-color:rgba(88, 166, 255, 0.3);">
-                    ${b.turns.length} turn${b.turns.length > 1 ? 's' : ''} processed together (${turnIdsStr})
+                    ${escapeHtml(String(b.turns.length))} turn${b.turns.length > 1 ? 's' : ''} processed together (${turnIdsStr})
                   </span>
                 </div>
                 <div style="display:flex; gap:8px; align-items:center;">
-                  <span class="pill ${statusClass}">${b.status.toUpperCase()}</span>
-                  <span style="font-size:0.75rem; color:var(--text-muted); font-family:monospace;">${b.processed_at}</span>
+                  <span class="pill ${escapeHtml(statusClass)}">${escapeHtml(String(b.status).toUpperCase())}</span>
+                  <span style="font-size:0.75rem; color:var(--text-muted); font-family:monospace;">${escapeHtml(b.processed_at)}</span>
                 </div>
               </div>
 
@@ -1125,9 +1271,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                     <div style="background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.05); border-radius:6px; padding:10px 12px;">
                       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
                         <span style="font-family:monospace; font-weight:600; color:var(--accent); font-size:0.85rem;">
-                          Turn #${t.id} <span style="font-weight:normal; color:var(--text-muted)">[${t.source || 'telegram'}]</span>
+                          Turn #${escapeHtml(t.id)} <span style="font-weight:normal; color:var(--text-muted)">[${escapeHtml(t.source || 'telegram')}]</span>
                         </span>
-                        <span style="font-size:0.75rem; color:var(--text-muted);">${t.created_at}</span>
+                        <span style="font-size:0.75rem; color:var(--text-muted);">${escapeHtml(t.created_at)}</span>
                       </div>
 
                       <div style="background:rgba(88, 166, 255, 0.06); border-radius:5px; padding:8px 10px; margin-bottom:6px; border-left:3px solid var(--accent);">
@@ -1135,9 +1281,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                         <div style="color:var(--text-bright); font-size:0.85rem; white-space:pre-wrap;">${escapeHtml(t.user_prompt)}</div>
                       </div>
 
-                      <details ${isOpen ? 'open' : ''} ontoggle="onTurnDetailToggle(${t.id}, this.open)" style="background:rgba(255, 255, 255, 0.02); border-radius:5px; padding:6px 10px;">
+                      <details ${isOpen ? 'open' : ''} ontoggle="onTurnDetailToggle(parseInt(this.dataset.turnId, 10), this.open)" data-turn-id="${escapeHtml(t.id)}" style="background:rgba(255, 255, 255, 0.02); border-radius:5px; padding:6px 10px;">
                         <summary style="cursor:pointer; font-size:0.75rem; color:var(--text-muted); font-weight:500;">
-                          🤖 Assistant Response (${(t.assistant_response || '').length} chars) — Click to view
+                          🤖 Assistant Response (${escapeHtml(String((t.assistant_response || '').length))} chars) — Click to view
                         </summary>
                         <div style="color:var(--text); font-size:0.8rem; margin-top:6px; white-space:pre-wrap; max-height:240px; overflow-y:auto; border-top:1px solid rgba(255,255,255,0.06); padding-top:6px;">
                           ${escapeHtml(t.assistant_response || '')}
@@ -1161,10 +1307,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         return `
           <div class="item-card" style="border-left: 3px solid ${t.status === 'processed' ? 'var(--success)' : 'var(--card-border)'}; margin-bottom:14px;">
             <div class="item-header">
-              <span class="item-id">Turn #${t.id} <span style="font-weight:normal; color:var(--text-muted)">[${t.source || 'telegram'}]</span></span>
+              <span class="item-id">Turn #${escapeHtml(t.id)} <span style="font-weight:normal; color:var(--text-muted)">[${escapeHtml(t.source || 'telegram')}]</span></span>
               <div style="display:flex; gap:8px; align-items:center;">
-                <span class="pill ${statusClass}">${t.status.toUpperCase()}</span>
-                <span style="font-size:0.75rem; color:var(--text-muted);">${t.created_at}</span>
+                <span class="pill ${escapeHtml(statusClass)}">${escapeHtml(String(t.status).toUpperCase())}</span>
+                <span style="font-size:0.75rem; color:var(--text-muted);">${escapeHtml(t.created_at)}</span>
               </div>
             </div>
             
@@ -1173,9 +1319,9 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
               <div style="color:var(--text-bright); font-size:0.9rem; white-space:pre-wrap;">${escapeHtml(t.user_prompt)}</div>
             </div>
 
-            <details ${isOpen ? 'open' : ''} ontoggle="onTurnDetailToggle(${t.id}, this.open)" style="background:rgba(255, 255, 255, 0.03); border-radius:6px; padding:8px 12px; margin-bottom:10px;">
+            <details ${isOpen ? 'open' : ''} ontoggle="onTurnDetailToggle(parseInt(this.dataset.turnId, 10), this.open)" data-turn-id="${escapeHtml(t.id)}" style="background:rgba(255, 255, 255, 0.03); border-radius:6px; padding:8px 12px; margin-bottom:10px;">
               <summary style="cursor:pointer; font-size:0.8rem; color:var(--text-muted); font-weight:500;">
-                🤖 Assistant Response (${(t.assistant_response || '').length} chars) — Click to view
+                🤖 Assistant Response (${escapeHtml(String((t.assistant_response || '').length))} chars) — Click to view
               </summary>
               <div style="color:var(--text); font-size:0.85rem; margin-top:8px; white-space:pre-wrap; max-height:280px; overflow-y:auto; border-top:1px solid rgba(255,255,255,0.06); padding-top:8px;">
                 ${escapeHtml(t.assistant_response || '')}
@@ -1195,8 +1341,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
             ` : ''}
 
             <div class="item-meta">
-              <span><b>Chat ID:</b> ${t.chat_id || '-'}</span>
-              <span><b>Status:</b> ${t.status}</span>
+              <span><b>Chat ID:</b> ${escapeHtml(t.chat_id || '-')}</span>
+              <span><b>Status:</b> ${escapeHtml(t.status)}</span>
             </div>
           </div>
         `;
@@ -1216,13 +1362,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       cont.innerHTML = facts.map(f => `
         <div class="item-card">
           <div class="item-header">
-            <span class="item-id">${f.id}</span>
-            <span class="pill category">${f.category}</span>
+            <span class="item-id">${escapeHtml(f.id)}</span>
+            <span class="pill category">${escapeHtml(f.category)}</span>
           </div>
           <div class="item-body">${escapeHtml(f.fact)}</div>
           <div class="item-meta">
             <span><b>Keywords:</b> ${escapeHtml(f.keywords || '-')}</span>
-            <span><b>Updated:</b> ${f.updated_at}</span>
+            <span><b>Updated:</b> ${escapeHtml(f.updated_at)}</span>
           </div>
         </div>
       `).join('');
@@ -1241,12 +1387,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       cont.innerHTML = episodes.map(e => `
         <div class="item-card">
           <div class="item-header">
-            <span class="item-id">${e.title || e.id} <span style="font-weight:normal; color:var(--text-muted)">(${e.topic})</span></span>
-            <span class="pill ${e.status}">${e.status}</span>
+            <span class="item-id">${escapeHtml(e.title || e.id)} <span style="font-weight:normal; color:var(--text-muted)">(${escapeHtml(e.topic)})</span></span>
+            <span class="pill ${escapeHtml(e.status)}">${escapeHtml(e.status)}</span>
           </div>
           <div class="item-body">${escapeHtml(e.narrative)}</div>
           <div class="item-meta">
-            <span><b>Period:</b> ${e.period || '-'}</span>
+            <span><b>Period:</b> ${escapeHtml(e.period || '-')}</span>
             <span><b>Entities:</b> ${escapeHtml(e.entities || '-')}</span>
             <span><b>Stance / Sentiment:</b> ${escapeHtml(e.stance || '-')}</span>
           </div>
@@ -1267,8 +1413,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       cont.innerHTML = learnings.map(l => `
         <div class="item-card">
           <div class="item-header">
-            <span class="item-id">${l.id}</span>
-            <span class="pill category">${l.category}</span>
+            <span class="item-id">${escapeHtml(l.id)}</span>
+            <span class="pill category">${escapeHtml(l.category)}</span>
           </div>
           <div class="item-body">💡 ${escapeHtml(l.insight)}</div>
           <div class="item-meta">
@@ -1397,27 +1543,35 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 <span class="item-id" style="font-size:0.95rem; color:var(--text-bright);">
                   📸 ${escapeHtml(s.filename)}
                 </span>
-                <span class="pill ${tagClass}">${s.tag.toUpperCase()}</span>
+                <span class="pill ${escapeHtml(tagClass)}">${escapeHtml(String(s.tag).toUpperCase())}</span>
                 ${idx === 0 ? '<span class="pill active" style="font-size:0.7rem;">LATEST</span>' : ''}
               </div>
               <div style="display:flex; gap:10px; align-items:center;">
-                <span style="font-size:0.8rem; color:var(--text-muted); font-family:monospace;">${s.created_at}</span>
-                <span class="badge" style="font-size:0.75rem; padding:2px 8px;">${s.size_kb}</span>
-                <button class="btn btn-secondary" style="font-size:0.75rem; padding:3px 10px; border-color:rgba(248,81,73,0.4); color:var(--danger);" onclick="promptRestoreSnapshot('${escapeHtml(s.filename)}', '${escapeHtml(s.created_at)}', '${st.facts || 0} Facts, ${st.episodes || 0} Episodes, ${st.learnings || 0} Learnings, ${st.links || 0} Links')" title="Rollback database to this snapshot">
+                <span style="font-size:0.8rem; color:var(--text-muted); font-family:monospace;">${escapeHtml(s.created_at)}</span>
+                <span class="badge" style="font-size:0.75rem; padding:2px 8px;">${escapeHtml(s.size_kb)}</span>
+                <button class="btn btn-secondary" style="font-size:0.75rem; padding:3px 10px; border-color:rgba(248,81,73,0.4); color:var(--danger);" onclick="handleRestoreSnapshotClick(${idx})" title="Rollback database to this snapshot">
                   ⏮️ Restore
                 </button>
               </div>
             </div>
             
             <div style="display:flex; gap:12px; margin-top:8px; font-size:0.8rem; color:var(--text-muted); flex-wrap:wrap;">
-              <span>🧱 <b>${st.facts || 0}</b> Facts</span>
-              <span>📖 <b>${st.episodes || 0}</b> Episodes</span>
-              <span>💡 <b>${st.learnings || 0}</b> Learnings</span>
-              <span>🔗 <b>${st.links || 0}</b> Links</span>
+              <span>🧱 <b>${escapeHtml(String(st.facts || 0))}</b> Facts</span>
+              <span>📖 <b>${escapeHtml(String(st.episodes || 0))}</b> Episodes</span>
+              <span>💡 <b>${escapeHtml(String(st.learnings || 0))}</b> Learnings</span>
+              <span>🔗 <b>${escapeHtml(String(st.links || 0))}</b> Links</span>
             </div>
           </div>
         `;
       }).join('');
+    }
+
+    function handleRestoreSnapshotClick(idx) {
+      const s = (rawData && rawData.snapshots) ? rawData.snapshots[idx] : null;
+      if (!s) return;
+      const st = s.stats || {};
+      const statsSummary = `${st.facts || 0} Facts, ${st.episodes || 0} Episodes, ${st.learnings || 0} Learnings, ${st.links || 0} Links`;
+      promptRestoreSnapshot(s.filename, s.created_at, statsSummary);
     }
 
     function renderAudit(audit, force = false) {
@@ -1436,13 +1590,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       cont.innerHTML = audit.map(a => `
         <div class="item-card">
           <div class="item-header">
-            <span class="item-id">${a.action.toUpperCase()}: ${a.target_id}</span>
-            <span class="pill category">${a.category}</span>
+            <span class="item-id">${escapeHtml(String(a.action).toUpperCase())}: ${escapeHtml(a.target_id)}</span>
+            <span class="pill category">${escapeHtml(a.category)}</span>
           </div>
           <div class="item-body"><b>Change:</b> ${escapeHtml(a.diff_summary)}</div>
           <div class="item-meta">
             <span><b>Rationale:</b> ${escapeHtml(a.rationale)}</span>
-            <span><b>Timestamp:</b> ${a.timestamp}</span>
+            <span><b>Timestamp:</b> ${escapeHtml(a.timestamp)}</span>
           </div>
         </div>
       `).join('');
@@ -1472,9 +1626,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       let bodyHtml = `<p style="margin-bottom:10px; color:var(--text-bright); font-size:0.92rem;">${escapeHtml(message)}</p>`;
       if (bulletPoints && bulletPoints.length > 0) {
-        bodyHtml += `<ul class="modal-checklist">` + bulletPoints.map(p => `<li><span>${p}</span></li>`).join('') + `</ul>`;
+        bodyHtml += `<ul class="modal-checklist">` + bulletPoints.map(p => `<li><span>${escapeHtml(p)}</span></li>`).join('') + `</ul>`;
       }
       document.getElementById('modal-body').innerHTML = bodyHtml;
+
 
       const footer = document.getElementById('modal-footer');
       footer.innerHTML = `
@@ -1576,25 +1731,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         let html = '';
         if (data.facts && data.facts.length > 0) {
-          html += '<h4 style="color:var(--accent); margin:15px 0 10px;">🧱 Matches in Facts (' + data.facts.length + ')</h4>' + data.facts.map(f => `
+          html += '<h4 style="color:var(--accent); margin:15px 0 10px;">🧱 Matches in Facts (' + escapeHtml(String(data.facts.length)) + ')</h4>' + data.facts.map(f => `
             <div class="item-card">
-              <div class="item-header"><span class="item-id">${f.id}</span><span class="pill category">${f.category}</span></div>
+              <div class="item-header"><span class="item-id">${escapeHtml(f.id)}</span><span class="pill category">${escapeHtml(f.category)}</span></div>
               <div class="item-body">${escapeHtml(f.fact)}</div>
             </div>
           `).join('');
         }
         if (data.episodes && data.episodes.length > 0) {
-          html += '<h4 style="color:var(--purple); margin:15px 0 10px;">📖 Matches in Episodes (' + data.episodes.length + ')</h4>' + data.episodes.map(e => `
+          html += '<h4 style="color:var(--purple); margin:15px 0 10px;">📖 Matches in Episodes (' + escapeHtml(String(data.episodes.length)) + ')</h4>' + data.episodes.map(e => `
             <div class="item-card">
-              <div class="item-header"><span class="item-id">${e.title}</span><span class="pill ${e.status}">${e.status}</span></div>
+              <div class="item-header"><span class="item-id">${escapeHtml(e.title || e.id)}</span><span class="pill ${escapeHtml(e.status)}">${escapeHtml(e.status)}</span></div>
               <div class="item-body">${escapeHtml(e.narrative)}</div>
             </div>
           `).join('');
         }
         if (data.learnings && data.learnings.length > 0) {
-          html += '<h4 style="color:var(--cyan); margin:15px 0 10px;">💡 Matches in Learnings (' + data.learnings.length + ')</h4>' + data.learnings.map(l => `
+          html += '<h4 style="color:var(--cyan); margin:15px 0 10px;">💡 Matches in Learnings (' + escapeHtml(String(data.learnings.length)) + ')</h4>' + data.learnings.map(l => `
             <div class="item-card">
-              <div class="item-header"><span class="item-id">${l.id}</span><span class="pill category">${l.category}</span></div>
+              <div class="item-header"><span class="item-id">${escapeHtml(l.id)}</span><span class="pill category">${escapeHtml(l.category)}</span></div>
               <div class="item-body">${escapeHtml(l.insight)}</div>
             </div>
           `).join('');
@@ -1625,7 +1780,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           try {
             const res = await fetch('/api/force-worker', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Dashboard-Token': DASHBOARD_TOKEN
+              },
               body: JSON.stringify({ user: currentProfile })
             });
             const data = await res.json();
@@ -1670,7 +1828,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           try {
             const res = await fetch('/api/clear-processed-queue', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Dashboard-Token': DASHBOARD_TOKEN
+              },
               body: JSON.stringify({ user: currentProfile })
             });
             const data = await res.json();
@@ -1710,7 +1871,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           try {
             const res = await fetch('/api/optimize', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Dashboard-Token': DASHBOARD_TOKEN
+              },
               body: JSON.stringify({ user: currentProfile })
             });
             const data = await res.json();
@@ -1769,7 +1933,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           try {
             const res = await fetch('/api/restore-snapshot', {
               method: 'POST',
-              headers: { 'Content-Type': 'application/json' },
+              headers: {
+                'Content-Type': 'application/json',
+                'X-Dashboard-Token': DASHBOARD_TOKEN
+              },
               body: JSON.stringify({ filename, user: currentProfile })
             });
             const data = await res.json();
@@ -1810,7 +1977,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       try {
         const res = await fetch('/api/create-snapshot', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Dashboard-Token': DASHBOARD_TOKEN
+          },
           body: JSON.stringify({ user: currentProfile })
         });
         const data = await res.json();
@@ -1827,7 +1997,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     function escapeHtml(text) {
-      if (!text) return '';
+      if (text === null || text === undefined) return '';
       return String(text)
         .replace(/&/g, "&amp;")
         .replace(/</g, "&lt;")
@@ -1852,12 +2022,44 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
         # Suppress noisy standard request logging
         pass
 
+    def _trusted_request(self):
+        """Reject foreign Host headers (including DNS rebinding) and origins."""
+        host = self.headers.get("Host", "")
+        parsed = urllib.parse.urlparse("http://" + host)
+        hostname = parsed.hostname or ""
+        server_host = getattr(self.server, "server_host", DASHBOARD_HOST)
+        allowed_hosts = getattr(self.server, "allowed_hosts", DASHBOARD_ALLOWED_HOSTS)
+        allow_private = getattr(self.server, "allow_private", DASHBOARD_ALLOW_PRIVATE_NETWORKS)
+        if not is_trusted_host(hostname, server_host=server_host, allowed_hosts=allowed_hosts, allow_private=allow_private):
+            return False
+        origin = self.headers.get("Origin")
+        if origin:
+            parsed_origin = urllib.parse.urlparse(origin)
+            return (
+                parsed_origin.scheme in ("http", "https")
+                and parsed_origin.netloc.lower() == host.lower()
+                and is_trusted_origin(origin, server_host=server_host, allowed_hosts=allowed_hosts, allow_private=allow_private)
+            )
+        return True
+
+    def _set_cors_headers(self):
+        origin = self.headers.get("Origin")
+        server_host = getattr(self.server, "server_host", DASHBOARD_HOST)
+        allowed_hosts = getattr(self.server, "allowed_hosts", DASHBOARD_ALLOWED_HOSTS)
+        allow_private = getattr(self.server, "allow_private", DASHBOARD_ALLOW_PRIVATE_NETWORKS)
+        if origin and is_trusted_origin(origin, server_host=server_host, allowed_hosts=allowed_hosts, allow_private=allow_private) and self._trusted_request():
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Credentials", "true")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Dashboard-Token")
+            self.send_header("Vary", "Origin")
+
     def _send_json(self, data: dict, status: int = 200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        self._set_cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -1865,17 +2067,102 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
         body = html.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Length", str(len(body)))
+        self._set_cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
+    def _verify_auth(self) -> bool:
+        expected = get_or_create_dashboard_token()
+        if not expected:
+            return False
+
+        # Header: X-Dashboard-Token
+        token = self.headers.get("X-Dashboard-Token")
+
+        # Header: Authorization: Bearer <token>
+        if not token:
+            auth = self.headers.get("Authorization", "")
+            if auth.startswith("Bearer "):
+                token = auth[7:].strip()
+
+        # Query param: ?token=<token>
+        if not token:
+            url = urllib.parse.urlparse(self.path)
+            params = urllib.parse.parse_qs(url.query)
+            token_list = params.get("token")
+            if token_list:
+                token = token_list[0].strip()
+
+        # Cookie: dashboard_token=<token>
+        if not token:
+            cookie_header = self.headers.get("Cookie", "")
+            if cookie_header:
+                import http.cookies
+                try:
+                    c = http.cookies.SimpleCookie()
+                    c.load(cookie_header)
+                    if "dashboard_token" in c:
+                        token = c["dashboard_token"].value.strip()
+                except Exception:
+                    pass
+
+        if token and hmac.compare_digest(token.encode("utf-8"), expected.encode("utf-8")):
+            return True
+
+        return False
+
+    def do_OPTIONS(self):
+        if not self._trusted_request():
+            self._send_json({"error": "Untrusted request origin or host"}, status=403)
+            return
+        origin = self.headers.get("Origin")
+        server_host = getattr(self.server, "server_host", DASHBOARD_HOST)
+        allowed_hosts = getattr(self.server, "allowed_hosts", DASHBOARD_ALLOWED_HOSTS)
+        allow_private = getattr(self.server, "allow_private", DASHBOARD_ALLOW_PRIVATE_NETWORKS)
+        if origin and not is_trusted_origin(origin, server_host=server_host, allowed_hosts=allowed_hosts, allow_private=allow_private):
+            self.send_response(403)
+            self.end_headers()
+            return
+        self.send_response(204)
+        self._set_cors_headers()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
+        if not self._trusted_request():
+            self._send_json({"error": "Untrusted request origin or host"}, status=403)
+            return
         url = urllib.parse.urlparse(self.path)
         path = url.path
         params = urllib.parse.parse_qs(url.query)
 
         if path == "/" or path == "/index.html":
-            self._send_html(HTML_TEMPLATE)
+            if not self._verify_auth():
+                self._send_html(
+                    "<!DOCTYPE html><html><head><title>401 Unauthorized</title></head>"
+                    "<body><h1>401 Unauthorized</h1>"
+                    "<p>Missing or invalid dashboard token. Provide token via ?token=&lt;token&gt; or Authorization header.</p>"
+                    "</body></html>",
+                    status=401
+                )
+                return
+            token = get_or_create_dashboard_token()
+            rendered = HTML_TEMPLATE.replace("{{DASHBOARD_TOKEN}}", json.dumps(token).replace("<", "\\u003c"))
+            body = rendered.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Set-Cookie", f"dashboard_token={token}; Path=/; SameSite=Strict; HttpOnly")
+            self.send_header("Content-Length", str(len(body)))
+            self._set_cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
             return
 
         if path == "/favicon.ico":
@@ -1885,6 +2172,7 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "image/svg+xml")
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "public, max-age=86400")
+            self._set_cors_headers()
             self.end_headers()
             self.wfile.write(body)
             return
@@ -1902,6 +2190,21 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
         self._send_json({"error": "Not Found"}, status=404)
 
     def do_POST(self):
+        if not self._trusted_request():
+            self._send_json({"error": "Untrusted request origin or host"}, status=403)
+            return
+        if not self._verify_auth():
+            self._send_json(
+                {"status": "error", "error": "Unauthorized", "message": "Missing or invalid dashboard token."},
+                status=401
+            )
+            return
+
+        length = int(self.headers.get("Content-Length", 0))
+        if length > 1024 * 1024:
+            self._send_json({"status": "error", "message": "Request payload exceeds maximum allowed size (1MB)."}, status=413)
+            return
+
         url = urllib.parse.urlparse(self.path)
         length = int(self.headers.get("Content-Length", 0))
         req_data = json.loads(self.rfile.read(length).decode("utf-8")) if length > 0 else {}
@@ -1915,8 +2218,22 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                 env = os.environ.copy()
                 env["AGY_MEMORY_DB"] = prof["db_path"]
                 env["AGY_TURN_QUEUE_DB"] = prof["queue_db_path"]
-                res = subprocess.run([sys.executable, str(worker_bin), "--force"], env=env, capture_output=True, text=True, timeout=60)
-                self._send_json({"status": "ok", "message": res.stdout.strip() or "Queue processed successfully."})
+                res = subprocess.run([sys.executable, str(worker_bin), "--force"], env=env, capture_output=True, text=True, timeout=180)
+                output = (res.stdout or "").strip()
+                err = (res.stderr or "").strip()
+                if res.returncode == 0:
+                    self._send_json({"status": "ok", "message": output or "Queue processed successfully.", "returncode": 0})
+                else:
+                    self._send_json(
+                        {
+                            "status": "error",
+                            "message": err or output or f"Worker process exited with code {res.returncode}",
+                            "returncode": res.returncode
+                        },
+                        status=500
+                    )
+            except subprocess.TimeoutExpired as e:
+                self._send_json({"status": "error", "message": f"Worker process timed out after {e.timeout} seconds.", "timeout": e.timeout}, status=504)
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
             return
@@ -1941,14 +2258,23 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                     env=env,
                     capture_output=True,
                     text=True,
-                    timeout=120
+                    timeout=240
                 )
                 output = (res.stdout or "").strip()
                 err = (res.stderr or "").strip()
                 if res.returncode == 0:
-                    self._send_json({"status": "ok", "message": output or "Database optimization completed successfully."})
+                    self._send_json({"status": "ok", "message": output or "Database optimization completed successfully.", "returncode": 0})
                 else:
-                    self._send_json({"status": "error", "message": err or output or f"Process exited with code {res.returncode}"}, status=500)
+                    self._send_json(
+                        {
+                            "status": "error",
+                            "message": err or output or f"Optimization exited with code {res.returncode}",
+                            "returncode": res.returncode
+                        },
+                        status=500
+                    )
+            except subprocess.TimeoutExpired as e:
+                self._send_json({"status": "error", "message": f"Optimization process timed out after {e.timeout} seconds.", "timeout": e.timeout}, status=504)
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
             return
@@ -1956,7 +2282,8 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
         if url.path == "/api/create-snapshot":
             try:
                 res = create_snapshot(tag="manual", db_path=prof["db_path"])
-                self._send_json(res)
+                status_code = 200 if res.get("status") == "ok" else 500
+                self._send_json(res, status=status_code)
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
             return
@@ -1968,7 +2295,8 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                     self._send_json({"status": "error", "message": "Missing 'filename' in request."}, status=400)
                     return
                 res = restore_snapshot(filename, db_path=prof["db_path"])
-                self._send_json(res)
+                status_code = 200 if res.get("status") == "ok" else 500
+                self._send_json(res, status=status_code)
             except Exception as e:
                 self._send_json({"status": "error", "message": str(e)}, status=500)
             return
@@ -2179,9 +2507,25 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             self._send_json({"error": str(e)}, status=500)
 
 
-def run_dashboard(host: str = DASHBOARD_HOST, port: int = DASHBOARD_PORT):
+def run_dashboard(
+    host: str = DASHBOARD_HOST,
+    port: int = DASHBOARD_PORT,
+    allowed_hosts: Optional[list] = None,
+    allow_private: Optional[bool] = None,
+):
     """Start the multi-threaded HTTP server."""
     server = ThreadingHTTPServer((host, port), MemoryDashboardHandler)
+    server.server_host = host
+    server.allowed_hosts = (
+        [h.strip().lower() for h in allowed_hosts if h.strip()]
+        if allowed_hosts is not None
+        else DASHBOARD_ALLOWED_HOSTS
+    )
+    server.allow_private = (
+        allow_private
+        if allow_private is not None
+        else DASHBOARD_ALLOW_PRIVATE_NETWORKS
+    )
     print(f"🚀 AGY Memory Debug Dashboard running at http://{host}:{port}")
     try:
         server.serve_forever()
@@ -2195,5 +2539,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="AGY Memory Real-Time Debug Dashboard")
     parser.add_argument("--port", type=int, default=DASHBOARD_PORT, help=f"Server port (default: {DASHBOARD_PORT})")
     parser.add_argument("--host", default=DASHBOARD_HOST, help=f"Server host (default: {DASHBOARD_HOST})")
+    parser.add_argument("--allowed-hosts", default=None, help="Comma-separated list of allowed Host header values")
+    parser.add_argument("--allow-private-networks", action="store_true", default=None, help="Permit private and mesh network Host headers")
     args = parser.parse_args()
-    run_dashboard(host=args.host, port=args.port)
+    allowed = [h.strip().lower() for h in args.allowed_hosts.split(",")] if args.allowed_hosts else None
+    run_dashboard(host=args.host, port=args.port, allowed_hosts=allowed, allow_private=args.allow_private_networks)
