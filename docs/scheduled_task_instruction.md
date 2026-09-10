@@ -23,7 +23,7 @@ The Antigravity memory engine captures conversational insights and stores them i
 | scripts/queue_cli.py status (evaluates 5m idle / 15m wait)  |
 +-------------------------------------------------------------+
            |
-           v (Claim batch)
+           v (Claim batch with lease fencing)
 +-------------------------------------------------------------+
 | scripts/queue_cli.py claim --batch-size 25                  |
 +-------------------------------------------------------------+
@@ -33,11 +33,12 @@ The Antigravity memory engine captures conversational insights and stores them i
 | Facts, Episodes, Learnings, Entity Links                    |
 +-------------------------------------------------------------+
            |
-           v (Atomic Commit & Acknowledge)
+           v (Atomic Single-Transaction Commit & Replay Receipt)
 +-------------------------------------------------------------+
-| scripts/queue_cli.py commit OR FastMCP memory tools         |
-| -> Updates ~/.gemini/memory.db (FTS5 + Vector Embeddings)   |
-| -> Acknowledges ~/.gemini/turn_queue.db                     |
+| scripts/queue_cli.py commit --data-file payload.json        |
+| -> Validates schema & canonical taxonomy upfront            |
+| -> Atomic write to ~/.gemini/memory.db with batch_receipts  |
+| -> Acknowledges ~/.gemini/turn_queue.db (clears lease)      |
 +-------------------------------------------------------------+
 ```
 
@@ -65,7 +66,8 @@ When processing conversation turns, extract only durable, reusable knowledge acr
 
 ### Layer 1: Atomic Facts (facts)
 - Description: Technical specs, IP addresses, server configs, personal preferences, account identifiers, definite appointments, medication/health data.
-- Allowed categories: config, credential, device, finance, health, identity, infra, network, personal, project, service, tool, general.
+- Allowed canonical categories: infra, hardware, software, contacts, family, health, fitness, finance, insurance, travel, home, media, music, work, dev, preferences, communication, cloud, security, architecture, workflow, general.
+- Supported aliases: device (hardware), credential (security), identity (preferences), personal (preferences), project (work), service (infra), tool (software), config (infra), network (infra).
 - Rule: Keep facts concise and atomic. Never dump raw chat transcripts or transient bash commands into facts.
 
 ### Layer 2: Narrative Episodes (episodes)
@@ -76,13 +78,13 @@ When processing conversation turns, extract only durable, reusable knowledge acr
 
 ### Layer 3: Experiential Learnings (learnings)
 - Description: Personal heuristics, tested rules of thumb, behavioral patterns, operational insights.
-- Allowed categories: architecture, automation, communication, finance, general, hardware, health, safety, security, shopping, travel, workflow.
+- Allowed categories: architecture, automation, communication, finance, general, hardware, health, insurance, preferences, safety, security, shopping, travel, workflow.
 - Critical filter: Pass the test "Would this insight help in a similar future situation?"
 - Do NOT store one-time bug fixes, routine syntax corrections, git commit hashes, or code snippets as learnings.
 
 ### Layer 4: Entity Links (entity_links)
-- Description: Directed relationships connecting memory keys.
-- Canonical relations: hosted_on, runs_on, depends_on, part_of, member_of, monitors, uses, stores, related_to.
+- Description: Directed relationships connecting existing memory keys.
+- Canonical relations: hosted_on, runs_on, depends_on, part_of, member_of, owned_by, managed_by, monitors, treats, prescribed_for, insured_by, finances, communicates_via, located_at, uses, stores, connects_to, related_to, maintains, created_by, delivers_to, advises, works_at, lives_at, travels_to, subscribed_to, prescribes.
 
 ## 4. Execution Workflow for the Scheduled Task
 
@@ -99,7 +101,8 @@ Run:
 Run:
 `/Users/__blitzzz/Documents/GitHub/agy-memory-engine/.venv/bin/python /Users/__blitzzz/Documents/GitHub/agy-memory-engine/scripts/queue_cli.py claim --batch-size 25`
 
-Receive the JSON payload containing `batch_id`, `lease_token`, `source`, `chat_id`, and `turns`.
+- If output is `null`: no pending turns available (concurrently drained), exit immediately.
+- Receive the JSON payload containing `batch_id`, `lease_token`, `source`, `chat_id`, and `turns`.
 
 ### Step 3: Cognitive Extraction
 Read all turns in the batch:
@@ -107,7 +110,7 @@ Read all turns in the batch:
   Run:
   `/Users/__blitzzz/Documents/GitHub/agy-memory-engine/.venv/bin/python /Users/__blitzzz/Documents/GitHub/agy-memory-engine/scripts/queue_cli.py skip --batch-id <batch_id> --lease-token <lease_token> --summary "No persistent entities found"`
 - If turns contain valuable persistent knowledge:
-  Structure the JSON extraction payload according to Section 3:
+  Save the extraction payload to a temporary file (e.g. `/tmp/extraction_payload.json`) or pipe via stdin to avoid shell quote escaping issues with apostrophes:
   ```json
   {
     "facts": [{"id": "...", "category": "...", "fact": "...", "keywords": "..."}],
@@ -119,10 +122,15 @@ Read all turns in the batch:
 
 ### Step 4: Atomic Commit & Queue Acknowledgment
 Run:
-`/Users/__blitzzz/Documents/GitHub/agy-memory-engine/.venv/bin/python /Users/__blitzzz/Documents/GitHub/agy-memory-engine/scripts/queue_cli.py commit --batch-id <batch_id> --lease-token <lease_token> --data '<json_payload>'`
+`/Users/__blitzzz/Documents/GitHub/agy-memory-engine/.venv/bin/python /Users/__blitzzz/Documents/GitHub/agy-memory-engine/scripts/queue_cli.py commit --batch-id <batch_id> --lease-token <lease_token> --data-file /tmp/extraction_payload.json`
+or pipe from stdin:
+`cat /tmp/extraction_payload.json | /Users/__blitzzz/Documents/GitHub/agy-memory-engine/.venv/bin/python /Users/__blitzzz/Documents/GitHub/agy-memory-engine/scripts/queue_cli.py commit --batch-id <batch_id> --lease-token <lease_token>`
 
-Alternatively, if committing via native FastMCP tools (store_memory, record_learning, record_episode, link_entities_mcp), call the tools and then run:
-`/Users/__blitzzz/Documents/GitHub/agy-memory-engine/.venv/bin/python /Users/__blitzzz/Documents/GitHub/agy-memory-engine/scripts/queue_cli.py ack --batch-id <batch_id> --lease-token <lease_token> --summary "<summary>"`
+The CLI guarantees:
+1. Lease fencing: Verifies batch ownership and unexpired lease in turn_queue before modifying memory.db.
+2. Replay idempotency: Checks batch_receipts table in memory.db; replayed batches return existing commit receipts without duplicate writes.
+3. Upfront validation: Validates all entity types, non-empty fields, and canonical taxonomy categories before any database mutation.
+4. Single-transaction commit: All entities and batch receipt are written in one atomic transaction; any failure triggers complete rollback with zero orphaned writes.
 
 If an error occurs during extraction, release the batch so it can be retried:
 `/Users/__blitzzz/Documents/GitHub/agy-memory-engine/.venv/bin/python /Users/__blitzzz/Documents/GitHub/agy-memory-engine/scripts/queue_cli.py release --batch-id <batch_id> --lease-token <lease_token> --error "<error_message>"`
@@ -136,9 +144,9 @@ Prune processed turns older than 7 days:
 A scheduled task execution is complete and successful when all of the following conditions are met:
 
 1. Debounce Compliance: No turns are processed while an interactive session is active within the 5-minute silence window, unless the 15-minute maximum wait threshold is exceeded.
-2. Partitioned Lease Isolation: Every claimed batch is identified by a unique `batch_id` and `lease_token`. No concurrent worker can double-process or overwrite the claimed turns.
-3. Strict Taxonomy Validation: All committed facts, episodes, and learnings strictly match canonical categories and statuses. Invalid categories are rejected or normalized.
-4. Clean Queue State: Every processed turn transitions from `status='claimed'` to `status='processed'` (or `'skipped'`), with `lease_token` cleared to `NULL` and `processed_at` timestamp recorded.
-5. Vector & FTS Index Integrity: All committed facts, episodes, and learnings have synchronized FTS5 entries and 1:1 vector embeddings in SQLite tables `vec_memories`, `vec_episodes`, and `vec_learnings`.
-6. Zero Orphaned Locks: The turn queue database and main memory database have zero stuck WAL frames, zero hung transactions, and zero locked rows after completion.
-7. Informative Summary: The task execution outputs a concise, factual summary of turns claimed, entities extracted, and queue count remaining.
+2. Lease Fencing & Isolation: Only workers holding an active, unexpired lease can write to memory.db. Stale workers or invalid tokens are rejected with zero mutations.
+3. Strict Taxonomy Upfront: All committed facts, episodes, and learnings strictly match canonical categories and statuses. Invalid schemas are rejected before touching storage.
+4. Atomic Transaction & Receipt: Memory updates and batch receipt commit in a single transaction. Retries are idempotent and do not duplicate entity links or revisions.
+5. Clean Queue State: Every processed turn transitions from `status='claimed'` to `status='processed'` (or `'skipped'`), with `lease_token` cleared to `NULL` and `processed_at` timestamp recorded.
+6. Vector & FTS Index Integrity: All committed facts, episodes, and learnings have synchronized FTS5 entries and 1:1 vector embeddings in SQLite tables `vec_memories`, `vec_episodes`, and `vec_learnings`.
+7. Informative Summary: The task execution outputs a concise, factual summary of turns claimed, entities stored, and queue count remaining.

@@ -264,7 +264,7 @@ def enqueue_turn(
                         # Turn is still pending and unbatched - atomically update with expanded response
                         if ex_status == 'pending' and ex_batch_id is None:
                             conn.execute(
-                                "UPDATE turn_queue SET user_prompt = ?, assistant_response = ? WHERE id = ?",
+                                "UPDATE turn_queue SET user_prompt = ?, assistant_response = ?, created_at = CURRENT_TIMESTAMP WHERE id = ?",
                                 (clean_user, clean_resp, ex_id)
                             )
                             conn.execute("COMMIT")
@@ -303,7 +303,7 @@ def enqueue_turn(
                                 return True
                             if cont_row[1] == 'pending' and cont_row[2] is None:
                                 conn.execute(
-                                    "UPDATE turn_queue SET assistant_response = ? WHERE id = ?",
+                                    "UPDATE turn_queue SET assistant_response = ?, created_at = CURRENT_TIMESTAMP WHERE id = ?",
                                     (clean_resp, cont_row[0])
                                 )
                                 conn.execute("COMMIT")
@@ -664,24 +664,24 @@ def mark_turn_status(
             raise
 
 
-def prune_processed_turns(days: int = 7, db_path: str = QUEUE_DB_PATH):
-    """Delete old processed / skipped items."""
+def prune_processed_turns(days: int = 7, db_path: str = QUEUE_DB_PATH) -> int:
+    """Delete old processed / skipped items based on processed_at (fallback to created_at)."""
     ensure_queue_db(db_path)
-    try:
-        with _get_connection(db_path, timeout=5.0, isolation_level=None) as conn:
-            conn.execute("BEGIN IMMEDIATE")
-            try:
-                conn.execute("""
-                    DELETE FROM turn_queue
-                    WHERE status IN ('processed', 'skipped')
-                      AND datetime(created_at) < datetime('now', '-' || ? || ' days')
-                """, (days,))
-                conn.execute("COMMIT")
-            except Exception:
-                conn.execute("ROLLBACK")
-                raise
-    except Exception:
-        pass
+    with _get_connection(db_path, timeout=5.0, isolation_level=None) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                DELETE FROM turn_queue
+                WHERE status IN ('processed', 'skipped')
+                  AND datetime(COALESCE(processed_at, created_at)) < datetime('now', '-' || ? || ' days')
+            """, (days,))
+            count = cursor.rowcount
+            conn.execute("COMMIT")
+            return count
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
 
 
 def get_recent_turns(limit: int = 50, status: str = None, db_path: str = QUEUE_DB_PATH) -> list:

@@ -40,6 +40,12 @@ _CATEGORY_ALIASES = {
     "heuristics": "general", "ai_tools": "software", "ai": "dev",
     "ui_ux": "architecture", "network": "infra",
     "realestate": "home", "calendar": "general",
+    "device": "hardware", "devices": "hardware",
+    "credential": "security", "credentials": "security",
+    "identity": "preferences", "personal": "preferences",
+    "project": "work", "projects": "work",
+    "service": "infra", "services": "infra",
+    "tool": "software", "tools": "software",
 }
 
 

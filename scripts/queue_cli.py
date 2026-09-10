@@ -17,13 +17,17 @@ from queue_manager import (
     release_batch,
     prune_processed_turns,
     QUEUE_DB_PATH,
+    _get_connection,
 )
+from config import get_config
+from schema import db_session
 from memory_worker import should_process_queue
 from agy_memory import (
     upsert_fact,
     upsert_episode,
     upsert_learning,
     link_entities,
+    _VOCABULARY_CACHE,
     CANONICAL_FACT_CATEGORIES,
     CANONICAL_LEARNING_CATEGORIES,
     CANONICAL_EPISODE_TOPICS,
@@ -111,69 +115,204 @@ def cmd_release(args):
     return 0 if ok else 1
 
 
+def _validate_payload(data):
+    """Strictly validate schema and content of extraction payload upfront.
+
+    Returns tuple of (validated_facts, validated_episodes, validated_learnings, validated_links)
+    or raises ValueError on malformed input.
+    """
+    if not isinstance(data, dict):
+        raise ValueError("Payload must be a JSON object.")
+
+    for key in ("facts", "episodes", "learnings", "entity_links"):
+        val = data.get(key, [])
+        if not isinstance(val, list):
+            raise ValueError(f"Field '{key}' must be a list, got {type(val).__name__}.")
+
+    validated_facts = []
+    for i, f in enumerate(data.get("facts", [])):
+        if not isinstance(f, dict):
+            raise ValueError(f"facts[{i}] must be an object.")
+        fid = f.get("id")
+        fact = f.get("fact")
+        if not isinstance(fid, str) or not fid.strip():
+            raise ValueError(f"facts[{i}] has missing or invalid 'id'.")
+        if not isinstance(fact, str) or not fact.strip():
+            raise ValueError(f"facts[{i}] has missing or invalid 'fact'.")
+        raw_cat = f.get("category", "general")
+        if not isinstance(raw_cat, str) or not raw_cat.strip():
+            raise ValueError(f"facts[{i}] has invalid 'category'.")
+        norm_cat = validate_category(raw_cat.strip(), CANONICAL_FACT_CATEGORIES)
+        kw = str(f.get("keywords") or "").strip()
+        validated_facts.append((fid.strip(), norm_cat, fact.strip(), kw))
+
+    validated_episodes = []
+    for i, ep in enumerate(data.get("episodes", [])):
+        if not isinstance(ep, dict):
+            raise ValueError(f"episodes[{i}] must be an object.")
+        epid = ep.get("id")
+        title = ep.get("title")
+        narrative = ep.get("narrative")
+        if not isinstance(epid, str) or not epid.strip():
+            raise ValueError(f"episodes[{i}] has missing or invalid 'id'.")
+        if not isinstance(title, str) or not title.strip():
+            raise ValueError(f"episodes[{i}] has missing or invalid 'title'.")
+        if not isinstance(narrative, str) or not narrative.strip():
+            raise ValueError(f"episodes[{i}] has missing or invalid 'narrative'.")
+        raw_topic = ep.get("topic", "general")
+        if not isinstance(raw_topic, str) or not raw_topic.strip():
+            raise ValueError(f"episodes[{i}] has invalid 'topic'.")
+        norm_topic = validate_category(raw_topic.strip(), CANONICAL_EPISODE_TOPICS)
+        raw_status = str(ep.get("status") or "active").strip().lower()
+        if raw_status not in CANONICAL_EPISODE_STATUSES:
+            raw_status = "active"
+        period = str(ep.get("period") or "").strip()
+        entities = str(ep.get("entities") or "").strip()
+        stance = str(ep.get("stance") or "").strip()
+        kw = str(ep.get("keywords") or "").strip()
+        validated_episodes.append((epid.strip(), norm_topic, title.strip(), narrative.strip(), period, raw_status, entities, stance, kw))
+
+    validated_learnings = []
+    for i, lr in enumerate(data.get("learnings", [])):
+        if not isinstance(lr, dict):
+            raise ValueError(f"learnings[{i}] must be an object.")
+        lrid = lr.get("id")
+        insight = lr.get("insight")
+        if not isinstance(lrid, str) or not lrid.strip():
+            raise ValueError(f"learnings[{i}] has missing or invalid 'id'.")
+        if not isinstance(insight, str) or not insight.strip():
+            raise ValueError(f"learnings[{i}] has missing or invalid 'insight'.")
+        raw_cat = lr.get("category", "general")
+        if not isinstance(raw_cat, str) or not raw_cat.strip():
+            raise ValueError(f"learnings[{i}] has invalid 'category'.")
+        norm_cat = validate_category(raw_cat.strip(), CANONICAL_LEARNING_CATEGORIES)
+        context = str(lr.get("context") or "").strip()
+        kw = str(lr.get("keywords") or "").strip()
+        validated_learnings.append((lrid.strip(), norm_cat, insight.strip(), context, kw))
+
+    validated_links = []
+    for i, link in enumerate(data.get("entity_links", [])):
+        if not isinstance(link, dict):
+            raise ValueError(f"entity_links[{i}] must be an object.")
+        src = link.get("source")
+        tgt = link.get("target")
+        rel = link.get("relation")
+        if not isinstance(src, str) or not src.strip():
+            raise ValueError(f"entity_links[{i}] has missing or invalid 'source'.")
+        if not isinstance(tgt, str) or not tgt.strip():
+            raise ValueError(f"entity_links[{i}] has missing or invalid 'target'.")
+        if not isinstance(rel, str) or not rel.strip():
+            raise ValueError(f"entity_links[{i}] has missing or invalid 'relation'.")
+        can_src, can_tgt, can_rel = map_relation(src.strip(), tgt.strip(), rel.strip())
+        validated_links.append((can_src, can_tgt, can_rel))
+
+    return validated_facts, validated_episodes, validated_learnings, validated_links
+
+
 def cmd_commit(args):
     db_path = args.db_path or QUEUE_DB_PATH
-    raw_data = args.data
-    if raw_data == "-" or not raw_data:
-        raw_data = sys.stdin.read()
+    m_db_path = getattr(args, "memory_db", None) or get_config("AGY_MEMORY_DB", None)
+
+    # 1. Batch Receipt Replay Check: If already committed, return existing receipt (idempotent replay)
+    with db_session(db_path=m_db_path) as m_conn:
+        receipt = m_conn.execute("SELECT result_json FROM batch_receipts WHERE batch_id = ?", (args.batch_id,)).fetchone()
+        if receipt:
+            summary = "Replay from existing batch receipt"
+            ok = acknowledge_batch(
+                batch_id=args.batch_id,
+                lease_token=args.lease_token,
+                status="processed",
+                summary=summary,
+                db_path=db_path,
+            )
+            res = {
+                "acknowledged": True,
+                "batch_id": args.batch_id,
+                "status": "processed",
+                "summary": summary,
+                "committed": json.loads(receipt[0]),
+                "replay": True,
+            }
+            print(json.dumps(res, ensure_ascii=False, indent=2))
+            return 0
+
+    # 2. Lease Fencing: Check that the batch is claimed by this worker and lease has not expired BEFORE touching memory.db
+    with _get_connection(db_path, timeout=5.0) as q_conn:
+        row = q_conn.execute("""
+            SELECT status, lease_expires_at
+            FROM turn_queue
+            WHERE batch_id = ? AND lease_token = ? AND status = 'claimed'
+        """, (args.batch_id, args.lease_token)).fetchone()
+        if not row:
+            sys.stderr.write(f"Commit rejected: batch '{args.batch_id}' is not claimed with the provided lease token.\n")
+            return 1
+
+        exp_check = q_conn.execute("""
+            SELECT 1
+            FROM turn_queue
+            WHERE batch_id = ? AND lease_token = ? AND status = 'claimed'
+              AND datetime(lease_expires_at) >= datetime('now')
+        """, (args.batch_id, args.lease_token)).fetchone()
+        if not exp_check:
+            sys.stderr.write(f"Commit rejected: lease for batch '{args.batch_id}' has expired.\n")
+            return 1
+
+    # 3. Read payload from data-file, data argument, or stdin
+    if getattr(args, "data_file", None):
+        try:
+            with open(args.data_file, "r", encoding="utf-8") as f:
+                raw_data = f.read()
+        except Exception as e:
+            sys.stderr.write(f"Cannot read data file '{args.data_file}': {e}\n")
+            return 1
+    else:
+        raw_data = args.data
+        if raw_data == "-" or not raw_data:
+            raw_data = sys.stdin.read()
+
+    # 4. Strict Validation: Parse JSON and validate all layers upfront before any writes
     try:
         data = json.loads(raw_data)
     except Exception as e:
         sys.stderr.write(f"Invalid JSON data: {e}\n")
         return 1
 
-    facts = data.get("facts", [])
-    episodes = data.get("episodes", [])
-    learnings = data.get("learnings", [])
-    entity_links = data.get("entity_links", [])
+    try:
+        facts, episodes, learnings, links = _validate_payload(data)
+    except ValueError as e:
+        sys.stderr.write(f"Commit validation error: {e}\n")
+        return 1
 
-    committed = {"facts": 0, "episodes": 0, "learnings": 0, "entity_links": 0}
+    total_items = len(facts) + len(episodes) + len(learnings) + len(links)
+    committed = {
+        "facts": len(facts),
+        "episodes": len(episodes),
+        "learnings": len(learnings),
+        "entity_links": len(links),
+    }
 
-    for f in facts:
-        fact_id = str(f.get("id", "")).strip()
-        cat = validate_category(f.get("category", "general"), CANONICAL_FACT_CATEGORIES)
-        content = str(f.get("fact", "")).strip()
-        kw = str(f.get("keywords", "")).strip()
-        if fact_id and content:
-            upsert_fact(fact_id, cat, content, kw)
-            committed["facts"] += 1
+    # 5. Atomic Persistence: Single transaction for all memory updates and batch receipt
+    if total_items > 0:
+        try:
+            with db_session(db_path=m_db_path) as m_conn, m_conn:
+                m_conn.execute("BEGIN IMMEDIATE")
+                for fid, cat, content, kw in facts:
+                    upsert_fact(fid, cat, content, kw, connection=m_conn)
+                for epid, topic, title, narrative, period, status, entities, stance, kw in episodes:
+                    upsert_episode(epid, topic, title, narrative, period, status, entities, stance, kw, connection=m_conn)
+                for lrid, cat, insight, context, kw in learnings:
+                    upsert_learning(lrid, cat, insight, context, kw, connection=m_conn)
+                for src, tgt, rel in links:
+                    link_entities(src, tgt, rel, connection=m_conn)
+                m_conn.execute(
+                    "INSERT INTO batch_receipts (batch_id, result_json) VALUES (?, ?)",
+                    (args.batch_id, json.dumps(committed))
+                )
+            _VOCABULARY_CACHE.clear()
+        except Exception as e:
+            sys.stderr.write(f"Transaction rollback: failed to persist memory batch: {e}\n")
+            return 1
 
-    for ep in episodes:
-        ep_id = str(ep.get("id", "")).strip()
-        topic = validate_category(ep.get("topic", "general"), CANONICAL_EPISODE_TOPICS)
-        title = str(ep.get("title", "")).strip()
-        narrative = str(ep.get("narrative", "")).strip()
-        period = str(ep.get("period", "")).strip()
-        status = str(ep.get("status", "active")).strip().lower()
-        if status not in CANONICAL_EPISODE_STATUSES:
-            status = "active"
-        entities = str(ep.get("entities", "")).strip()
-        stance = str(ep.get("stance", "")).strip()
-        kw = str(ep.get("keywords", "")).strip()
-        if ep_id and title and narrative:
-            upsert_episode(ep_id, topic, title, narrative, period, status, entities, stance, kw)
-            committed["episodes"] += 1
-
-    for lr in learnings:
-        lr_id = str(lr.get("id", "")).strip()
-        cat = validate_category(lr.get("category", "general"), CANONICAL_LEARNING_CATEGORIES)
-        insight = str(lr.get("insight", "")).strip()
-        context = str(lr.get("context", "")).strip()
-        kw = str(lr.get("keywords", "")).strip()
-        if lr_id and insight:
-            upsert_learning(lr_id, cat, insight, context, kw)
-            committed["learnings"] += 1
-
-    for link in entity_links:
-        src = str(link.get("source", "")).strip()
-        tgt = str(link.get("target", "")).strip()
-        rel = str(link.get("relation", "")).strip()
-        if src and tgt and rel:
-            can_src, can_tgt, can_rel = map_relation(src, tgt, rel)
-            link_entities(can_src, can_tgt, can_rel)
-            committed["entity_links"] += 1
-
-    total = sum(committed.values())
     summary_parts = []
     if committed["facts"]:
         summary_parts.append(f"{committed['facts']} facts")
@@ -185,7 +324,7 @@ def cmd_commit(args):
         summary_parts.append(f"{committed['entity_links']} links")
     summary = ", ".join(summary_parts) if summary_parts else "No persistent entities found"
 
-    status = "processed" if total > 0 else "skipped"
+    status = "processed" if total_items > 0 else "skipped"
     ok = acknowledge_batch(
         batch_id=args.batch_id,
         lease_token=args.lease_token,
@@ -206,8 +345,8 @@ def cmd_commit(args):
 
 def cmd_prune(args):
     db_path = args.db_path or QUEUE_DB_PATH
-    prune_processed_turns(days=args.days, db_path=db_path)
-    print(json.dumps({"pruned": True, "days": args.days}))
+    deleted_count = prune_processed_turns(days=args.days, db_path=db_path)
+    print(json.dumps({"pruned": True, "days": args.days, "deleted_count": deleted_count}))
     return 0
 
 
@@ -247,6 +386,8 @@ def main():
     commit_p.add_argument("--batch-id", required=True, help="Batch ID")
     commit_p.add_argument("--lease-token", required=True, help="Lease token")
     commit_p.add_argument("--data", default="-", help="JSON data string or '-' to read from stdin")
+    commit_p.add_argument("--data-file", default=None, help="Path to JSON data file")
+    commit_p.add_argument("--memory-db", default=None, help="Custom memory database path")
     commit_p.set_defaults(func=cmd_commit)
 
     prune_p = subparsers.add_parser("prune", help="Prune processed and skipped turns older than N days")
