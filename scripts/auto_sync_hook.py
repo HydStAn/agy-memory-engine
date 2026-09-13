@@ -144,10 +144,23 @@ def main():
             try:
                 with open(state_file, "r", encoding="utf-8") as f:
                     state_data = json.load(f)
+                # 1. Check existing sessions
                 for session_chat_id, session in state_data.get("sessions", {}).items():
                     if session.get("conversationId") == conv_id:
                         chat_id = str(session_chat_id)
                         break
+
+                # 2. Check inFlight sessions (first turn of new topic/session before conv_id is saved)
+                if not chat_id:
+                    inflight = state_data.get("inFlight", {})
+                    norm_prompt = (last_user_prompt or "").strip()
+                    for if_chat_id, if_data in inflight.items():
+                        if_prompt = (if_data.get("prompt") or "").strip()
+                        if if_prompt and (if_prompt == norm_prompt or if_prompt in norm_prompt or norm_prompt in if_prompt):
+                            chat_id = str(if_chat_id)
+                            break
+                    if not chat_id and len(inflight) == 1:
+                        chat_id = str(list(inflight.keys())[0])
             except Exception:
                 pass
 
