@@ -54,6 +54,7 @@ MODEL_EXPLICIT = bool(get_config("AGY_MEMORY_MODEL"))
 EMBEDDING_MODEL_NAME = get_config("AGY_EMBEDDING_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2")
 EMBEDDING_DIM = int(get_config("AGY_EMBEDDING_DIM", "384"))
 VECTOR_SEARCH_ENABLED = get_config("AGY_VECTOR_SEARCH_ENABLED", "true").lower() in ("true", "1", "yes", "on")
+STRICT_GRAPH = get_config("AGY_MEMORY_STRICT_GRAPH", "false").lower() in ("true", "1", "yes", "on")
 
 # --- Binary Paths ---
 AGY_BIN = (

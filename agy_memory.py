@@ -29,7 +29,7 @@ from config import (
     MODEL_NAME,
     DEFAULT_MODEL,
     CACHE_PATH,
-    AGY_BIN, MODEL_EXPLICIT, archive_path, sync_lock_path
+    AGY_BIN, MODEL_EXPLICIT, archive_path, sync_lock_path, STRICT_GRAPH
 )
 try:
     from embedder import upsert_vector, delete_vector, build_text_repr
@@ -1095,10 +1095,17 @@ Output ONLY a single valid JSON object (or {{"facts":[], "episodes":[], "learnin
                         if dry_run:
                             diff_lines.append(f"  [NEW] Entity Link: {el['source']} --[{relation}]--> {el['target']}")
                             continue
+                        valid_endpoints = True
                         for endpoint in (el["source"], el["target"]):
                             if not any(transaction.execute(f"SELECT 1 FROM {table} WHERE id = ?", (endpoint,)).fetchone()
                                        for table in ("memories", "episodes", "learnings")):
-                                raise SyncExtractionError(f"Unknown graph endpoint: {endpoint}")
+                                if STRICT_GRAPH:
+                                    raise SyncExtractionError(f"Unknown graph endpoint: {endpoint}")
+                                logger.warning(f"Skipping entity link with unknown graph endpoint: {endpoint}")
+                                valid_endpoints = False
+                                break
+                        if not valid_endpoints:
+                            continue
                         link_entities(el["source"], el["target"], relation, connection=transaction)
                         applied_changes["entity_links"].append({
                             "source": el["source"],
