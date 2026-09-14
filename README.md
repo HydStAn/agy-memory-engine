@@ -1,4 +1,4 @@
-# AGY Memory Engine (v2.2.0)
+# AGY Memory Engine (v2.3.0)
 
 > Hardening branch: see [runtime setup and audit coverage](HARDENING.md). Automatic extraction now requires an explicitly configured tool-free chat-completions endpoint. It no longer launches an unrestricted AGY agent. Failed extraction retains pending turns. Schema upgrades run on first engine access; restart all clients together for rollout.
 
@@ -400,6 +400,16 @@ python3 -m unittest discover tests/ -v
 ---
 
 ## 🚀 Release Notes
+
+### v2.3.0 (2026-09-14)
+- **Comprehensive Hardening, WAL-Safe Storage & Queue Reliability**:
+  - Atomic batch claims with durable batch receipts and recoverable expiring leases in `turn_queue.db`.
+  - Concurrency hardening: serialized schema bootstrap, entity revision tracking, and generation fencing preventing stale overwrites across restores.
+  - Native `agy --print` CLI fallback for tool-free background inference when `AGY_MEMORY_INFERENCE_URL` is unset, with automatic markdown extraction and slash-command retry.
+  - Multi-user dashboard and permission resilience: shared maintenance lock (`LOCK_SH`) allowing seamless cross-user profile inspection (e.g. `ubuntu` / `henrik`).
+  - Tolerant entity graph linking: invalid or unresolvable relationship endpoints are skipped with warnings instead of rolling back the entire extraction transaction (`AGY_MEMORY_STRICT_GRAPH=false`).
+  - First-turn Telegram routing: in-flight session resolution in `scripts/auto_sync_hook.py` ensuring immediate chat attribution from the very first message.
+  - Bounded MCP maintenance offloading to a single background worker thread to keep the event loop responsive.
 
 ### v2.2.0 (2026-09-07)
 - **Semantic Recall & In-Process Hybrid Search (FTS5 + `sqlite-vec`)**:

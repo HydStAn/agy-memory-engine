@@ -38,7 +38,7 @@ except ImportError:
     delete_vector = None
     build_text_repr = None
 
-__version__ = "2.2.0"
+__version__ = "2.3.0"
 
 logger = logging.getLogger("agy_memory")
 if not logger.handlers:
