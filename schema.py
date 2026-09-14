@@ -312,8 +312,28 @@ def _upgrade_schema(conn):
 def maintenance_lock(db_path, exclusive=False, timeout=5):
     """Coordinate restore with all current engine connections across processes."""
     lock_path = Path(db_path).expanduser().resolve().with_suffix('.maintenance.lock')
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with lock_path.open('a') as handle:
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except (PermissionError, OSError):
+        pass
+
+    handle = None
+    try:
+        try:
+            handle = lock_path.open('a')
+        except PermissionError:
+            if not exclusive and lock_path.exists():
+                handle = lock_path.open('r')
+            else:
+                raise
+    except PermissionError:
+        if not exclusive:
+            # Multi-user or read-only profile: allow shared access if lock file cannot be created/opened
+            yield
+            return
+        raise
+
+    with handle:
         deadline = time.monotonic() + timeout
         operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
         while True:

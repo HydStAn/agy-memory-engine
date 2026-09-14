@@ -1088,6 +1088,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     async function fetchData(forceDomRefresh = false) {
       try {
         const res = await fetch('/api/stats?user=' + encodeURIComponent(currentProfile));
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          showToast('Failed to load profile ' + currentProfile + ': ' + (errData.error || res.statusText), 'error', 4000);
+          return;
+        }
         const data = await res.json();
         rawData = data;
 
