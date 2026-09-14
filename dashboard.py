@@ -860,7 +860,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <!-- Dedicated Live Search Bar -->
   <div class="search-box">
     <span style="color:var(--text-muted);">🔍</span>
-    <input type="text" id="inp-search" placeholder="Type to search across all memory layers (e.g. dog insurance, Tesla, Beelink, Madrid, retirement)..." oninput="debounceSearch()">
+    <input type="text" id="inp-search" placeholder="Type to search across all memory layers (e.g. dog insurance, Tesla, server IP, Madrid, retirement)..." oninput="debounceSearch()">
     <button id="btn-clear-search" onclick="clearSearch()" style="display:none; background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:1.1rem; padding:0 6px;">✕</button>
     <div class="search-meta" id="search-latency">0 ms</div>
   </div>

@@ -330,7 +330,7 @@ def link_entities_mcp(source_id: str, target_id: str, relation: str) -> str:
 
     Args:
         source_id: Source ID (e.g. 'service.immich').
-        target_id: Target ID (e.g. 'infra.beelink').
+        target_id: Target ID (e.g. 'infra.server').
         relation: Canonical relation type (e.g. 'hosted_on', 'runs_on', 'depends_on', 'part_of', 'member_of', 'monitors', 'uses', 'stores', 'related_to').
                   Legacy relations (e.g. 'hosts', 'runs_in') are automatically mapped and directionally inverted if needed.
     """
@@ -518,7 +518,7 @@ async def _link_entities_mcp(source_id: str, target_id: str, relation: str) -> s
 
     Args:
         source_id: Source ID (e.g. 'service.immich').
-        target_id: Target ID (e.g. 'infra.beelink').
+        target_id: Target ID (e.g. 'infra.server').
         relation: Canonical relation type (e.g. 'hosted_on', 'runs_on', 'depends_on', 'part_of', 'member_of', 'monitors', 'uses', 'stores', 'related_to').
                   Legacy relations (e.g. 'hosts', 'runs_in') are automatically mapped and directionally inverted if needed.
     """

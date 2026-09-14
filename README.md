@@ -197,7 +197,7 @@ To have the memory engine automatically learn from your conversations without yo
 python3 agy_memory.py prefetch "Hundeversicherung"
 
 # Add Layer 1 Fact
-python3 agy_memory.py add --id "infra.beelink.ip" --category "infra" --fact "Beelink Host IP is 100.114.118.47" --keywords "beelink host server ip"
+python3 agy_memory.py add --id "infra.server.ip" --category "infra" --fact "Home server IP is 192.168.1.50" --keywords "server host ip home"
 
 # Add Layer 2 Episode
 python3 agy_memory.py add-episode --id "travel.iceland2027" --topic "travel" --title "Laugavegur Trekking" --narrative "Hut booking watchdog active for July 2027." --status "active" --keywords "island laugavegur"
@@ -206,7 +206,7 @@ python3 agy_memory.py add-episode --id "travel.iceland2027" --topic "travel" --t
 python3 agy_memory.py add-learning --id "travel.flights.cdp" --category "travel" --insight "Use CDP browser for Google Flights to avoid bot-blocking." --keywords "google flights bot cdp"
 
 # Link Entities in Graph
-python3 agy_memory.py link --source "service.immich" --target "infra.beelink.ip" --relation "hosted_on"
+python3 agy_memory.py link --source "service.immich" --target "infra.server.ip" --relation "hosted_on"
 
 # Optimize & Decay Maintenance
 python3 agy_memory.py optimize --apply
@@ -275,7 +275,7 @@ Add to your MCP settings file (e.g. `~/.gemini/antigravity-cli/mcp_config.json` 
             ▼
    📲 Instant Status Notification back to Telegram Topic / Chat
       "🧠 Autonomous memory updated (1 fact, 1 learning)
-       • ➕ Beelink Host IP is 100.114.118.47
+       • ➕ Home server IP is 192.168.1.50
        • ➕ Use CDP browser for Google Flights"
 ```
 
@@ -321,10 +321,17 @@ AGY_BIN=agy
 AGY_MEMORY_DEBUG_DASHBOARD=true
 AGY_MEMORY_DASHBOARD_PORT=8085
 AGY_MEMORY_DASHBOARD_HOST=127.0.0.1
-# Remote access (VPN, Tailscale, LAN): set HOST=0.0.0.0 or specify allowed hostnames
-# When bound to 0.0.0.0, private (RFC 1918) and Tailscale/mesh (RFC 6598 / 100.64.0.0/10) IPs are allowed by default
+# Dashboard Authentication: set custom token or let engine auto-generate in ~/.gemini/dashboard.token
+AGY_MEMORY_DASHBOARD_TOKEN=your_secure_dashboard_token_here
+# Remote access (VPN, Tailscale, LAN): specify allowed hostnames and private networks
 AGY_MEMORY_DASHBOARD_ALLOWED_HOSTS=my-node.ts.net,*.ts.net
 AGY_MEMORY_DASHBOARD_ALLOW_PRIVATE_NETWORKS=true
+
+# Optional: trusted OpenAI-compatible chat-completions URL for tool-free HTTP extraction.
+# If unset (default), the engine gracefully falls back to native Antigravity CLI (agy --print).
+AGY_MEMORY_INFERENCE_URL=
+AGY_MEMORY_INFERENCE_MODEL=
+AGY_MEMORY_INFERENCE_KEY=
 ```
 
 ---
@@ -337,6 +344,26 @@ A zero-dependency, standalone live web dashboard is included to inspect, search,
 * **Turn Queue & Debounce Monitor:** Visual countdown bar for active conversation debouncing (5m idle / 15m timeout) with an instant *"Process batch now"* trigger.
 * **4-Layer Visualizer:** Browse Facts (Layer 1), Thematic Episodes with status badges (Layer 2), Experiential Learnings (Layer 3), and Knowledge Graph Entity Links (Layer 4).
 * **Consolidation Audit Log:** Review automated background merges, deduplications, and semantic rationale.
+* **Multi-User Profile Switcher:** Seamlessly switch between configured user profiles on the host via the header dropdown.
+
+### Authentication & Token Security
+
+The dashboard is protected by authentication tokens for all viewing and mutation endpoints:
+
+1. **Auto-Generated Token (Default)**:  
+   On first start, the dashboard generates a 256-bit secure token stored in `~/.gemini/dashboard.token` (permissions `0600`, user-only).
+2. **Explicit Token via `.env`**:  
+   You can specify your own token in `.env` via `AGY_MEMORY_DASHBOARD_TOKEN=your-secret-token`.
+3. **Browser Access**:  
+   Append `?token=<your_token>` to the URL on your first visit:
+   ```text
+   http://localhost:8085/?token=your_secure_dashboard_token_here
+   # Or over Tailscale:
+   https://<your-tailscale-node>.ts.net:8085/?token=your_secure_dashboard_token_here
+   ```
+   The token is saved in browser `localStorage`, so subsequent reloads and visits do not require re-entering it.
+4. **API Requests**:  
+   Pass the header `Authorization: Bearer <your_token>`.
 
 ### Starting the Dashboard
 
@@ -350,8 +377,6 @@ python3 dashboard.py --port 8085
 # Or via systemd background user service
 systemctl --user start agy-memory-dashboard.service
 ```
-
-Access in your browser at `http://localhost:8085` (or over Tailscale at `http://<tailscale-ip>:8085`).
 
 ---
 
@@ -406,7 +431,7 @@ python3 -m unittest discover tests/ -v
   - Atomic batch claims with durable batch receipts and recoverable expiring leases in `turn_queue.db`.
   - Concurrency hardening: serialized schema bootstrap, entity revision tracking, and generation fencing preventing stale overwrites across restores.
   - Native `agy --print` CLI fallback for tool-free background inference when `AGY_MEMORY_INFERENCE_URL` is unset, with automatic markdown extraction and slash-command retry.
-  - Multi-user dashboard and permission resilience: shared maintenance lock (`LOCK_SH`) allowing seamless cross-user profile inspection (e.g. `ubuntu` / `henrik`).
+  - Multi-user dashboard and permission resilience: shared maintenance lock (`LOCK_SH`) allowing seamless cross-user profile inspection between multiple Linux user profiles.
   - Tolerant entity graph linking: invalid or unresolvable relationship endpoints are skipped with warnings instead of rolling back the entire extraction transaction (`AGY_MEMORY_STRICT_GRAPH=false`).
   - First-turn Telegram routing: in-flight session resolution in `scripts/auto_sync_hook.py` ensuring immediate chat attribution from the very first message.
   - Bounded MCP maintenance offloading to a single background worker thread to keep the event loop responsive.
