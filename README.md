@@ -110,7 +110,7 @@ Get up and running from zero to autonomous memory in 5 minutes.
 Clone the repository and install the lightweight Python dependencies (no PyTorch, no heavyweight vector DBs needed):
 
 ```bash
-git clone https://github.com/sbolten/agy-memory-engine.git
+git clone https://github.com/HydStAn/agy-memory-engine.git
 cd agy-memory-engine
 
 # Optional: set up your environment configuration
@@ -407,7 +407,7 @@ python3 -m unittest discover tests/ -v
   - Dense 384-dimensional multilingual embeddings via `fastembed` with `paraphrase-multilingual-MiniLM-L12-v2`.
   - Reciprocal Rank Fusion (RRF) combining BM25 lexical precision with semantic cosine similarity in `search_memory`.
   - Zero latency impact on CLI prefetch: Pre-invocation prefetch remains strictly < 2ms (FTS5 + Trigram).
-  - Background vector indexing of 175 facts, 37 episodes, and 92 learnings in `~/.gemini/memory.db`.
+  - Background vector indexing of facts, episodes and learnings in `~/.gemini/memory.db`.
   - Automatic cascade deletion triggers from SQLite parent tables to virtual vector tables (`vec_memories`, `vec_episodes`, `vec_learnings`).
   - Standalone reindexing utility `scripts/reindex_vectors.py`.
 
