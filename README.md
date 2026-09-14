@@ -475,12 +475,18 @@ python3 -m unittest discover tests/ -v
   - **Tier 1 (Profile/Preferences)**: Lean, fixed identity facts injected directly into agent system prompt (0ms latency, ~150-250 tokens max).
   - **Tier 2 (Episodic & Semantic Store)**: 4-Layer SQLite `memory.db` with Hybrid Search on-demand.
   - **Tier 3 (Working Memory)**: Active session context & scratchpad.
-- [ ] **Pluggable LLM Backends for Background Worker**:
-  - Abstract extraction & consolidation caller (`call_llm`) beyond `agy --print`.
-  - **Claude Code Compatibility**: Support Claude CLI (`claude -p`) as background extraction engine.
-  - **Direct Provider APIs**: Native lightweight connectors for Anthropic (e.g. Claude 3.5 Haiku) and OpenAI-compatible endpoints without external CLI dependencies.
-- [ ] **Multi-Agent Session Routing**: Dynamic extraction profile tagging per client/agent session.
-- [ ] **Selective Synced Subgraphs**: Export and sync filtered memory subsets across distributed nodes.
+- [x] **Production Hardening, WAL Concurrency & Tool-Free Inference (v2.3.0)**:
+  - Atomic batch claims, durable batch receipts, and recoverable expiring worker leases in `turn_queue.db`.
+  - Concurrency hardening: serialized schema bootstrap, entity revision tracking, and generation fencing.
+  - Tool-free Direct Provider API: Native lightweight connector for OpenAI-compatible endpoints without external CLI dependencies (`memory_inference.py`).
+  - Native Antigravity CLI fallback (`agy --print`) with markdown JSON extraction and slash-command retry.
+  - Multi-user dashboard resilience and cross-user maintenance locking.
+  - Tolerant graph linking (`AGY_MEMORY_STRICT_GRAPH=false`) and first-turn Telegram in-flight session resolution.
+- [ ] **Extended Agent & CLI Integrations**:
+  - **Claude Code Compatibility**: Support Claude CLI (`claude -p`) as alternate background extraction engine.
+  - Dynamic extraction profile tagging per client/agent session (multi-agent orchestration).
+- [ ] **Selective Synced Subgraphs**:
+  - Export and sync filtered memory subsets across distributed nodes over Tailscale mesh.
 
 ---
 
