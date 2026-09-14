@@ -4,7 +4,7 @@ This branch changes repository behavior. It does not install host hooks, start a
 
 ## Runtime configuration
 
-Automatic extraction and semantic consolidation use `memory_inference.py`, a bounded subprocess calling a trusted OpenAI-compatible chat-completions endpoint. Set `AGY_MEMORY_INFERENCE_URL` to its full HTTPS endpoint, `AGY_MEMORY_INFERENCE_MODEL` to an available provider model, and `AGY_MEMORY_INFERENCE_KEY` if authentication is required. Loopback HTTP is supported for local servers. No tools are offered or executed, and tool-call responses are rejected. There is deliberately no unrestricted agent fallback. Without endpoint configuration, extraction fails and turns remain pending with diagnostic errors.
+Automatic extraction and semantic consolidation use `memory_inference.py`, a bounded subprocess supporting dual inference modes. When `AGY_MEMORY_INFERENCE_URL` is set to a trusted HTTPS or loopback HTTP chat-completions endpoint, inference uses a tool-free request (`AGY_MEMORY_INFERENCE_MODEL` and optional `AGY_MEMORY_INFERENCE_KEY`), rejecting any tool calls returned by the provider. When `AGY_MEMORY_INFERENCE_URL` is unset (default), inference gracefully falls back to the native Antigravity CLI (`agy --print ... --model ... --dangerously-skip-permissions --disable-slash-commands`) executed with `AGY_INTERNAL_INVOCATION=1` and `AGY_SAGE_DISABLED=1` to prevent recursive agent loops and ensure standard environments work out of the box.
 
 Database schema version is 211, independent of package version. Bootstrap and migration are serialized; FTS mirrors use base-table rowids. Restart all clients together before deploying this branch. Current engine connections take a shared maintenance lock; restore takes its exclusive counterpart and waits for active clients. Older binaries and arbitrary SQLite clients do not honor that advisory lock and must be stopped before restore. SQLite's backup API supplies database-level consistency, including committed WAL frames. Every restore creates a verified safety backup first; corrupt targets require offline recovery.
 
@@ -33,7 +33,7 @@ The dashboard defaults to `127.0.0.1`. Mutations require the local bearer token 
 | F07 | Library diagnostics on stderr and real FastMCP stdio test. No process-global stdout redirection in background threads. |
 | F08 | Loopback default, authenticated mutations, origin/host checks, escaped metadata and bounded payloads. Dashboard suites. |
 | F09 | Read-only optimization preview with no initialization, snapshots, inference, queue pruning or maintenance writes. Core suite. |
-| F10 | Tool-free inference subprocess and internal invocation flags; no AGY agent launch. Inference regression. |
+| F10 | Dual-mode inference subprocess (tool-free HTTP endpoint or native `agy --print` CLI fallback) with loop prevention flags; no unrestricted agent launch. Inference regression. |
 | F11 | Separate Stop-hook/service artifacts supplied. Host installation and live canary remain deployment work. |
 | F12 | Explicit or multi-root transcript resolution, latest USER_INPUT boundary and stable event index. Hook suite. External shared-skill search helpers are outside this repository. |
 | F13 | Shared taxonomy, strict new writes, preservation of unmapped legacy categories/statuses, architecture/workflow categories retained. Core, migration and MCP suites. Untracked external import scripts were preserved, not adopted. |

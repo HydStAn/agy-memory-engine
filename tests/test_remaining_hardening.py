@@ -132,6 +132,72 @@ class RemainingHardeningTests(unittest.TestCase):
             body=json.loads(request.call_args.args[0].data)
             self.assertNotIn('tools',body)
 
+    def test_inference_cli_fallback_when_url_unset(self):
+        import memory_inference
+        data = {'facts': [{'id': 'server', 'category': 'infra', 'fact': 'postgres'}]}
+        cli_response = Mock(returncode=0, stdout=json.dumps(data), stderr='')
+        with patch.object(memory_inference, 'get_config', side_effect=lambda key, default='': '' if key == 'AGY_MEMORY_INFERENCE_URL' else default), \
+             patch.object(memory_inference.subprocess, 'run', return_value=cli_response) as mock_run:
+            result = memory_inference.infer('remember postgres server', 'test-model')
+            self.assertEqual(result, data)
+            mock_run.assert_called_once()
+            args, kwargs = mock_run.call_args
+            self.assertIn('--print', args[0])
+            self.assertIn('--model', args[0])
+            self.assertIn('test-model', args[0])
+            self.assertIn('--dangerously-skip-permissions', args[0])
+            self.assertIn('--disable-slash-commands', args[0])
+            self.assertEqual(kwargs['env']['AGY_INTERNAL_INVOCATION'], '1')
+            self.assertEqual(kwargs['env']['AGY_SAGE_DISABLED'], '1')
+
+    def test_inference_cli_fallback_parses_markdown_fenced_json(self):
+        import memory_inference
+        data = {'facts': [{'id': 'server', 'category': 'infra', 'fact': 'redis'}]}
+        cli_output = f"Here is the extracted memory:\n```json\n{json.dumps(data)}\n```\nDone."
+        cli_response = Mock(returncode=0, stdout=cli_output, stderr='')
+        with patch.object(memory_inference, 'get_config', return_value=''), \
+             patch.object(memory_inference.subprocess, 'run', return_value=cli_response):
+            result = memory_inference.infer('remember redis server', 'test-model')
+            self.assertEqual(result, data)
+
+    def test_inference_cli_fallback_error_handling(self):
+        import memory_inference
+        # 1. Non-zero exit code
+        fail_res = Mock(returncode=1, stdout='', stderr='Model quota exceeded')
+        with patch.object(memory_inference, 'get_config', return_value=''), \
+             patch.object(memory_inference.subprocess, 'run', return_value=fail_res):
+            with self.assertRaises(RuntimeError):
+                memory_inference.infer('remember server', 'test-model')
+
+        # 2. Output without JSON object
+        no_json_res = Mock(returncode=0, stdout='I could not extract anything.', stderr='')
+        with patch.object(memory_inference, 'get_config', return_value=''), \
+             patch.object(memory_inference.subprocess, 'run', return_value=no_json_res):
+            with self.assertRaises(ValueError):
+                memory_inference.infer('remember server', 'test-model')
+
+        # 3. Output with non-dict JSON
+        array_res = Mock(returncode=0, stdout='["item1", "item2"]', stderr='')
+        with patch.object(memory_inference, 'get_config', return_value=''), \
+             patch.object(memory_inference.subprocess, 'run', return_value=array_res):
+            with self.assertRaises(ValueError):
+                memory_inference.infer('remember server', 'test-model')
+
+    def test_inference_cli_fallback_retry_without_disable_slash_commands(self):
+        import memory_inference
+        data = {'facts': []}
+        fail_res = Mock(returncode=1, stdout='', stderr='unknown flag: --disable-slash-commands')
+        ok_res = Mock(returncode=0, stdout=json.dumps(data), stderr='')
+        with patch.object(memory_inference, 'get_config', return_value=''), \
+             patch.object(memory_inference.subprocess, 'run', side_effect=[fail_res, ok_res]) as mock_run:
+            result = memory_inference.infer('remember server', 'test-model')
+            self.assertEqual(result, data)
+            self.assertEqual(mock_run.call_count, 2)
+            first_cmd = mock_run.call_args_list[0][0][0]
+            second_cmd = mock_run.call_args_list[1][0][0]
+            self.assertIn('--disable-slash-commands', first_cmd)
+            self.assertNotIn('--disable-slash-commands', second_cmd)
+
     def test_fts_primary_key_and_delete_transitions(self):
         memory.upsert_fact('old','infra','searchable sql')
         with schema.db_session() as conn, conn:
