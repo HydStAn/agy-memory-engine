@@ -16,18 +16,29 @@ Tests:
 - Schema initialization efficiency (only once per process)
 """
 
-import os
+# Set temporary paths before importing modules that capture configuration defaults.
 import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _test_environment  # noqa: F401
+
+
+import os
 import tempfile
 import unittest
 import json
 import io
-from contextlib import redirect_stdout, redirect_stderr
+from contextlib import redirect_stdout, redirect_stderr, contextmanager
+from unittest.mock import patch
+import logging
+import shutil
 
 # Set temporary test database environment variable before importing engine
 TEST_DIR = tempfile.mkdtemp()
 TEST_DB = os.path.join(TEST_DIR, "test_memory.db")
 os.environ["AGY_MEMORY_DB"] = TEST_DB
+os.environ["AGY_TURN_QUEUE_DB"] = os.path.join(TEST_DIR, "queue.db")
+os.environ["AGY_MEMORY_CACHE"] = os.path.join(TEST_DIR, "model.txt")
 
 # Must set env before importing schema module
 import schema
@@ -35,6 +46,36 @@ schema.DB_PATH = TEST_DB
 schema._SCHEMA_INITIALIZED.clear()
 
 import agy_memory
+
+
+def setUpModule():
+    global _home_patch, _db_patch, _prune_patch
+    _home_patch = patch.dict(os.environ, {"HOME": TEST_DIR})
+    _home_patch.start()
+    _db_patch = patch.object(schema, "DB_PATH", TEST_DB)
+    _db_patch.start()
+    import queue_manager
+    from functools import partial
+    _prune_patch = patch.object(queue_manager, "prune_processed_turns", partial(queue_manager.prune_processed_turns, db_path=os.path.join(TEST_DIR, "queue.db")))
+    _prune_patch.start()
+
+
+def tearDownModule():
+    _prune_patch.stop()
+    _db_patch.stop()
+    _home_patch.stop()
+    shutil.rmtree(TEST_DIR)
+
+
+@contextmanager
+def capture_memory_output(stream):
+    handler = logging.StreamHandler(stream)
+    old = agy_memory.logger.handlers[:]
+    agy_memory.logger.handlers = [handler]
+    try:
+        yield
+    finally:
+        agy_memory.logger.handlers = old
 
 
 class TestFactLifecycle(unittest.TestCase):
@@ -70,13 +111,13 @@ class TestFactLifecycle(unittest.TestCase):
     def test_upsert_overwrites_existing(self):
         """Upsert should overwrite an existing fact with the same ID."""
         agy_memory.upsert_fact("test.key", "general", "Original value", "kw1")
-        agy_memory.upsert_fact("test.key", "updated_cat", "Updated value", "kw2")
+        agy_memory.upsert_fact("test.key", "software", "Updated value", "kw2")
         
         with schema.db_session(TEST_DB) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT category, fact, keywords FROM memories WHERE id = 'test.key'")
             row = cursor.fetchone()
-            self.assertEqual(row[0], "updated_cat")
+            self.assertEqual(row[0], "software")
             self.assertEqual(row[1], "Updated value")
             self.assertEqual(row[2], "kw2")
             
@@ -86,7 +127,7 @@ class TestFactLifecycle(unittest.TestCase):
 
     def test_unicode_umlauts_in_facts(self):
         """Facts with German umlauts and special characters should be stored and searchable."""
-        agy_memory.upsert_fact("test.umlaut", "test", "Zürich Höhenweg Strässchen", "zürich höhe ö ä ü")
+        agy_memory.upsert_fact("test.umlaut", "general", "Zürich Höhenweg Strässchen", "zürich höhe ö ä ü")
         
         with schema.db_session(TEST_DB) as conn:
             cursor = conn.cursor()
@@ -217,7 +258,7 @@ class TestMultiLayerPrefetch(unittest.TestCase):
         )
 
         f = io.StringIO()
-        with redirect_stdout(f):
+        with capture_memory_output(f):
             agy_memory.prefetch("Was ist der Status mit Jenni und dem Garten?")
         output = f.getvalue()
 
@@ -231,7 +272,7 @@ class TestMultiLayerPrefetch(unittest.TestCase):
     def test_prefetch_on_empty_database(self):
         """Prefetch on an empty database should not crash."""
         f = io.StringIO()
-        with redirect_stdout(f):
+        with capture_memory_output(f):
             agy_memory.prefetch("Wo ist der Server?")
         output = f.getvalue()
         # Should produce no output (empty DB), but not crash
@@ -243,7 +284,7 @@ class TestMultiLayerPrefetch(unittest.TestCase):
         agy_memory.upsert_fact("infra.server", "infra", "Server 10.0.0.1", "server ip")
 
         f = io.StringIO()
-        with redirect_stdout(f):
+        with capture_memory_output(f):
             agy_memory.prefetch("Erzähl mir einen Witz")
         output = f.getvalue()
         # Preferences should load even though query doesn't match them
@@ -348,15 +389,13 @@ class TestOptimizeDB(unittest.TestCase):
         agy_memory.upsert_fact("test.key", "general", "Fact 1", "keyword1")
         
         f = io.StringIO()
-        with redirect_stdout(f):
+        with capture_memory_output(f):
             agy_memory.optimize_db(apply_changes=True)
         output = f.getvalue()
 
         self.assertIn("[BACKUP]", output)
-        self.assertIn("[STATS]", output)
-        self.assertIn("[OPTIMIZE]", output)
         self.assertIn("[SUCCESS]", output)
-        self.assertIn("Facts: 1", output)
+        self.assertIn("'memories': 1", output)
 
         # Verify data survived
         with schema.db_session(TEST_DB) as conn:
@@ -369,7 +408,7 @@ class TestOptimizeDB(unittest.TestCase):
         """The backward-compat 'compact_all' alias should call optimize_db."""
         agy_memory.upsert_fact("test.compat", "general", "Compat test", "")
         f = io.StringIO()
-        with redirect_stdout(f):
+        with capture_memory_output(f):
             agy_memory.compact_all(apply_changes=True)
         output = f.getvalue()
         self.assertIn("[SUCCESS]", output)
@@ -416,15 +455,19 @@ class TestEntityLinking(unittest.TestCase):
 
     def test_link_and_list_entities(self):
         """Test creating and listing directional entity links."""
+        for entity_id in ("infra.beelink", "service.immich", "service.jellyfin"):
+            agy_memory.upsert_fact(entity_id,"infra","entity node")
         agy_memory.link_entities("infra.beelink", "service.immich", "hosts")
         agy_memory.link_entities("infra.beelink", "service.jellyfin", "hosts")
         
         links = agy_memory.list_entity_links("infra.beelink")
         self.assertEqual(len(links), 2)
-        self.assertEqual(links[0], ("infra.beelink", "service.immich", "hosts"))
+        self.assertEqual(links[0], ("service.immich", "infra.beelink", "hosted_on"))
 
     def test_unlink_entities(self):
         """Test unlinking relations."""
+        for entity_id in ("user.stephan", "device.fenix8"):
+            agy_memory.upsert_fact(entity_id,"infra","entity node")
         agy_memory.link_entities("user.stephan", "device.fenix8", "owns")
         self.assertEqual(len(agy_memory.list_entity_links("user.stephan")), 1)
         
@@ -438,7 +481,7 @@ class TestEntityLinking(unittest.TestCase):
         agy_memory.link_entities("service.immich.port", "infra.beelink.ip", "hosted_on")
 
         f = io.StringIO()
-        with redirect_stdout(f):
+        with capture_memory_output(f):
             agy_memory.prefetch("Wie lautet der Port von Immich?")
         output = f.getvalue()
 
@@ -463,7 +506,7 @@ class TestEpisodeAging(unittest.TestCase):
     def test_episode_aging_transition(self):
         """Test that old episodes transition active -> cooling -> historic."""
         agy_memory.upsert_episode("ep.old_1", "travel", "Spain Trip", "Trip completed in June.", status="active")
-        agy_memory.upsert_episode("ep.old_2", "hardware", "TrueNAS Setup", "Setup cooled down.", status="cooling")
+        agy_memory.upsert_episode("ep.old_2", "infra", "TrueNAS Setup", "Setup cooled down.", status="cooling")
 
         # Manually backdate updated_at in database
         with schema.db_session(TEST_DB) as conn:
@@ -501,18 +544,18 @@ class TestConsolidation(unittest.TestCase):
 
     def test_consolidation_audit_logging(self):
         """Test that consolidation correctly writes to consolidation_log and merges entries."""
-        agy_memory.upsert_fact("health.creatine.1", "health", "Takes 5g creatine monohydrate daily.", "creatine supplement")
-        agy_memory.upsert_fact("health.creatine.2", "health", "Lee-Sport Creapure Creatine 5g.", "creapure lee-sport")
+        agy_memory.upsert_fact("fitness.creatine.1", "fitness", "Takes 5g creatine monohydrate daily.", "creatine supplement")
+        agy_memory.upsert_fact("fitness.creatine.2", "fitness", "Lee-Sport Creapure Creatine 5g.", "creapure lee-sport")
 
         # Mock LLM response for consolidation
         mock_response = json.dumps({
             "merges": [
                 {
-                    "target_id": "health.creatine.daily",
-                    "category": "health",
+                    "target_id": "fitness.creatine.daily",
+                    "category": "fitness",
                     "fact": "Takes 5g Creapure Creatine Monohydrate (Lee-Sport) daily.",
                     "keywords": "creatine creapure lee-sport supplement",
-                    "merged_ids": ["health.creatine.1", "health.creatine.2"],
+                    "merged_ids": ["fitness.creatine.1", "fitness.creatine.2"],
                     "rationale": "Merged dosage and brand info into one canonical record."
                 }
             ]
@@ -524,18 +567,18 @@ class TestConsolidation(unittest.TestCase):
             merges = agy_memory.consolidate_memories(dry_run=False)
 
         self.assertEqual(len(merges), 1)
-        self.assertEqual(merges[0]["target_id"], "health.creatine.daily")
+        self.assertEqual(merges[0]["target_id"], "fitness.creatine.daily")
 
         with schema.db_session(TEST_DB) as conn:
             cursor = conn.cursor()
             # 1. Target ID exists
-            cursor.execute("SELECT fact FROM memories WHERE id = 'health.creatine.daily'")
+            cursor.execute("SELECT fact FROM memories WHERE id = 'fitness.creatine.daily'")
             row = cursor.fetchone()
             self.assertIsNotNone(row)
             self.assertIn("Lee-Sport", row[0])
 
             # 2. Merged IDs are deleted
-            cursor.execute("SELECT COUNT(*) FROM memories WHERE id IN ('health.creatine.1', 'health.creatine.2')")
+            cursor.execute("SELECT COUNT(*) FROM memories WHERE id IN ('fitness.creatine.1', 'fitness.creatine.2')")
             self.assertEqual(cursor.fetchone()[0], 0)
 
             # 3. Audit log contains the merge action
@@ -543,9 +586,9 @@ class TestConsolidation(unittest.TestCase):
             log_row = cursor.fetchone()
             self.assertIsNotNone(log_row)
             self.assertEqual(log_row[0], "merge")
-            self.assertEqual(log_row[1], "health")
-            self.assertEqual(log_row[2], "health.creatine.daily")
-            self.assertIn("health.creatine.1", log_row[3])
+            self.assertEqual(log_row[1], "fitness")
+            self.assertEqual(log_row[2], "fitness.creatine.daily")
+            self.assertIn("fitness.creatine.1", log_row[3])
             self.assertEqual(log_row[4], "Merged dosage and brand info into one canonical record.")
 
 
@@ -612,26 +655,26 @@ class TestMultilingualCompoundAndStemming(unittest.TestCase):
     def test_multilingual_prefetch_end_to_end(self):
         """End-to-end test verifying that multilingual compound and inflected queries match stored facts."""
         agy_memory.upsert_fact("insurance.dog.ch", "insurance", "Hundeversicherung bei der Helvetia Police 12345.", "hund versicherung helvetia")
-        agy_memory.upsert_fact("tax.sent.zweitwohnung", "tax", "Zweitwohnungssteuer in Sent ist 1.5 Promille.", "zweitwohnung steuer sent")
+        agy_memory.upsert_fact("tax.sent.zweitwohnung", "finance", "Zweitwohnungssteuer in Sent ist 1.5 Promille.", "zweitwohnung steuer sent")
         agy_memory.upsert_fact("travel.madrid.hotel", "travel", "Hotel Urban Madrid gebucht für Oktober.", "hotel madrid reservation")
 
         # 1. German compound query should match "Hundeversicherung" via "hund" + "versicherung"
         f = io.StringIO()
-        with redirect_stdout(f):
+        with capture_memory_output(f):
             res = agy_memory.prefetch("Gibt es eine Hundeleine oder Hundeversicherung?")
         output = f.getvalue()
         self.assertIn("Hundeversicherung bei der Helvetia", output)
 
         # 2. English inflected query should match "hotel madrid reservation"
         f2 = io.StringIO()
-        with redirect_stdout(f2):
+        with capture_memory_output(f2):
             res2 = agy_memory.prefetch("Show me my hotel reservations in Madrid")
         output2 = f2.getvalue()
         self.assertIn("Hotel Urban Madrid gebucht", output2)
 
         # 3. Italian query should match "tax.sent.zweitwohnung"
         f3 = io.StringIO()
-        with redirect_stdout(f3):
+        with capture_memory_output(f3):
             res3 = agy_memory.prefetch("Qual è la tassa sulla seconda casa a Sent?")
         output3 = f3.getvalue()
         self.assertIn("Zweitwohnungssteuer in Sent", output3)
@@ -677,17 +720,14 @@ class TestDashboardEndpoints(unittest.TestCase):
     """Tests for dashboard API endpoints."""
 
     def test_dashboard_stats_endpoint(self):
-        import urllib.request
-        try:
-            req = urllib.request.urlopen("http://127.0.0.1:8085/api/stats", timeout=3)
-            self.assertEqual(req.status, 200)
-            data = json.loads(req.read().decode("utf-8"))
-            self.assertIn("counts", data)
-            self.assertIn("facts", data["counts"])
-            self.assertIn("queue", data)
-        except Exception as e:
-            # If server not running in test runner environment, verify handler logic directly
-            pass
+        from dashboard import MemoryDashboardHandler
+        handler = object.__new__(MemoryDashboardHandler)
+        with patch.object(handler, "_send_json") as send:
+            handler._handle_stats()
+        data = send.call_args.args[0]
+        self.assertIn("counts", data)
+        self.assertIn("facts", data["counts"])
+        self.assertIn("queue", data)
 
     def test_dashboard_html_contains_optimize_button(self):
         from dashboard import HTML_TEMPLATE
@@ -722,7 +762,7 @@ class TestDashboardEndpoints(unittest.TestCase):
         self.assertIn(fname, fnames)
 
         # Cleanup test snapshot
-        archive_dir = os.path.expanduser("~/.gemini/archive")
+        archive_dir = str(agy_memory.archive_path(schema.DB_PATH))
         test_file = os.path.join(archive_dir, fname)
         if os.path.exists(test_file):
             os.remove(test_file)
@@ -815,7 +855,7 @@ class TestMigrationV2ToV21(unittest.TestCase):
             # Episode topic & status normalized
             topic, status = conn.execute("SELECT topic, status FROM episodes WHERE id = 'ep.home'").fetchone()
             self.assertEqual(topic, "home")
-            self.assertEqual(status, "active")
+            self.assertEqual(status, "monitoring")
 
             # Links: orphan pruned, relations canonicalized
             links = conn.execute("SELECT source_id, target_id, relation FROM entity_links").fetchall()
@@ -827,7 +867,7 @@ class TestMigrationV2ToV21(unittest.TestCase):
 
             # Check PRAGMA user_version
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            self.assertEqual(version, 210)
+            self.assertEqual(version, schema.SCHEMA_VERSION)
 
         # Cleanup backup
         if report_live["backup_file"] and os.path.exists(report_live["backup_file"]):
@@ -863,7 +903,9 @@ class TestMCPServerTools(unittest.TestCase):
         self.assertIn("category: infra", res_fact)
 
         # Test record_episode status & topic normalization
-        res_ep = record_episode("ep.test", "stweg", "Condo meeting", "Discussed roof", status="monitoring")
+        with self.assertRaises(ValueError):
+            record_episode("ep.test", "stweg", "Condo meeting", "Discussed roof", status="monitoring")
+        res_ep = record_episode("ep.test", "stweg", "Condo meeting", "Discussed roof", status="active")
         self.assertIn("topic: home", res_ep)
         self.assertIn("status: active", res_ep)
 
@@ -872,6 +914,8 @@ class TestMCPServerTools(unittest.TestCase):
         self.assertIn("category: general", res_lrn)
 
         # Test link_entities_mcp mapping & direction inversion (beelink hosts immich -> immich hosted_on beelink)
+        store_memory("infra.beelink", "host", "infra")
+        store_memory("service.immich", "service", "software")
         res_link = link_entities_mcp("infra.beelink", "service.immich", "hosts")
         self.assertIn("'service.immich' --[hosted_on]--> 'infra.beelink'", res_link)
 

@@ -1,5 +1,7 @@
 # AGY Memory Engine (v2.2.0)
 
+> Hardening branch: see [runtime setup and audit coverage](HARDENING.md). Automatic extraction now requires an explicitly configured tool-free chat-completions endpoint. It no longer launches an unrestricted AGY agent. Failed extraction retains pending turns. Schema upgrades run on first engine access; restart all clients together for rollout.
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests: 49/49 Passing](https://img.shields.io/badge/Tests-49%2F49%20Passed-brightgreen.svg)]()
 
@@ -183,7 +185,7 @@ Add a simple memory rule to your global agent instructions (e.g. `~/.gemini/conf
 #### Option C: Autonomous Background Sync (Zero-friction)
 To have the memory engine automatically learn from your conversations without you lifting a finger:
 
-1. Register the sub-millisecond turn hook in `~/.gemini/config/hooks.json` (see [Autonomous Background Pipeline](#-autonomous-background-pipeline-cron--lifecycle-hooks)).
+1. Register the turn hook in `~/.gemini/config/hooks.json` (see [Autonomous Background Pipeline](#-autonomous-background-pipeline-cron--lifecycle-hooks)).
 2. Add the debounced background worker to your crontab (`*/5 * * * * python3 /path/to/agy-memory-engine/memory_worker.py`).
 
 ---
@@ -299,7 +301,7 @@ cp .env.example .env
 # ==============================================================================
 
 # LLM model used for background memory extraction & consolidation
-AGY_MEMORY_MODEL=gemini-3.7-flash-low
+AGY_MEMORY_MODEL=gemini-3.8-flash-low
 
 # SQLite Database Storage Paths
 AGY_MEMORY_DB=~/.gemini/memory.db
@@ -318,7 +320,11 @@ AGY_BIN=agy
 # Real-Time Debug Dashboard (Web UI)
 AGY_MEMORY_DEBUG_DASHBOARD=true
 AGY_MEMORY_DASHBOARD_PORT=8085
-AGY_MEMORY_DASHBOARD_HOST=0.0.0.0
+AGY_MEMORY_DASHBOARD_HOST=127.0.0.1
+# Remote access (VPN, Tailscale, LAN): set HOST=0.0.0.0 or specify allowed hostnames
+# When bound to 0.0.0.0, private (RFC 1918) and Tailscale/mesh (RFC 6598 / 100.64.0.0/10) IPs are allowed by default
+AGY_MEMORY_DASHBOARD_ALLOWED_HOSTS=my-node.ts.net,*.ts.net
+AGY_MEMORY_DASHBOARD_ALLOW_PRIVATE_NETWORKS=true
 ```
 
 ---
@@ -355,7 +361,7 @@ To enable 100% autonomous background learning without manual intervention, confi
 
 ### 1. Global Lifecycle Hook (`~/.gemini/config/hooks.json`)
 
-Registers the sub-millisecond transcript collector on every agent turn stop:
+Registers the transcript collector on every agent turn stop:
 
 ```json
 {
@@ -378,7 +384,7 @@ Registers the sub-millisecond transcript collector on every agent turn stop:
 # Process pending memory queue every 5 minutes (debounced)
 */5 * * * * python3 /opt/agy-memory-engine/memory_worker.py >/dev/null 2>&1
 
-# Nightly memory decay aging, duplicate consolidation & VACUUM (04:30)
+# Nightly deterministic maintenance only (04:30); semantic consolidation is opt-in
 30 4 * * * python3 /opt/agy-memory-engine/agy_memory.py optimize --apply >/dev/null 2>&1
 ```
 
