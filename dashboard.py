@@ -7,6 +7,7 @@ multi-layer memories, knowledge graph relations, and turn queue state.
 
 import os
 import sys
+import subprocess
 import json
 import time
 import sqlite3
@@ -233,6 +234,91 @@ def is_trusted_origin(
         return False
 
 
+def get_memory_engine_version_info():
+    try:
+        res = subprocess.run(
+            ["systemctl", "--user", "show", "agy-memory-dashboard.service", "--property=MainPID,ActiveEnterTimestamp,ActiveState,SubState"],
+            capture_output=True, text=True, timeout=2
+        )
+        props = dict(line.split("=", 1) for line in res.stdout.splitlines() if "=" in line)
+        main_pid = props.get("MainPID", "0")
+        active_state = props.get("ActiveState", "inactive")
+        start_ts_str = props.get("ActiveEnterTimestamp", "")
+
+        head_res = subprocess.run(
+            ["git", "-C", str(BASE_DIR), "log", "-1", "--format=%h|%s|%cd", "--date=short"],
+            capture_output=True, text=True, timeout=2
+        )
+        head_parts = head_res.stdout.strip().split("|") if head_res.returncode == 0 else []
+        head_hash = head_parts[0] if len(head_parts) > 0 else ""
+        head_subject = head_parts[1] if len(head_parts) > 1 else ""
+        head_date = head_parts[2] if len(head_parts) > 2 else ""
+
+        tag_res = subprocess.run(
+            ["git", "-C", str(BASE_DIR), "describe", "--tags", "--always"],
+            capture_output=True, text=True, timeout=2
+        )
+        tag = tag_res.stdout.strip() if tag_res.returncode == 0 else ""
+
+        branch_res = subprocess.run(
+            ["git", "-C", str(BASE_DIR), "rev-parse", "--abbrev-ref", "HEAD"],
+            capture_output=True, text=True, timeout=2
+        )
+        branch = branch_res.stdout.strip() if branch_res.returncode == 0 else "main"
+
+        is_running = active_state == "active" and main_pid != "0" and os.path.exists(f"/proc/{main_pid}")
+
+        running_hash = ""
+        running_subject = ""
+        running_date = ""
+
+        if is_running and start_ts_str:
+            git_before = subprocess.run(
+                ["git", "-C", str(BASE_DIR), "log", "-1", f"--before={start_ts_str}", "--format=%h|%s|%cd", "--date=short"],
+                capture_output=True, text=True, timeout=2
+            )
+            if git_before.returncode == 0 and git_before.stdout.strip():
+                r_parts = git_before.stdout.strip().split("|")
+                running_hash = r_parts[0] if len(r_parts) > 0 else ""
+                running_subject = r_parts[1] if len(r_parts) > 1 else ""
+                running_date = r_parts[2] if len(r_parts) > 2 else ""
+
+        if is_running and not running_hash:
+            running_hash = head_hash
+            running_subject = head_subject
+            running_date = head_date
+
+        needs_restart = is_running and bool(running_hash and head_hash and running_hash != head_hash)
+
+        return {
+            "is_running": is_running,
+            "pid": int(main_pid) if main_pid.isdigit() else 0,
+            "started_at": start_ts_str,
+            "running_hash": running_hash,
+            "running_subject": running_subject,
+            "running_date": running_date,
+            "head_hash": head_hash,
+            "head_subject": head_subject,
+            "head_date": head_date,
+            "tag": tag,
+            "branch": branch,
+            "needs_restart": needs_restart,
+            "hash": running_hash or head_hash,
+            "commit": f"{running_hash} {running_subject} ({running_date})" if running_hash else f"{head_hash} {head_subject} ({head_date})"
+        }
+    except Exception:
+        pass
+    return None
+
+def restart_memory_service():
+    try:
+        subprocess.Popen(
+            ["nohup", "bash", "-c", "sleep 0.5 && systemctl --user restart agy-memory-dashboard.service"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, preexec_fn=os.setpgrp
+        )
+        return {"status": "ok", "message": "Memory Dashboard service restart initiated."}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 HTML_TEMPLATE = r"""<!DOCTYPE html>
 <html lang="en">
@@ -821,12 +907,20 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       </div>
       <div class="badge">Model: <b id="lbl-model">-</b></div>
       <div class="badge">DB: <b id="lbl-db-size">-</b></div>
+      <div class="badge" id="badge-version" style="display:flex; align-items:center; gap:6px;" title="Engine Git & Service Status">
+        <span>Engine:</span>
+        <b id="lbl-version-hash" style="color:var(--accent); font-family:monospace;">-</b>
+        <button id="btn-restart-dashboard" onclick="restartDashboard(this)" title="Memory Dashboard Service neu starten" style="background:none; border:none; color:var(--text-muted); cursor:pointer; font-size:0.85rem; padding:0 2px; line-height:1;">🔄</button>
+      </div>
       <button class="btn btn-secondary" onclick="switchTab('history')">📸 History & Snapshots</button>
       <button class="btn btn-secondary" onclick="fetchData(true)">🔄 Refresh</button>
       <button class="btn btn-secondary" id="btn-optimize" onclick="optimizeDb()" title="Rebuild FTS5 indexes, VACUUM DB, consolidate facts, and age episodes">🧹 Optimize DB</button>
       <button class="btn" onclick="forceWorker()">⚡ Force Queue</button>
     </div>
   </header>
+
+  <!-- Commit message sub-bar -->
+  <div id="version-commit-row" style="font-size:0.8rem; color:var(--text-muted); margin-top:-10px; margin-bottom:15px; display:flex; align-items:center; gap:8px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;"></div>
 
   <!-- 5-Card Navigation Bar -->
   <div class="stats-grid">
@@ -1108,6 +1202,33 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
         document.getElementById('lbl-model').innerText = data.model || 'gemini-3.7-flash-low';
         document.getElementById('lbl-db-size').innerText = data.db_size || '-';
+
+        if (data.version_info) {
+          const v = data.version_info;
+          const hashEl = document.getElementById('lbl-version-hash');
+          const rowEl = document.getElementById('version-commit-row');
+          const runHash = escapeHtml(v.running_hash || v.hash || '');
+          const tag = v.tag ? ` (${escapeHtml(v.tag)})` : '';
+          const runSub = escapeHtml(v.running_subject || v.head_subject || '');
+
+          if (hashEl) {
+            if (v.needs_restart) {
+              hashEl.innerHTML = `<span style="color:var(--warning)">${runHash}</span> ⚠️ <span style="font-size:0.75rem; color:var(--warning); font-family:sans-serif;">Neustart nötig</span>`;
+            } else {
+              hashEl.innerHTML = `<span style="color:var(--success)">${runHash}</span>${tag} ✓`;
+            }
+            hashEl.title = `PID: ${v.pid}\nLaufender Commit: ${v.running_hash} (${v.running_subject})\nGit HEAD: ${v.head_hash} (${v.head_subject})\nGestartet: ${v.started_at}`;
+          }
+
+          if (rowEl) {
+            if (v.needs_restart) {
+              rowEl.innerHTML = `<span style="color:var(--warning); font-weight:600;">⚠️ Laufender Prozess auf ${runHash}:</span> <span>💬 ${runSub}</span> <span style="color:var(--accent); margin-left:8px;">↳ Neu im Git (${escapeHtml(v.head_hash)}): ${escapeHtml(v.head_subject)}</span>`;
+            } else {
+              rowEl.innerHTML = `<span style="color:var(--text-muted)">💬 Commit:</span> <span style="color:var(--text-bright)">${runSub}</span> <span style="color:var(--text-muted); font-size:0.75rem;">(${escapeHtml(v.running_date || v.head_date || '')})</span>`;
+            }
+          }
+        }
+
         document.getElementById('cnt-facts').innerText = data.counts.facts || 0;
         document.getElementById('cnt-episodes').innerText = data.counts.episodes || 0;
         document.getElementById('cnt-learnings').innerText = data.counts.learnings || 0;
@@ -1850,6 +1971,41 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       });
     }
 
+    async function restartDashboard(btn = null) {
+      if (btn) {
+        btn.disabled = true;
+        btn.style.opacity = '0.5';
+      }
+      showToast('Dashboard-Service wird neu gestartet...', 'info', 3000);
+      try {
+        const res = await fetch('/api/restart-service', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Dashboard-Token': DASHBOARD_TOKEN
+          },
+          body: JSON.stringify({ user: currentProfile })
+        });
+        const data = await res.json().catch(() => ({}));
+        showToast('Service neu gestartet. Aktualisiere in 2 Sekunden...', 'success', 3000);
+        setTimeout(() => {
+          fetchData(true);
+        }, 2000);
+      } catch (e) {
+        showToast('Neustart angestoßen. Aktualisiere...', 'success', 3000);
+        setTimeout(() => {
+          fetchData(true);
+        }, 2000);
+      } finally {
+        if (btn) {
+          setTimeout(() => {
+            btn.disabled = false;
+            btn.style.opacity = '1';
+          }, 2500);
+        }
+      }
+    }
+
     function optimizeDb() {
       showConfirmModal({
         title: '🧹 Run Full Memory Optimization',
@@ -2306,6 +2462,14 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                 self._send_json({"status": "error", "message": str(e)}, status=500)
             return
 
+        if url.path == "/api/restart-service":
+            try:
+                res = restart_memory_service()
+                self._send_json(res, status=200 if res.get("status") == "ok" else 500)
+            except Exception as e:
+                self._send_json({"status": "error", "message": str(e)}, status=500)
+            return
+
         self._send_json({"error": "Not Found"}, status=404)
 
     def _handle_stats(self, user: str = "ubuntu"):
@@ -2365,6 +2529,7 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             all_profs = get_all_profiles()
             self._send_json({
                 "model": MODEL_NAME,
+                "version_info": get_memory_engine_version_info(),
                 "profiles": [{"id": p["id"], "label": p["label"]} for p in all_profs.values()],
                 "profile": prof["id"],
                 "profile_label": prof["label"],
