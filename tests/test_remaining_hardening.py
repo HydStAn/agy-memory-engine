@@ -142,7 +142,8 @@ class RemainingHardeningTests(unittest.TestCase):
             self.assertEqual(result, data)
             mock_run.assert_called_once()
             args, kwargs = mock_run.call_args
-            self.assertIn('--print', args[0])
+            self.assertIn('--input-format', args[0])
+            self.assertIn('stream-json', args[0])
             self.assertIn('--model', args[0])
             self.assertIn('test-model', args[0])
             self.assertIn('--dangerously-skip-permissions', args[0])

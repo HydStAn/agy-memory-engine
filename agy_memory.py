@@ -866,7 +866,12 @@ def _sync_turn_inner(user_prompt: str, assistant_response: str, dry_run: bool = 
         return empty_res
 
     inv = get_existing_database_inventory()
-    inv_context = json.dumps(inv, ensure_ascii=False, indent=2)
+    inv_for_prompt = {
+        "facts": inv.get("fact_keys", []),
+        "episodes": inv.get("episodes", []),
+        "learnings": inv.get("learnings", []),
+    }
+    inv_context = json.dumps(inv_for_prompt, ensure_ascii=False)
 
     prompt = f"""You are the Multi-Layer Cognitive Memory Engine for the user.
 Analyze the conversation turn below and extract ONLY genuinely persistent, reusable information.

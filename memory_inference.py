@@ -47,15 +47,25 @@ def _infer_cli(prompt, model, timeout=80):
     env = dict(os.environ, AGY_INTERNAL_INVOCATION='1', AGY_SAGE_DISABLED='1')
     cmd = [
         AGY_BIN,
-        '--print',
-        prompt,
         '--model',
         model,
+        '--input-format',
+        'stream-json',
+        '--output-format',
+        'stream-json',
         '--dangerously-skip-permissions',
         '--disable-slash-commands',
     ]
+    input_event = json.dumps({
+        'event': 'user',
+        'message': {
+            'role': 'user',
+            'content': prompt
+        }
+    }) + '\n'
+
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+        res = subprocess.run(cmd, input=input_event, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired as error:
         raise TimeoutError('CLI inference timed out') from error
     except OSError as error:
@@ -64,14 +74,16 @@ def _infer_cli(prompt, model, timeout=80):
     if res.returncode != 0 and '--disable-slash-commands' in (res.stderr or ''):
         cmd = [
             AGY_BIN,
-            '--print',
-            prompt,
             '--model',
             model,
+            '--input-format',
+            'stream-json',
+            '--output-format',
+            'stream-json',
             '--dangerously-skip-permissions',
         ]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
+            res = subprocess.run(cmd, input=input_event, capture_output=True, text=True, timeout=timeout, env=env)
         except subprocess.TimeoutExpired as error:
             raise TimeoutError('CLI inference timed out') from error
         except OSError as error:
@@ -80,11 +92,42 @@ def _infer_cli(prompt, model, timeout=80):
     if res.returncode != 0:
         raise RuntimeError(f'Antigravity CLI failed with code {res.returncode}')
 
-    out = res.stdout.strip()
-    if not out:
+    response_text = ''
+    for line in res.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            ev = json.loads(line)
+            if isinstance(ev, dict) and ev.get('event') == 'result':
+                response_text = ev.get('result', {}).get('response', '')
+                break
+        except (json.JSONDecodeError, AttributeError):
+            continue
+
+    if not response_text:
+        deltas = []
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+                if isinstance(ev, dict) and ev.get('event') == 'step_update':
+                    delta = ev.get('step_update', {}).get('text_delta')
+                    if delta:
+                        deltas.append(delta)
+            except Exception:
+                pass
+        response_text = ''.join(deltas)
+
+    if not response_text:
+        response_text = res.stdout.strip()
+
+    if not response_text:
         raise ValueError('Antigravity CLI returned empty output')
 
-    match = re.search(r'\{.*\}', out, re.DOTALL)
+    match = re.search(r'\{.*\}', response_text, re.DOTALL)
     if not match:
         raise ValueError('Antigravity CLI output contains no JSON object')
 
