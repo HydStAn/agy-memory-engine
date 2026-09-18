@@ -1,97 +1,54 @@
 #!/usr/bin/env python3
 """
-Initial Vector Indexing & Rebuild Script for AGY Memory Engine.
-Populates vec_memories, vec_episodes, and vec_learnings from existing records.
+Vector Indexing & Rebuild Script for AGY Memory Engine.
+Populates and synchronizes vec_memories, vec_episodes, and vec_learnings via fenced outbox jobs.
 """
 
 import sys
 import os
-import sqlite3
 from pathlib import Path
 
 # Add project root to sys.path
 BASE_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(BASE_DIR))
 
-from schema import db_session, HAS_SQLITE_VEC
+from schema import HAS_SQLITE_VEC
 from config import DB_PATH, VECTOR_SEARCH_ENABLED
-import embedder
+from vector_index import reconcile_vector_index, drain_vector_jobs, get_vector_sync_status
+
 
 def reindex_all(db_path: str = None, verbose: bool = True) -> dict:
+    """Enqueues all records and processes them via the atomic, fenced vector outbox worker."""
     target_db = db_path or DB_PATH
     if not (HAS_SQLITE_VEC and VECTOR_SEARCH_ENABLED):
         if verbose:
             print("[WARN] sqlite-vec or vector search not enabled. Skipping vector reindexing.")
         return {"status": "skipped", "reason": "vector_search_disabled"}
 
-    stats = {"facts": 0, "episodes": 0, "learnings": 0}
-
-    BATCH_SIZE = 64
-
-    with db_session(target_db) as conn:
-        cursor = conn.cursor()
-
-        # 1. Facts
-        cursor.execute("SELECT id, category, fact, keywords FROM memories")
-        facts = cursor.fetchall()
-        if facts:
-            if verbose:
-                print(f"Indexing {len(facts)} facts into vec_memories (batch mode)...")
-            items = []
-            for fid, cat, fact, kws in facts:
-                text = embedder.build_text_repr("fact", {"category": cat, "fact": fact, "keywords": kws})
-                items.append((fid, text))
-            
-            for i in range(0, len(items), BATCH_SIZE):
-                batch = items[i:i + BATCH_SIZE]
-                stats["facts"] += embedder.upsert_vectors_batch(conn, "vec_memories", batch)
-
-        # 2. Episodes
-        cursor.execute("SELECT id, topic, title, narrative, stance, keywords FROM episodes")
-        episodes = cursor.fetchall()
-        if episodes:
-            if verbose:
-                print(f"Indexing {len(episodes)} episodes into vec_episodes (batch mode)...")
-            items = []
-            for eid, topic, title, narrative, stance, kws in episodes:
-                text = embedder.build_text_repr("episode", {
-                    "topic": topic,
-                    "title": title,
-                    "narrative": narrative,
-                    "stance": stance,
-                    "keywords": kws
-                })
-                items.append((eid, text))
-
-            for i in range(0, len(items), BATCH_SIZE):
-                batch = items[i:i + BATCH_SIZE]
-                stats["episodes"] += embedder.upsert_vectors_batch(conn, "vec_episodes", batch)
-
-        # 3. Learnings
-        cursor.execute("SELECT id, category, insight, context, keywords FROM learnings")
-        learnings = cursor.fetchall()
-        if learnings:
-            if verbose:
-                print(f"Indexing {len(learnings)} learnings into vec_learnings (batch mode)...")
-            items = []
-            for lid, cat, insight, ctx, kws in learnings:
-                text = embedder.build_text_repr("learning", {
-                    "category": cat,
-                    "insight": insight,
-                    "context": ctx,
-                    "keywords": kws
-                })
-                items.append((lid, text))
-
-            for i in range(0, len(items), BATCH_SIZE):
-                batch = items[i:i + BATCH_SIZE]
-                stats["learnings"] += embedder.upsert_vectors_batch(conn, "vec_learnings", batch)
-
-        conn.commit()
-
     if verbose:
-        print(f"[SUCCESS] Reindexed {stats['facts']} facts, {stats['episodes']} episodes, {stats['learnings']} learnings.")
-    return {"status": "success", "stats": stats}
+        print(f"Reconciling and enqueuing vector jobs for {target_db}...")
+    report = reconcile_vector_index(db_path=target_db, apply=True)
+
+    total_processed = 0
+    while True:
+        processed = drain_vector_jobs(db_path=target_db, batch_size=64, max_batches=1)
+        if processed == 0:
+            break
+        total_processed += processed
+        if verbose:
+            print(f"  Processed {total_processed} vector jobs...")
+
+    final_status = get_vector_sync_status(db_path=target_db)
+    stats = {
+        "facts": final_status["sources"]["memories"]["eligible"],
+        "episodes": final_status["sources"]["episodes"]["eligible"],
+        "learnings": final_status["sources"]["learnings"]["eligible"],
+    }
+    if verbose:
+        print(f"[SUCCESS] Reindexed vector store: {total_processed} jobs published. Eligible: {final_status['total_eligible_vectors']}, Missing: {final_status['total_missing_vectors']}, Stale: {final_status['total_stale_vectors']}.")
+
+    return {"status": "success", "processed_jobs": total_processed, "stats": stats, "coverage": final_status}
+
 
 if __name__ == "__main__":
     reindex_all()

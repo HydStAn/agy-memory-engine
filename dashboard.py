@@ -91,11 +91,15 @@ from queue_manager import (
 )
 try:
     from embedder import embed_text, reciprocal_rank_fusion, log_vec_query_failure
+    from schema import get_db_generation
+    from vector_index import get_active_model_fingerprint
     HAS_DASHBOARD_EMBEDDER = True
 except ImportError:
     embed_text = None
     reciprocal_rank_fusion = None
     log_vec_query_failure = None
+    get_db_generation = None
+    get_active_model_fingerprint = None
     HAS_DASHBOARD_EMBEDDER = False
 
 
@@ -2611,21 +2615,34 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                     """, (fts_query,))
                     fts_learnings = [{"id": r[0], "category": r[1], "insight": r[2]} for r in cursor.fetchall()]
 
-                # --- Semantic Vector Search ---
+                # --- Semantic Vector Search with Freshness Pre-filtering ---
                 vec_facts = []
                 vec_episodes = []
                 vec_learnings = []
                 if HAS_DASHBOARD_EMBEDDER and VECTOR_SEARCH_ENABLED and embed_text:
                     q_emb = embed_text(q)
                     if q_emb is not None:
+                        cur_gen = get_db_generation(conn) if get_db_generation else ""
+                        active_fp = get_active_model_fingerprint(conn) if get_active_model_fingerprint else ""
+
                         try:
                             cursor.execute("""
+                                WITH eligible AS (
+                                    SELECT s.entity_id
+                                    FROM vector_index_state s
+                                    JOIN memories m ON m.id = s.entity_id
+                                    JOIN entity_revisions r ON r.entity_type = 'memories' AND r.entity_id = s.entity_id
+                                    WHERE s.entity_type = 'memories'
+                                      AND s.indexed_revision = r.revision
+                                      AND s.generation = ?
+                                      AND s.model_fingerprint = ?
+                                )
                                 SELECT m.id, m.category, m.fact
                                 FROM vec_memories v
                                 JOIN memories m ON m.id = v.id
-                                WHERE v.embedding MATCH ? AND k = 10
+                                WHERE v.embedding MATCH ? AND k = 10 AND v.id IN eligible
                                 ORDER BY v.distance ASC
-                            """, (q_emb,))
+                            """, (cur_gen, active_fp, q_emb))
                             vec_facts = [{"id": r[0], "category": r[1], "fact": r[2]} for r in cursor.fetchall()]
                         except Exception as e:
                             if log_vec_query_failure:
@@ -2633,12 +2650,22 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
 
                         try:
                             cursor.execute("""
+                                WITH eligible AS (
+                                    SELECT s.entity_id
+                                    FROM vector_index_state s
+                                    JOIN episodes e ON e.id = s.entity_id
+                                    JOIN entity_revisions r ON r.entity_type = 'episodes' AND r.entity_id = s.entity_id
+                                    WHERE s.entity_type = 'episodes'
+                                      AND s.indexed_revision = r.revision
+                                      AND s.generation = ?
+                                      AND s.model_fingerprint = ?
+                                )
                                 SELECT e.id, e.topic, e.title, e.period, e.status, e.narrative
                                 FROM vec_episodes v
                                 JOIN episodes e ON e.id = v.id
-                                WHERE v.embedding MATCH ? AND k = 10
+                                WHERE v.embedding MATCH ? AND k = 10 AND v.id IN eligible
                                 ORDER BY v.distance ASC
-                            """, (q_emb,))
+                            """, (cur_gen, active_fp, q_emb))
                             vec_episodes = [{"id": r[0], "topic": r[1], "title": r[2], "period": r[3], "status": r[4], "narrative": r[5]} for r in cursor.fetchall()]
                         except Exception as e:
                             if log_vec_query_failure:
@@ -2646,12 +2673,22 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
 
                         try:
                             cursor.execute("""
+                                WITH eligible AS (
+                                    SELECT s.entity_id
+                                    FROM vector_index_state s
+                                    JOIN learnings l ON l.id = s.entity_id
+                                    JOIN entity_revisions r ON r.entity_type = 'learnings' AND r.entity_id = s.entity_id
+                                    WHERE s.entity_type = 'learnings'
+                                      AND s.indexed_revision = r.revision
+                                      AND s.generation = ?
+                                      AND s.model_fingerprint = ?
+                                )
                                 SELECT l.id, l.category, l.insight
                                 FROM vec_learnings v
                                 JOIN learnings l ON l.id = v.id
-                                WHERE v.embedding MATCH ? AND k = 10
+                                WHERE v.embedding MATCH ? AND k = 10 AND v.id IN eligible
                                 ORDER BY v.distance ASC
-                            """, (q_emb,))
+                            """, (cur_gen, active_fp, q_emb))
                             vec_learnings = [{"id": r[0], "category": r[1], "insight": r[2]} for r in cursor.fetchall()]
                         except Exception as e:
                             if log_vec_query_failure:
