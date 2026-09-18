@@ -623,10 +623,6 @@ def upsert_fact(fact_id: str, category: str, fact: str, keywords: str = "", conn
                 keywords = excluded.keywords,
                 updated_at = CURRENT_TIMESTAMP;
         """, (fact_id, category, fact, keywords))
-        if upsert_vector:
-            # Vector representation includes category, content and keywords
-            text_repr = build_text_repr("fact", {"category": category, "fact": fact, "keywords": keywords}) if build_text_repr else f"[{category}] {fact} {keywords or ''}".strip()
-            upsert_vector(conn, "vec_memories", fact_id, text_repr)
 
 
 def upsert_episode(episode_id: str, topic: str, title: str, narrative: str, period: str = "", status: str = "active", entities: str = "", stance: str = "", keywords: str = "", connection=None):
@@ -655,9 +651,6 @@ def upsert_episode(episode_id: str, topic: str, title: str, narrative: str, peri
                 keywords = excluded.keywords,
                 updated_at = CURRENT_TIMESTAMP;
         """, (episode_id, topic, title, period, status, narrative, entities, stance, keywords))
-        if upsert_vector:
-            text_repr = build_text_repr("episode", {"topic": topic, "title": title, "narrative": narrative, "stance": stance, "keywords": keywords}) if build_text_repr else f"[{topic}] {title}: {narrative} (Stance: {stance or 'neutral'}) {keywords or ''}".strip()
-            upsert_vector(conn, "vec_episodes", episode_id, text_repr)
 
 
 def upsert_learning(learning_id: str, category: str, insight: str, context: str = "", keywords: str = "", connection=None):
@@ -678,9 +671,6 @@ def upsert_learning(learning_id: str, category: str, insight: str, context: str 
                 keywords = excluded.keywords,
                 updated_at = CURRENT_TIMESTAMP;
         """, (learning_id, category, insight, context, keywords))
-        if upsert_vector:
-            text_repr = build_text_repr("learning", {"category": category, "insight": insight, "context": context, "keywords": keywords}) if build_text_repr else f"[{category}] {insight} (Context: {context or ''}) {keywords or ''}".strip()
-            upsert_vector(conn, "vec_learnings", learning_id, text_repr)
 
 def list_all():
     """Print a formatted overview of all stored facts, episodes, learnings, and entity relations."""

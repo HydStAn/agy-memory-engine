@@ -282,6 +282,13 @@ def main(db_path: str | None = None):
         sys.exit(2)
 
     try:
+        # Drain vector jobs even if turn queue is idle or debouncing
+        try:
+            from vector_index import drain_vector_jobs
+            drain_vector_jobs(batch_size=args.batch_size, max_batches=4)
+        except Exception as e:
+            sys.stderr.write(f"[WARN] Failed to drain vector jobs: {e}\n")
+
         can_run, reason = should_process_queue(force=args.force, db_path=effective_db_path)
         if not can_run:
             sys.exit(0)
@@ -289,6 +296,13 @@ def main(db_path: str | None = None):
         count = process_queue(batch_size=args.batch_size, notify=not args.no_notify, db_path=effective_db_path)
         if count > 0:
             print(f"Memory Worker: Processed batch of {count} turn(s) ({reason}).")
+
+        # Drain any newly committed vector jobs from this run
+        try:
+            from vector_index import drain_vector_jobs
+            drain_vector_jobs(batch_size=args.batch_size, max_batches=4)
+        except Exception:
+            pass
 
         if _LAST_RUN_FAILED_COUNT > 0:
             sys.exit(1)
