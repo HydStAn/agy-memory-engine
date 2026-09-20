@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from contextlib import contextmanager
 
-from config import QUEUE_DB_PATH, CLAIM_BATCH_SIZE
+from config import QUEUE_DB_PATH, CLAIM_BATCH_SIZE, MAX_TURN_CHARS
 
 _INITIALIZED_DBS = set()
 _DB_IDENTITIES = {}
@@ -204,6 +204,15 @@ def reset_queue_db_guard(db_path: str = None):
         _INITIALIZED_DBS.clear()
 
 
+def _cap_turn_text(text: str, limit: int, label: str) -> str:
+    """Keep head and tail. An agent turn concludes at the tail, so head-only truncation drops the answer."""
+    if not text or len(text) <= limit:
+        return text
+    half = limit // 2
+    removed = len(text) - 2 * half
+    return f"{text[:half]}\n\n[... truncated {removed} chars of {label} ...]\n\n{text[-half:]}"
+
+
 def enqueue_turn(
     user_prompt: str,
     assistant_response: str,
@@ -232,6 +241,9 @@ def enqueue_turn(
     ]
     if any(m in user_prompt for m in internal_markers):
         return False
+
+    user_prompt = _cap_turn_text(user_prompt.strip(), MAX_TURN_CHARS, "prompt")
+    assistant_response = _cap_turn_text(assistant_response.strip(), MAX_TURN_CHARS, "response")
 
     ensure_queue_db(db_path)
     content_hash = make_content_hash(

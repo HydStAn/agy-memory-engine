@@ -27,6 +27,7 @@ from queue_manager import (
     mark_turn_status,
     prune_processed_turns
 )
+from config import MAX_TURN_CHARS
 from memory_worker import (
     process_queue,
     should_process_queue,
@@ -343,6 +344,49 @@ class TestWorkerPartitioningAndErrorHandling(unittest.TestCase):
         self.assertIsNone(recent_after[0]["error"])
         self.assertIn("1 facts", recent_after[0]["extracted_summary"])
         mock_notify.assert_called_once_with(mock_notify.call_args[0][0], chat_id="444")
+
+
+class TestTurnSizeCap(unittest.TestCase):
+    """An agent turn accumulates every intermediate output, so it can reach hundreds of KB."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test_cap.db")
+        reset_queue_db_guard()
+
+    def tearDown(self):
+        reset_queue_db_guard()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _stored(self):
+        return get_pending_turns(limit=1, db_path=self.db_path)[0]
+
+    def test_oversized_response_keeps_head_and_tail(self):
+        tail = "conclusion that must survive"
+        huge = "noise line\n" * (MAX_TURN_CHARS * 2) + tail
+
+        enqueue_turn("deploy to prod", huge, source="hook", chat_id="c1", db_path=self.db_path)
+        stored = self._stored()["assistant_response"]
+
+        self.assertLess(len(stored), len(huge))
+        self.assertLess(len(stored), MAX_TURN_CHARS + 200)
+        self.assertTrue(stored.startswith("noise line"))
+        self.assertTrue(stored.endswith(tail))
+        self.assertIn("truncated", stored)
+
+    def test_oversized_prompt_is_capped_too(self):
+        enqueue_turn("x" * (MAX_TURN_CHARS * 3), "ok", source="hook", chat_id="c1", db_path=self.db_path)
+        stored = self._stored()["user_prompt"]
+
+        self.assertLess(len(stored), MAX_TURN_CHARS + 200)
+        self.assertIn("truncated", stored)
+        self.assertEqual(self._stored()["assistant_response"], "ok")
+
+    def test_small_turn_is_untouched(self):
+        enqueue_turn("short prompt", "small answer", source="hook", chat_id="c1", db_path=self.db_path)
+
+        self.assertEqual(self._stored()["assistant_response"], "small answer")
+        self.assertEqual(self._stored()["user_prompt"], "short prompt")
 
 
 if __name__ == "__main__":
