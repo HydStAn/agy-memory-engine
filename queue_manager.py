@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from contextlib import contextmanager
 
-from config import QUEUE_DB_PATH
+from config import QUEUE_DB_PATH, CLAIM_BATCH_SIZE
 
 _INITIALIZED_DBS = set()
 _DB_IDENTITIES = {}
@@ -334,7 +334,7 @@ def enqueue_turn(
 
 
 def claim_batch(
-    batch_size: int = 25,
+    batch_size: int = CLAIM_BATCH_SIZE,
     lease_duration_seconds: int = 300,
     retry_delay_seconds: int = 60,
     prefer_fresh: bool = False,

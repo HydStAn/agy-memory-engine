@@ -71,6 +71,11 @@ QUEUE_DB_PATH = os.path.expanduser(get_config("AGY_TURN_QUEUE_DB", str(Path.home
 INACTIVITY_THRESHOLD_SECONDS = int(get_config("AGY_MEMORY_INACTIVITY_SECONDS", "300"))
 MAX_WAIT_THRESHOLD_SECONDS = int(get_config("AGY_MEMORY_MAX_WAIT_SECONDS", "900"))
 
+# --- Queue Batch Sizing ---
+# WORKER caps total turns drained per run; CLAIM caps turns per single claim, i.e. one LLM extraction prompt.
+WORKER_BATCH_SIZE = int(get_config("AGY_MEMORY_WORKER_BATCH_SIZE", "150"))
+CLAIM_BATCH_SIZE = int(get_config("AGY_MEMORY_CLAIM_BATCH_SIZE", "25"))
+
 # --- Telegram Notifications ---
 DEFAULT_TELEGRAM_CHAT_ID = get_config("AGY_MEMORY_TELEGRAM_CHAT_ID", "")
 SEND_TELEGRAM_BIN = Path(os.path.expanduser(
