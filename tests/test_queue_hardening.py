@@ -25,9 +25,10 @@ from queue_manager import (
     get_pending_stats,
     get_recent_turns,
     mark_turn_status,
-    prune_processed_turns
+    prune_processed_turns,
+    claim_batch
 )
-from config import MAX_TURN_CHARS
+from config import MAX_TURN_CHARS, RETRY_SPLIT_AFTER
 from memory_worker import (
     process_queue,
     should_process_queue,
@@ -387,6 +388,78 @@ class TestTurnSizeCap(unittest.TestCase):
 
         self.assertEqual(self._stored()["assistant_response"], "small answer")
         self.assertEqual(self._stored()["user_prompt"], "short prompt")
+
+
+class TestRetrySplit(unittest.TestCase):
+    """A batch that keeps failing must eventually retry one turn at a time.
+
+    Retries used to re-claim the whole stored batch regardless of batch_size, so a
+    single unparseable turn kept taking its healthy neighbours down with it until
+    every member reached the attempt ceiling.
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.db_path = os.path.join(self.temp_dir, "test_split.db")
+        reset_queue_db_guard()
+
+    def tearDown(self):
+        reset_queue_db_guard()
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def _seed_batch(self, chat):
+        for i in range(3):
+            enqueue_turn(f"Turn {i}", f"Resp {i}", source="hook", chat_id=chat, db_path=self.db_path)
+        return claim_batch(batch_size=10, db_path=self.db_path)
+
+    def _release_for_retry(self, batch_id, attempt_count=None):
+        with sqlite3.connect(self.db_path) as conn:
+            if attempt_count is None:
+                conn.execute(
+                    "UPDATE turn_queue SET lease_expires_at = datetime('now', '-5 seconds') WHERE batch_id = ?",
+                    (batch_id,))
+            else:
+                conn.execute(
+                    "UPDATE turn_queue SET lease_expires_at = datetime('now', '-5 seconds'), attempt_count = ?"
+                    " WHERE batch_id = ?",
+                    (attempt_count, batch_id))
+
+    def test_below_threshold_keeps_membership_and_batch_id(self):
+        first = self._seed_batch("chat_keep")
+
+        self._release_for_retry(first.batch_id)
+        retry = claim_batch(batch_size=10, db_path=self.db_path)
+
+        self.assertEqual(len(retry.turns), 3)
+        self.assertEqual(retry.batch_id, first.batch_id)
+        self.assertEqual([t["id"] for t in retry.turns], [t["id"] for t in first.turns])
+
+    def test_exhausted_batch_splits_to_a_single_turn(self):
+        first = self._seed_batch("chat_split")
+
+        self._release_for_retry(first.batch_id, attempt_count=RETRY_SPLIT_AFTER)
+        retry = claim_batch(batch_size=10, db_path=self.db_path)
+
+        self.assertEqual(len(retry.turns), 1)
+        self.assertNotEqual(retry.batch_id, first.batch_id)
+        self.assertEqual(retry.turns[0]["id"], first.turns[0]["id"])
+
+    def test_split_leaves_the_rest_of_the_batch_for_later_claims(self):
+        first = self._seed_batch("chat_peel")
+
+        self._release_for_retry(first.batch_id, attempt_count=RETRY_SPLIT_AFTER)
+        claim_batch(batch_size=10, db_path=self.db_path)
+
+        with sqlite3.connect(self.db_path) as conn:
+            remaining = conn.execute(
+                "SELECT COUNT(*) FROM turn_queue WHERE batch_id = ?",
+                (first.batch_id,)).fetchone()[0]
+            peeled = conn.execute(
+                "SELECT COUNT(*) FROM turn_queue WHERE batch_id != ?",
+                (first.batch_id,)).fetchone()[0]
+
+        self.assertEqual(remaining, 2)
+        self.assertEqual(peeled, 1)
 
 
 if __name__ == "__main__":

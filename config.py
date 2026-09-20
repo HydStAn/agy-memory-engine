@@ -81,6 +81,11 @@ CLAIM_BATCH_SIZE = int(get_config("AGY_MEMORY_CLAIM_BATCH_SIZE", "25"))
 # produce hundreds of KB of build logs in one "assistant response".
 MAX_TURN_CHARS = int(get_config("AGY_MEMORY_MAX_TURN_CHARS", "20000"))
 
+# After this many attempts on the same batch, retries peel off one turn at a
+# time. Without it a batch keeps its original membership forever and a single
+# unparseable turn takes its healthy neighbours down with it.
+RETRY_SPLIT_AFTER = int(get_config("AGY_MEMORY_RETRY_SPLIT_AFTER", "3"))
+
 # --- Telegram Notifications ---
 DEFAULT_TELEGRAM_CHAT_ID = get_config("AGY_MEMORY_TELEGRAM_CHAT_ID", "")
 SEND_TELEGRAM_BIN = Path(os.path.expanduser(
