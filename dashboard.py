@@ -1750,7 +1750,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
     });
 
-    function showConfirmModal({ title, icon = '❓', message, bulletPoints = [], confirmText = 'Confirm', confirmStyle = 'btn', onConfirm }) {
+    function showConfirmModal({ title, icon = '❓', message, bulletPoints = [], extraHtml = '', confirmText = 'Confirm', confirmStyle = 'btn', onConfirm }) {
       document.getElementById('modal-icon').innerText = icon;
       document.getElementById('modal-title').innerText = title;
 
@@ -1758,8 +1758,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (bulletPoints && bulletPoints.length > 0) {
         bodyHtml += `<ul class="modal-checklist">` + bulletPoints.map(p => `<li><span>${escapeHtml(p)}</span></li>`).join('') + `</ul>`;
       }
+      if (extraHtml) {
+        bodyHtml += extraHtml;
+      }
       document.getElementById('modal-body').innerHTML = bodyHtml;
-
 
       const footer = document.getElementById('modal-footer');
       footer.innerHTML = `
@@ -2011,27 +2013,44 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     function optimizeDb() {
+      const extraHtml = `
+        <div style="margin-top:14px; padding:10px 12px; background:rgba(88,166,255,0.06); border:1px solid rgba(88,166,255,0.25); border-radius:6px;">
+          <label style="display:flex; align-items:flex-start; gap:9px; cursor:pointer; font-size:0.88rem; color:var(--text-bright); user-select:none;">
+            <input type="checkbox" id="chk-opt-consolidate" style="margin-top:3px; cursor:pointer; accent-color:var(--accent);">
+            <div>
+              <span style="font-weight:600;">🧠 Include Semantic Consolidation (LLM Deduplication)</span>
+              <div style="font-size:0.78rem; color:var(--text-muted); margin-top:2px;">
+                Uses LLM background inference to detect overlapping facts, merge redundancies, rewrite graph relations, and write audit logs.
+              </div>
+            </div>
+          </label>
+        </div>
+      `;
+
       showConfirmModal({
-        title: '🧹 Run Full Memory Optimization',
+        title: '🧹 Run Memory Optimization',
         icon: '🧹',
-        message: 'Execute complete cognitive memory engine maintenance, semantic deduplication, and database compacting.',
+        message: 'Execute cognitive memory engine maintenance, index synchronization, and database compacting.',
         bulletPoints: [
           '📸 Create snapshot backup in ~/.gemini/archive (with 20-snapshot retention)',
           '⏳ Episode state decay (active ➔ cooling ➔ historic)',
-          '🧠 Semantic LLM fact deduplication & consolidation',
           '🗑️ Automatic queue pruning (> 7 days retention)',
           '🔍 Rebuild all SQLite FTS5 full-text search indexes',
           '🗜️ Execute SQLite VACUUM database compaction'
         ],
+        extraHtml: extraHtml,
         confirmText: 'Start Optimization',
         onConfirm: async () => {
           const btn = document.getElementById('btn-optimize');
           const origText = btn ? btn.innerText : '🧹 Optimize DB';
+          const chk = document.getElementById('chk-opt-consolidate');
+          const shouldConsolidate = chk ? chk.checked : false;
+
           if (btn) {
             btn.disabled = true;
-            btn.innerText = '⏳ Optimizing...';
+            btn.innerText = shouldConsolidate ? '🧠 Consolidating...' : '⏳ Optimizing...';
           }
-          showToast('Database optimization started...', 'info', 4000);
+          showToast(shouldConsolidate ? 'Memory optimization & LLM consolidation started...' : 'Database optimization started...', 'info', 4000);
 
           try {
             const res = await fetch('/api/optimize', {
@@ -2040,14 +2059,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 'Content-Type': 'application/json',
                 'X-Dashboard-Token': DASHBOARD_TOKEN
               },
-              body: JSON.stringify({ user: currentProfile })
+              body: JSON.stringify({ user: currentProfile, consolidate: shouldConsolidate })
             });
             const data = await res.json();
             if (data.status === 'ok') {
               showResultModal({
                 title: '✅ Optimization Completed',
                 icon: '🧹',
-                message: 'All memory layers and FTS5 indexes were optimized successfully.',
+                message: shouldConsolidate ? 'Memory layers, semantic consolidation, and FTS5 indexes were optimized successfully.' : 'All memory layers and FTS5 indexes were optimized successfully.',
                 logOutput: data.message
               });
               showToast('Memory database optimized successfully!', 'success', 3500);
@@ -2418,12 +2437,16 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
                 env = os.environ.copy()
                 env["AGY_MEMORY_DB"] = prof["db_path"]
                 env["AGY_TURN_QUEUE_DB"] = prof["queue_db_path"]
+                should_consolidate = bool(req_data.get("consolidate", False))
+                cmd = [sys.executable, str(main_bin), "optimize", "--apply"]
+                if should_consolidate:
+                    cmd.append("--consolidate")
                 res = subprocess.run(
-                    [sys.executable, str(main_bin), "optimize", "--apply"],
+                    cmd,
                     env=env,
                     capture_output=True,
                     text=True,
-                    timeout=240
+                    timeout=300
                 )
                 output = (res.stdout or "").strip()
                 err = (res.stderr or "").strip()
