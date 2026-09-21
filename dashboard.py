@@ -1220,6 +1220,25 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       if (rawData && rawData.links) renderGraph(rawData.links, true);
     }
 
+    let networkClusterFilter = 'all';
+    let networkRelationFilter = 'all';
+    let networkHideRelatedTo = false;
+
+    function onNetworkFilterChange() {
+      const selC = document.getElementById('sel-network-cluster');
+      const selR = document.getElementById('sel-network-relation');
+      if (selC) networkClusterFilter = selC.value;
+      if (selR) networkRelationFilter = selR.value;
+      lastRenderedGraphHash = '';
+      if (rawData && rawData.links) renderGraph(rawData.links, true);
+    }
+
+    function toggleHideRelatedTo(checked) {
+      networkHideRelatedTo = !!checked;
+      lastRenderedGraphHash = '';
+      if (rawData && rawData.links) renderGraph(rawData.links, true);
+    }
+
     function onProfileChange(val) {
       currentProfile = val;
       const url = new URL(window.location);
@@ -1620,14 +1639,36 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       let filtered = links;
       if (graphFilterQuery) {
-        filtered = links.filter(l => 
+        filtered = filtered.filter(l => 
           l.source_id.toLowerCase().includes(graphFilterQuery) ||
           l.relation.toLowerCase().includes(graphFilterQuery) ||
           l.target_id.toLowerCase().includes(graphFilterQuery)
         );
       }
 
-      const hash = currentGraphViewMode + '::' + graphFilterQuery + '::' + JSON.stringify(filtered);
+      if (currentGraphViewMode === 'network') {
+        if (networkClusterFilter && networkClusterFilter !== 'all') {
+          filtered = filtered.filter(l => {
+            const d1 = (l.source_id.split('.')[0] || '').toLowerCase();
+            const d2 = (l.target_id.split('.')[0] || '').toLowerCase();
+            return d1 === networkClusterFilter || d2 === networkClusterFilter;
+          });
+        }
+        if (networkRelationFilter === 'functional') {
+          const functionalRels = ['depends_on', 'runs_on', 'hosted_on', 'monitors', 'uses', 'stores', 'advises', 'executes'];
+          filtered = filtered.filter(l => functionalRels.includes(l.relation));
+        } else if (networkRelationFilter === 'structural') {
+          const structuralRels = ['part_of', 'member_of', 'located_at', 'subsystem_of'];
+          filtered = filtered.filter(l => structuralRels.includes(l.relation));
+        } else if (networkRelationFilter === 'related_to') {
+          filtered = filtered.filter(l => l.relation === 'related_to');
+        }
+        if (networkHideRelatedTo && networkRelationFilter !== 'related_to') {
+          filtered = filtered.filter(l => l.relation !== 'related_to');
+        }
+      }
+
+      const hash = currentGraphViewMode + '::' + graphFilterQuery + '::' + networkClusterFilter + '::' + networkRelationFilter + '::' + networkHideRelatedTo + '::' + JSON.stringify(filtered);
       if (!force && hash === lastRenderedGraphHash) return;
       lastRenderedGraphHash = hash;
 
@@ -1637,19 +1678,60 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       }
 
       if (currentGraphViewMode === 'network') {
+        const domainCounts = {};
+        for (const l of links) {
+          const d1 = (l.source_id.split('.')[0] || 'other').toLowerCase();
+          const d2 = (l.target_id.split('.')[0] || 'other').toLowerCase();
+          domainCounts[d1] = (domainCounts[d1] || 0) + 1;
+          domainCounts[d2] = (domainCounts[d2] || 0) + 1;
+        }
+        const topDomains = Object.entries(domainCounts)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 10)
+          .map(e => e[0]);
+
         cont.innerHTML = `
-          <div class="network-controls">
-            <div class="network-legend">
-              <span class="legend-item"><span class="legend-dot" style="background:#58a6ff;"></span> Facts</span>
-              <span class="legend-item"><span class="legend-dot" style="background:#d29922;"></span> Episodes</span>
-              <span class="legend-item"><span class="legend-dot" style="background:#3fb950;"></span> Learnings</span>
-              <span class="legend-item"><span class="legend-dot" style="background:#bc8cff;"></span> Other Entities</span>
+          <div class="network-controls" style="display:flex; flex-direction:column; gap:10px; background:var(--card-bg); border:1px solid var(--card-border); border-radius:8px; padding:12px; margin-bottom:12px;">
+            <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">
+              <div class="network-legend">
+                <span class="legend-item"><span class="legend-dot" style="background:#58a6ff;"></span> Facts</span>
+                <span class="legend-item"><span class="legend-dot" style="background:#d29922;"></span> Episodes</span>
+                <span class="legend-item"><span class="legend-dot" style="background:#3fb950;"></span> Learnings</span>
+                <span class="legend-item"><span class="legend-dot" style="background:#bc8cff;"></span> Other Entities</span>
+              </div>
+              <div style="display:flex; gap:8px; align-items:center;">
+                <button class="btn btn-secondary" style="font-size:0.75rem; padding:3px 10px;" onclick="resetNetworkView()">Center Graph</button>
+                <span id="network-node-count" style="color:var(--text-muted); font-size:0.75rem;"></span>
+              </div>
             </div>
-            <div style="margin-left:auto; display:flex; gap:8px; align-items:center;">
-              <button class="btn btn-secondary" style="font-size:0.75rem; padding:3px 10px;" onclick="resetNetworkView()">Center Graph</button>
-              <span id="network-node-count" style="color:var(--text-muted); font-size:0.75rem;"></span>
+
+            <!-- Filters Bar -->
+            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding-top:6px; border-top:1px solid rgba(255,255,255,0.06);">
+              <div style="display:flex; align-items:center; gap:6px;">
+                <label style="color:var(--text-muted); font-size:0.75rem; font-weight:600;">Cluster / Topic:</label>
+                <select id="sel-network-cluster" onchange="onNetworkFilterChange()" style="background:var(--bg); border:1px solid var(--card-border); border-radius:6px; color:var(--text-bright); font-size:0.75rem; padding:3px 8px; outline:none;">
+                  <option value="all">🌐 All Domains (Global Graph)</option>
+                  ${topDomains.map(d => `<option value="${escapeHtml(d)}" ${networkClusterFilter === d ? 'selected' : ''}>📁 ${escapeHtml(d)} (${domainCounts[d]} refs)</option>`).join('')}
+                </select>
+              </div>
+
+              <div style="display:flex; align-items:center; gap:6px;">
+                <label style="color:var(--text-muted); font-size:0.75rem; font-weight:600;">Relation Type:</label>
+                <select id="sel-network-relation" onchange="onNetworkFilterChange()" style="background:var(--bg); border:1px solid var(--card-border); border-radius:6px; color:var(--text-bright); font-size:0.75rem; padding:3px 8px; outline:none;">
+                  <option value="all">All Relations</option>
+                  <option value="functional" ${networkRelationFilter === 'functional' ? 'selected' : ''}>⚡ Functional Only (depends_on, runs_on, etc.)</option>
+                  <option value="structural" ${networkRelationFilter === 'structural' ? 'selected' : ''}>📂 Structural Only (part_of, member_of, located_at)</option>
+                  <option value="related_to" ${networkRelationFilter === 'related_to' ? 'selected' : ''}>🔗 related_to Only</option>
+                </select>
+              </div>
+
+              <label style="display:flex; align-items:center; gap:5px; font-size:0.75rem; color:var(--text-bright); cursor:pointer; user-select:none; margin-left:auto;">
+                <input type="checkbox" id="chk-hide-related" ${networkHideRelatedTo ? 'checked' : ''} onchange="toggleHideRelatedTo(this.checked)">
+                Hide generic <code>related_to</code> edges
+              </label>
             </div>
           </div>
+
           <div class="network-container" id="network-graph-canvas">
             <div class="network-drawer" id="network-detail-drawer">
               <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
