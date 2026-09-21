@@ -332,6 +332,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="theme-color" content="#0d1117">
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/dist/vis-network.min.js"></script>
   <style>
     :root {
       --bg: #0d1117;
@@ -697,6 +698,61 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     /* Queue & Debounce */
+    .network-container {
+      width: 100%;
+      height: 640px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 8px;
+      position: relative;
+      overflow: hidden;
+    }
+    .network-controls {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+      font-size: 0.8rem;
+    }
+    .network-legend {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      flex-wrap: wrap;
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+    .network-drawer {
+      position: absolute;
+      top: 0;
+      right: -360px;
+      width: 350px;
+      height: 100%;
+      background: #1c2128;
+      border-left: 1px solid var(--card-border);
+      box-shadow: -4px 0 16px rgba(0,0,0,0.5);
+      transition: right 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+      z-index: 100;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      overflow-y: auto;
+    }
+    .network-drawer.open {
+      right: 0;
+    }
     .queue-bar-container {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
@@ -985,6 +1041,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         <input type="text" id="inp-filter-graph" placeholder="Filter relations..." oninput="filterGraphView()" style="background:var(--card-bg); border:1px solid var(--card-border); border-radius:6px; padding:4px 10px; color:var(--text-bright); font-size:0.8rem; width:180px; outline:none;">
         <button class="pill active g-view-btn" style="cursor:pointer;" onclick="setGraphViewMode('grouped', event)">Grouped</button>
         <button class="pill g-view-btn" style="cursor:pointer;" onclick="setGraphViewMode('table', event)">Table</button>
+        <button class="pill g-view-btn" style="cursor:pointer;" onclick="setGraphViewMode('network', event)">🕸️ Network Graph</button>
       </div>
     </div>
     <div id="graph-items"></div>
@@ -1579,6 +1636,35 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         return;
       }
 
+      if (currentGraphViewMode === 'network') {
+        cont.innerHTML = `
+          <div class="network-controls">
+            <div class="network-legend">
+              <span class="legend-item"><span class="legend-dot" style="background:#58a6ff;"></span> Facts</span>
+              <span class="legend-item"><span class="legend-dot" style="background:#d29922;"></span> Episodes</span>
+              <span class="legend-item"><span class="legend-dot" style="background:#3fb950;"></span> Learnings</span>
+              <span class="legend-item"><span class="legend-dot" style="background:#bc8cff;"></span> Other Entities</span>
+            </div>
+            <div style="margin-left:auto; display:flex; gap:8px; align-items:center;">
+              <button class="btn btn-secondary" style="font-size:0.75rem; padding:3px 10px;" onclick="resetNetworkView()">Center Graph</button>
+              <span id="network-node-count" style="color:var(--text-muted); font-size:0.75rem;"></span>
+            </div>
+          </div>
+          <div class="network-container" id="network-graph-canvas">
+            <div class="network-drawer" id="network-detail-drawer">
+              <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                <span id="drawer-entity-badge" class="pill active">Entity</span>
+                <button onclick="closeNetworkDrawer()" style="background:none; border:none; color:var(--text-muted); font-size:1.1rem; cursor:pointer;">✕</button>
+              </div>
+              <h4 id="drawer-title" style="word-break:break-all; font-size:0.95rem; color:var(--text-bright); margin-bottom:10px;"></h4>
+              <div id="drawer-body" style="font-size:0.8rem; color:var(--text); line-height:1.4; flex:1;"></div>
+            </div>
+          </div>
+        `;
+        initNetworkGraph(filtered);
+        return;
+      }
+
       if (currentGraphViewMode === 'table') {
         cont.innerHTML = `
           <div style="background:var(--card-bg); border:1px solid var(--card-border); border-radius:8px; overflow:hidden;">
@@ -1640,6 +1726,215 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
           `).join('')}
         </div>
       `;
+    }
+
+    let networkInstance = null;
+
+    function initNetworkGraph(links) {
+      const container = document.getElementById('network-graph-canvas');
+      if (!container || typeof vis === 'undefined') return;
+
+      const factsMap = new Map((rawData?.facts || []).map(f => [f.id, f]));
+      const episodesMap = new Map((rawData?.episodes || []).map(e => [e.id, e]));
+      const learningsMap = new Map((rawData?.learnings || []).map(l => [l.id, l]));
+
+      const nodesMap = new Map();
+      const edges = [];
+
+      function getOrCreateNode(id) {
+        if (nodesMap.has(id)) return nodesMap.get(id);
+
+        let group = 'other';
+        let color = '#bc8cff';
+        let shape = 'dot';
+        let title = id;
+
+        if (factsMap.has(id)) {
+          group = 'fact';
+          color = '#58a6ff';
+          title = `[Fact] ${factsMap.get(id).fact}`;
+        } else if (episodesMap.has(id)) {
+          group = 'episode';
+          color = '#d29922';
+          shape = 'diamond';
+          title = `[Episode] ${episodesMap.get(id).title || id}`;
+        } else if (learningsMap.has(id)) {
+          group = 'learning';
+          color = '#3fb950';
+          shape = 'square';
+          title = `[Learning] ${learningsMap.get(id).insight}`;
+        }
+
+        const node = {
+          id: id,
+          label: id.length > 28 ? id.slice(0, 26) + '…' : id,
+          fullLabel: id,
+          group: group,
+          color: {
+            background: color,
+            border: '#30363d',
+            highlight: { background: color, border: '#ffffff' },
+            hover: { background: color, border: '#ffffff' }
+          },
+          shape: shape,
+          font: { color: '#c9d1d9', size: 12, face: 'monospace' },
+          title: title
+        };
+        nodesMap.set(id, node);
+        return node;
+      }
+
+      links.forEach((l, idx) => {
+        getOrCreateNode(l.source_id);
+        getOrCreateNode(l.target_id);
+
+        edges.push({
+          id: 'edge_' + idx,
+          from: l.source_id,
+          to: l.target_id,
+          label: l.relation,
+          font: { color: '#8b949e', size: 10, align: 'middle' },
+          arrows: 'to',
+          color: { color: 'rgba(139, 148, 158, 0.4)', highlight: '#58a6ff' },
+          smooth: { enabled: true, type: 'continuous', roundness: 0.2 }
+        });
+      });
+
+      const countSpan = document.getElementById('network-node-count');
+      if (countSpan) {
+        countSpan.innerText = `${nodesMap.size} nodes • ${edges.length} edges`;
+      }
+
+      const data = {
+        nodes: new vis.DataSet(Array.from(nodesMap.values())),
+        edges: new vis.DataSet(edges)
+      };
+
+      const options = {
+        physics: {
+          stabilization: { iterations: 150, updateInterval: 25 },
+          barnesHut: {
+            gravitationalConstant: -3500,
+            centralGravity: 0.25,
+            springLength: 95,
+            springConstant: 0.04,
+            damping: 0.09
+          }
+        },
+        interaction: {
+          hover: true,
+          tooltipDelay: 100,
+          zoomView: true,
+          dragView: true
+        }
+      };
+
+      if (networkInstance) {
+        networkInstance.destroy();
+      }
+
+      networkInstance = new vis.Network(container, data, options);
+
+      networkInstance.on('click', function(params) {
+        if (params.nodes.length > 0) {
+          const nodeId = params.nodes[0];
+          showNetworkNodeDetails(nodeId, factsMap, episodesMap, learningsMap, links);
+        }
+      });
+    }
+
+    function showNetworkNodeDetails(nodeId, factsMap, episodesMap, learningsMap, links) {
+      const drawer = document.getElementById('network-detail-drawer');
+      const badge = document.getElementById('drawer-entity-badge');
+      const title = document.getElementById('drawer-title');
+      const body = document.getElementById('drawer-body');
+      if (!drawer || !title || !body) return;
+
+      title.innerText = nodeId;
+
+      let layerHtml = '';
+      if (factsMap.has(nodeId)) {
+        const f = factsMap.get(nodeId);
+        badge.innerText = 'Fact (Layer 1)';
+        badge.style.background = '#1f6feb';
+        layerHtml = `
+          <div style="margin-bottom:12px; background:var(--bg); border:1px solid var(--card-border); padding:10px; border-radius:6px;">
+            <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:4px;">Category: ${escapeHtml(f.category || '-')}</div>
+            <div style="color:var(--text-bright);">${escapeHtml(f.fact)}</div>
+            ${f.keywords ? `<div style="font-size:0.75rem; color:var(--accent); margin-top:6px;">🏷️ ${escapeHtml(f.keywords)}</div>` : ''}
+          </div>
+        `;
+      } else if (episodesMap.has(nodeId)) {
+        const ep = episodesMap.get(nodeId);
+        badge.innerText = 'Episode (Layer 2)';
+        badge.style.background = '#9e6a03';
+        layerHtml = `
+          <div style="margin-bottom:12px; background:var(--bg); border:1px solid var(--card-border); padding:10px; border-radius:6px;">
+            <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:4px;">Topic: ${escapeHtml(ep.topic || '-')} | Status: ${escapeHtml(ep.status || '-')}</div>
+            <div style="font-weight:600; color:var(--text-bright); margin-bottom:4px;">${escapeHtml(ep.title || ep.id)}</div>
+            <div style="color:var(--text);">${escapeHtml(ep.narrative || '')}</div>
+          </div>
+        `;
+      } else if (learningsMap.has(nodeId)) {
+        const l = learningsMap.get(nodeId);
+        badge.innerText = 'Learning (Layer 3)';
+        badge.style.background = '#238636';
+        layerHtml = `
+          <div style="margin-bottom:12px; background:var(--bg); border:1px solid var(--card-border); padding:10px; border-radius:6px;">
+            <div style="font-size:0.75rem; color:var(--text-muted); margin-bottom:4px;">Category: ${escapeHtml(l.category || '-')}</div>
+            <div style="color:var(--text-bright);">${escapeHtml(l.insight)}</div>
+            ${l.context ? `<div style="font-size:0.75rem; color:var(--text-muted); margin-top:6px;">Context: ${escapeHtml(l.context)}</div>` : ''}
+          </div>
+        `;
+      } else {
+        badge.innerText = 'Entity (Layer 4)';
+        badge.style.background = '#6e40c9';
+        layerHtml = `<p style="color:var(--text-muted); margin-bottom:12px;">Relational node in knowledge graph.</p>`;
+      }
+
+      // Outgoing and Incoming links
+      const outgoing = links.filter(l => l.source_id === nodeId);
+      const incoming = links.filter(l => l.target_id === nodeId);
+
+      let linksHtml = '<h5 style="color:var(--text-bright); margin-bottom:6px; font-size:0.85rem;">Connected Relations:</h5>';
+      if (outgoing.length === 0 && incoming.length === 0) {
+        linksHtml += '<div style="color:var(--text-muted); font-size:0.75rem;">No active relations.</div>';
+      } else {
+        linksHtml += '<div style="display:flex; flex-direction:column; gap:6px;">';
+        outgoing.forEach(l => {
+          linksHtml += `
+            <div style="background:var(--bg); padding:6px 8px; border-radius:4px; font-size:0.75rem; border:1px solid var(--card-border);">
+              <span style="color:var(--text-muted);">OUT:</span> 
+              <span class="entity-relation-pill" style="font-size:0.65rem;">${escapeHtml(l.relation)}</span> ➔ 
+              <span style="color:var(--accent);">${escapeHtml(l.target_id)}</span>
+            </div>
+          `;
+        });
+        incoming.forEach(l => {
+          linksHtml += `
+            <div style="background:var(--bg); padding:6px 8px; border-radius:4px; font-size:0.75rem; border:1px solid var(--card-border);">
+              <span style="color:var(--text-muted);">IN:</span> 
+              <span style="color:var(--accent);">${escapeHtml(l.source_id)}</span> ➔ 
+              <span class="entity-relation-pill" style="font-size:0.65rem;">${escapeHtml(l.relation)}</span>
+            </div>
+          `;
+        });
+        linksHtml += '</div>';
+      }
+
+      body.innerHTML = layerHtml + linksHtml;
+      drawer.classList.add('open');
+    }
+
+    function closeNetworkDrawer() {
+      const drawer = document.getElementById('network-detail-drawer');
+      if (drawer) drawer.classList.remove('open');
+    }
+
+    function resetNetworkView() {
+      if (networkInstance) {
+        networkInstance.fit({ animation: { duration: 600, easingFunction: 'easeInOutQuad' } });
+      }
     }
 
     function renderSnapshots(snapshots, force = false) {
