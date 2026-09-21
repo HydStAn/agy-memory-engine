@@ -19,7 +19,7 @@ from queue_manager import (
     QUEUE_DB_PATH,
     _get_connection,
 )
-from config import get_config
+from config import get_config, CLAIM_BATCH_SIZE
 from schema import db_session
 from memory_worker import should_process_queue
 from agy_memory import (
@@ -360,7 +360,7 @@ def main():
     status_p.set_defaults(func=cmd_status)
 
     claim_p = subparsers.add_parser("claim", help="Claim a batch of pending turns")
-    claim_p.add_argument("--batch-size", type=int, default=25, help="Batch size")
+    claim_p.add_argument("--batch-size", type=int, default=CLAIM_BATCH_SIZE, help="Batch size")
     claim_p.add_argument("--lease-seconds", type=int, default=300, help="Lease duration in seconds")
     claim_p.set_defaults(func=cmd_claim)
 

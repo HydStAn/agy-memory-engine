@@ -34,7 +34,9 @@ from agy_memory import is_trivial_prompt, sync_turn
 from config import (
     INACTIVITY_THRESHOLD_SECONDS,
     MAX_WAIT_THRESHOLD_SECONDS,
-    SEND_TELEGRAM_BIN
+    SEND_TELEGRAM_BIN,
+    WORKER_BATCH_SIZE,
+    CLAIM_BATCH_SIZE
 )
 
 from agy_memory import SyncBusyError, SyncExtractionError
@@ -135,7 +137,7 @@ def should_process_queue(force: bool = False, db_path: str | None = None) -> tup
 _LAST_RUN_FAILED_COUNT = 0
 
 
-def process_queue(batch_size: int = 25, notify: bool = True, db_path: str | None = None) -> int:
+def process_queue(batch_size: int = WORKER_BATCH_SIZE, notify: bool = True, db_path: str | None = None) -> int:
     """Process pending conversation batches partitioned strictly by (source, chat_id).
 
     Uses atomic batch claims with expiring recoverable leases and durable batch IDs.
@@ -157,7 +159,7 @@ def process_queue(batch_size: int = 25, notify: bool = True, db_path: str | None
         # Interleave fresh claims and retries to reserve capacity for fresh work (BR03)
         prefer_fresh = (iterations % 2 == 0)
         claim = claim_batch(
-            batch_size=min(remaining, 25),
+            batch_size=min(remaining, CLAIM_BATCH_SIZE),
             retry_delay_seconds=60,
             prefer_fresh=prefer_fresh,
             exclude_batch_ids=attempted_batch_ids,
@@ -165,7 +167,7 @@ def process_queue(batch_size: int = 25, notify: bool = True, db_path: str | None
         )
         if not claim or not claim.turns:
             claim = claim_batch(
-                batch_size=min(remaining, 25),
+                batch_size=min(remaining, CLAIM_BATCH_SIZE),
                 retry_delay_seconds=60,
                 prefer_fresh=not prefer_fresh,
                 exclude_batch_ids=attempted_batch_ids,
@@ -265,7 +267,7 @@ def process_queue(batch_size: int = 25, notify: bool = True, db_path: str | None
 
 def main(db_path: str | None = None):
     parser = argparse.ArgumentParser(description="Autonomous Calm AGY Memory Queue Worker")
-    parser.add_argument("--batch-size", type=int, default=25, help="Number of turns to process per run")
+    parser.add_argument("--batch-size", type=int, default=WORKER_BATCH_SIZE, help="Total turns to process per run, across multiple claims")
     parser.add_argument("--force", action="store_true", help="Force processing regardless of 5m idle or 15m timer")
     parser.add_argument("--no-notify", action="store_true", help="Disable Telegram notification")
     args = parser.parse_args()
@@ -282,6 +284,13 @@ def main(db_path: str | None = None):
         sys.exit(2)
 
     try:
+        # Drain vector jobs even if turn queue is idle or debouncing
+        try:
+            from vector_index import drain_vector_jobs
+            drain_vector_jobs(batch_size=args.batch_size, max_batches=4)
+        except Exception as e:
+            sys.stderr.write(f"[WARN] Failed to drain vector jobs: {e}\n")
+
         can_run, reason = should_process_queue(force=args.force, db_path=effective_db_path)
         if not can_run:
             sys.exit(0)
@@ -289,6 +298,13 @@ def main(db_path: str | None = None):
         count = process_queue(batch_size=args.batch_size, notify=not args.no_notify, db_path=effective_db_path)
         if count > 0:
             print(f"Memory Worker: Processed batch of {count} turn(s) ({reason}).")
+
+        # Drain any newly committed vector jobs from this run
+        try:
+            from vector_index import drain_vector_jobs
+            drain_vector_jobs(batch_size=args.batch_size, max_batches=4)
+        except Exception:
+            pass
 
         if _LAST_RUN_FAILED_COUNT > 0:
             sys.exit(1)

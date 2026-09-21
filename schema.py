@@ -10,10 +10,11 @@ import sqlite3
 import fcntl
 import time
 import uuid
+import hashlib
 from pathlib import Path
 from contextlib import contextmanager
 
-from config import DB_PATH, EMBEDDING_DIM, VECTOR_SEARCH_ENABLED
+from config import DB_PATH, EMBEDDING_DIM, EMBEDDING_MODEL_NAME, VECTOR_SEARCH_ENABLED
 
 try:
     import sqlite_vec
@@ -25,7 +26,7 @@ except (ImportError, ModuleNotFoundError):
 PROTECTED_CATEGORIES = frozenset({"health", "finance", "pension", "insurance", "preferences", "user"})
 
 _SCHEMA_IDENTITIES = {}
-SCHEMA_VERSION = 211
+SCHEMA_VERSION = 212
 
 _SCHEMA_INITIALIZED = set()  # Track which DB paths have been initialized this process
 
@@ -206,7 +207,7 @@ def _init_schema(conn: sqlite3.Connection) -> None:
     """)
     conn.execute("INSERT OR IGNORE INTO meta_generation(key, value) VALUES ('generation', ?);", (uuid.uuid4().hex,))
 
-    # --- Feature 7: Vector Tables & Triggers (sqlite-vec) ---
+    # --- Feature 7: Vector Tables (sqlite-vec) ---
     if HAS_SQLITE_VEC and VECTOR_SEARCH_ENABLED:
         try:
             conn.enable_load_extension(True)
@@ -231,26 +232,66 @@ def _init_schema(conn: sqlite3.Connection) -> None:
                     embedding float[{EMBEDDING_DIM}]
                 );
             """)
-
-            # Automatic deletion cascade from parent tables
-            conn.execute("""
-                CREATE TRIGGER IF NOT EXISTS trg_vec_memories_ad AFTER DELETE ON memories BEGIN
-                    DELETE FROM vec_memories WHERE id = old.id;
-                END;
-            """)
-            conn.execute("""
-                CREATE TRIGGER IF NOT EXISTS trg_vec_episodes_ad AFTER DELETE ON episodes BEGIN
-                    DELETE FROM vec_episodes WHERE id = old.id;
-                END;
-            """)
-            conn.execute("""
-                CREATE TRIGGER IF NOT EXISTS trg_vec_learnings_ad AFTER DELETE ON learnings BEGIN
-                    DELETE FROM vec_learnings WHERE id = old.id;
-                END;
-            """)
         except Exception:
             # Non-blocking if extension cannot be loaded in current context
             pass
+
+    # --- Feature 8: Vector Reliability & Outbox Synchronization ---
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS vector_index_config (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            model_name TEXT NOT NULL,
+            dimension INTEGER NOT NULL,
+            repr_version TEXT NOT NULL DEFAULT 'v1',
+            fingerprint TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS vector_index_state (
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            indexed_revision INTEGER NOT NULL,
+            generation TEXT NOT NULL,
+            model_fingerprint TEXT NOT NULL,
+            text_hash TEXT,
+            indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (entity_type, entity_id)
+        );
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS vector_index_jobs (
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            op TEXT NOT NULL DEFAULT 'upsert',
+            desired_revision INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            lease_token TEXT,
+            lease_expires_at TIMESTAMP,
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (entity_type, entity_id)
+        );
+    """)
+    conn.execute("""
+        CREATE INDEX IF NOT EXISTS idx_vector_index_jobs_claim ON vector_index_jobs(status, next_attempt_at);
+    """)
+    default_fp = compute_model_fingerprint(EMBEDDING_MODEL_NAME, EMBEDDING_DIM, "v1")
+    conn.execute("""
+        INSERT OR IGNORE INTO vector_index_config (id, model_name, dimension, repr_version, fingerprint)
+        VALUES (1, ?, ?, 'v1', ?);
+    """, (EMBEDDING_MODEL_NAME, EMBEDDING_DIM, default_fp))
+
+
+def compute_model_fingerprint(model_name: str = None, dim: int = None, repr_version: str = "v1") -> str:
+    """Compute deterministic fingerprint for active embedding model and text representation contract."""
+    m = model_name or EMBEDDING_MODEL_NAME
+    d = dim or EMBEDDING_DIM
+    raw = f"{m}:{d}:{repr_version}".encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()[:16]
 
 
 def get_db_generation(conn: sqlite3.Connection) -> str:
@@ -279,11 +320,64 @@ def bump_db_generation(conn: sqlite3.Connection) -> str:
 
 
 def _upgrade_schema(conn):
-    """Versioned, transactional migration to rowid mirrors and durable receipts."""
+    """Versioned, transactional migration to rowid mirrors, durable receipts, and vector outbox."""
     conn.execute("CREATE TABLE IF NOT EXISTS batch_receipts (batch_id TEXT PRIMARY KEY, result_json TEXT NOT NULL, committed_at TEXT DEFAULT CURRENT_TIMESTAMP)")
     conn.execute("CREATE TABLE IF NOT EXISTS entity_revisions (entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(entity_type, entity_id))")
     conn.execute("CREATE TABLE IF NOT EXISTS meta_generation (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
     conn.execute("INSERT OR IGNORE INTO meta_generation(key, value) VALUES ('generation', ?)", (uuid.uuid4().hex,))
+
+    # Feature 8 tables: Vector reliability & outbox jobs
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS vector_index_config (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            model_name TEXT NOT NULL,
+            dimension INTEGER NOT NULL,
+            repr_version TEXT NOT NULL DEFAULT 'v1',
+            fingerprint TEXT NOT NULL,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS vector_index_state (
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            indexed_revision INTEGER NOT NULL,
+            generation TEXT NOT NULL,
+            model_fingerprint TEXT NOT NULL,
+            text_hash TEXT,
+            indexed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (entity_type, entity_id)
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS vector_index_jobs (
+            entity_type TEXT NOT NULL,
+            entity_id TEXT NOT NULL,
+            op TEXT NOT NULL DEFAULT 'upsert',
+            desired_revision INTEGER NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            next_attempt_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            lease_token TEXT,
+            lease_expires_at TIMESTAMP,
+            last_error TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (entity_type, entity_id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_vector_index_jobs_claim ON vector_index_jobs(status, next_attempt_at)")
+
+    default_fp = compute_model_fingerprint(EMBEDDING_MODEL_NAME, EMBEDDING_DIM, "v1")
+    conn.execute("""
+        INSERT OR IGNORE INTO vector_index_config (id, model_name, dimension, repr_version, fingerprint)
+        VALUES (1, ?, ?, 'v1', ?)
+    """, (EMBEDDING_MODEL_NAME, EMBEDDING_DIM, default_fp))
+
+    # Drop legacy triggers that cascade delete directly on virtual tables (causes crashes if sqlite-vec is absent)
+    for table in ('memories', 'episodes', 'learnings'):
+        conn.execute(f"DROP TRIGGER IF EXISTS trg_vec_{table}_ad")
+
     columns = {
         'memories': 'id, category, fact, keywords',
         'episodes': 'id, topic, title, narrative, entities, stance, keywords',
@@ -299,12 +393,72 @@ def _upgrade_schema(conn):
         conn.execute(f"CREATE TRIGGER trg_{table}_au AFTER UPDATE ON {table} BEGIN DELETE FROM {table}_fts WHERE rowid=old.rowid; INSERT INTO {table}_fts(rowid, {names}) VALUES(new.rowid, {values}); END")
         conn.execute(f"DELETE FROM {table}_fts")
         conn.execute(f"INSERT INTO {table}_fts(rowid, {names}) SELECT rowid, {names} FROM {table}")
-        if table != 'entity_links':
-            conn.execute(f"INSERT OR IGNORE INTO entity_revisions SELECT '{table}', id, 1 FROM {table}")
-            for suffix, event, ref in (('ai', 'INSERT', 'new'), ('au', 'UPDATE', 'new'), ('ad', 'DELETE', 'old')):
-                conn.execute(f"CREATE TRIGGER IF NOT EXISTS rev_{table}_{suffix} AFTER {event} ON {table} BEGIN INSERT INTO entity_revisions VALUES('{table}', {ref}.id, 1) ON CONFLICT(entity_type,entity_id) DO UPDATE SET revision=revision+1; END")
-    for table in ('memories','episodes','learnings'):
-        conn.execute(f"CREATE TRIGGER IF NOT EXISTS rev_{table}_rename AFTER UPDATE OF id ON {table} WHEN old.id != new.id BEGIN INSERT INTO entity_revisions VALUES('{table}', old.id, 1) ON CONFLICT(entity_type,entity_id) DO UPDATE SET revision=revision+1; END")
+
+        if table == 'entity_links':
+            continue
+
+        conn.execute(f"INSERT OR IGNORE INTO entity_revisions SELECT '{table}', id, 1 FROM {table}")
+
+        # Drop old revision triggers before recreating unified revision + outbox triggers
+        for suffix in ('ai', 'au', 'ad'):
+            conn.execute(f"DROP TRIGGER IF EXISTS rev_{table}_{suffix}")
+        conn.execute(f"DROP TRIGGER IF EXISTS rev_{table}_rename")
+
+        for suffix, event, ref, op in (
+            ('ai', 'INSERT', 'new', 'upsert'),
+            ('au', 'UPDATE', 'new', 'upsert'),
+            ('ad', 'DELETE', 'old', 'delete')
+        ):
+            conn.execute(f"""
+                CREATE TRIGGER IF NOT EXISTS rev_{table}_{suffix} AFTER {event} ON {table} BEGIN
+                    INSERT INTO entity_revisions VALUES('{table}', {ref}.id, 1)
+                        ON CONFLICT(entity_type, entity_id) DO UPDATE SET revision=revision+1;
+                    INSERT INTO vector_index_jobs (entity_type, entity_id, op, desired_revision, status, attempts, next_attempt_at, updated_at)
+                        VALUES('{table}', {ref}.id, '{op}', (SELECT revision FROM entity_revisions WHERE entity_type='{table}' AND entity_id={ref}.id), 'pending', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                        ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                            op='{op}',
+                            desired_revision=(SELECT revision FROM entity_revisions WHERE entity_type='{table}' AND entity_id={ref}.id),
+                            status='pending',
+                            lease_token=NULL,
+                            lease_expires_at=NULL,
+                            updated_at=CURRENT_TIMESTAMP;
+                END;
+            """)
+
+        conn.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS rev_{table}_rename AFTER UPDATE OF id ON {table} WHEN old.id != new.id BEGIN
+                INSERT INTO entity_revisions VALUES('{table}', old.id, 1)
+                    ON CONFLICT(entity_type, entity_id) DO UPDATE SET revision=revision+1;
+                INSERT INTO vector_index_jobs (entity_type, entity_id, op, desired_revision, status, attempts, next_attempt_at, updated_at)
+                    VALUES('{table}', old.id, 'delete', (SELECT revision FROM entity_revisions WHERE entity_type='{table}' AND entity_id=old.id), 'pending', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                        op='delete',
+                        desired_revision=(SELECT revision FROM entity_revisions WHERE entity_type='{table}' AND entity_id=old.id),
+                        status='pending',
+                        lease_token=NULL,
+                        lease_expires_at=NULL,
+                        updated_at=CURRENT_TIMESTAMP;
+                INSERT INTO entity_revisions VALUES('{table}', new.id, 1)
+                    ON CONFLICT(entity_type, entity_id) DO UPDATE SET revision=revision+1;
+                INSERT INTO vector_index_jobs (entity_type, entity_id, op, desired_revision, status, attempts, next_attempt_at, updated_at)
+                    VALUES('{table}', new.id, 'upsert', (SELECT revision FROM entity_revisions WHERE entity_type='{table}' AND entity_id=new.id), 'pending', 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                    ON CONFLICT(entity_type, entity_id) DO UPDATE SET
+                        op='upsert',
+                        desired_revision=(SELECT revision FROM entity_revisions WHERE entity_type='{table}' AND entity_id=new.id),
+                        status='pending',
+                        lease_token=NULL,
+                        lease_expires_at=NULL,
+                        updated_at=CURRENT_TIMESTAMP;
+            END;
+        """)
+
+        # Seed initial pending jobs for legacy rows
+        conn.execute(f"""
+            INSERT OR IGNORE INTO vector_index_jobs (entity_type, entity_id, op, desired_revision, status, attempts, next_attempt_at)
+            SELECT '{table}', id, 'upsert', COALESCE((SELECT revision FROM entity_revisions WHERE entity_type='{table}' AND entity_id={table}.id), 1), 'pending', 0, CURRENT_TIMESTAMP
+            FROM {table}
+        """)
+
     conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
 

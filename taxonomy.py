@@ -89,6 +89,7 @@ RELATION_MAPPINGS: Dict[str, Tuple[str, bool]] = {
     "associates_with": ("related_to", False),
     "associated_with": ("related_to", False),
     "references": ("related_to", False),
+    "relates_to": ("related_to", False),
     "subscribed": ("subscribed_to", False),
     "consults": ("advises", True),             # A consults B -> B advises A
     "treated_by": ("treats", True),            # A treated_by B -> B treats A

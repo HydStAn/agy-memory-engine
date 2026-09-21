@@ -91,7 +91,10 @@ When processing conversation turns, extract only durable, reusable knowledge acr
 Every scheduled task invocation executes the following sequence:
 
 ### Step 1: Pre-flight & Debounce Evaluation
-Run:
+First, always drain any pending or retry vector indexing jobs:
+`/Users/__blitzzz/Documents/GitHub/agy-memory-engine/.venv/bin/python /Users/__blitzzz/Documents/GitHub/agy-memory-engine/scripts/vector_index_cli.py run`
+
+Then evaluate conversation turn queue:
 `/Users/__blitzzz/Documents/GitHub/agy-memory-engine/.venv/bin/python /Users/__blitzzz/Documents/GitHub/agy-memory-engine/scripts/queue_cli.py status`
 
 - If `count` is 0: queue is empty, exit immediately.
@@ -135,8 +138,11 @@ The CLI guarantees:
 If an error occurs during extraction, release the batch so it can be retried:
 `/Users/__blitzzz/Documents/GitHub/agy-memory-engine/.venv/bin/python /Users/__blitzzz/Documents/GitHub/agy-memory-engine/scripts/queue_cli.py release --batch-id <batch_id> --lease-token <lease_token> --error "<error_message>"`
 
-### Step 5: Housekeeping
-Prune processed turns older than 7 days:
+### Step 5: Housekeeping & Vector Drain
+1. Drain newly enqueued vector jobs:
+`/Users/__blitzzz/Documents/GitHub/agy-memory-engine/.venv/bin/python /Users/__blitzzz/Documents/GitHub/agy-memory-engine/scripts/vector_index_cli.py run`
+
+2. Prune processed turns older than 7 days:
 `/Users/__blitzzz/Documents/GitHub/agy-memory-engine/.venv/bin/python /Users/__blitzzz/Documents/GitHub/agy-memory-engine/scripts/queue_cli.py prune --days 7`
 
 ## 5. Definition of Done (DOD)

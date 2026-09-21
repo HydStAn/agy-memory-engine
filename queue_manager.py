@@ -9,7 +9,7 @@ import uuid
 from pathlib import Path
 from contextlib import contextmanager
 
-from config import QUEUE_DB_PATH
+from config import QUEUE_DB_PATH, CLAIM_BATCH_SIZE, MAX_TURN_CHARS, RETRY_SPLIT_AFTER
 
 _INITIALIZED_DBS = set()
 _DB_IDENTITIES = {}
@@ -204,6 +204,15 @@ def reset_queue_db_guard(db_path: str = None):
         _INITIALIZED_DBS.clear()
 
 
+def _cap_turn_text(text: str, limit: int, label: str) -> str:
+    """Keep head and tail. An agent turn concludes at the tail, so head-only truncation drops the answer."""
+    if not text or len(text) <= limit:
+        return text
+    half = limit // 2
+    removed = len(text) - 2 * half
+    return f"{text[:half]}\n\n[... truncated {removed} chars of {label} ...]\n\n{text[-half:]}"
+
+
 def enqueue_turn(
     user_prompt: str,
     assistant_response: str,
@@ -232,6 +241,9 @@ def enqueue_turn(
     ]
     if any(m in user_prompt for m in internal_markers):
         return False
+
+    user_prompt = _cap_turn_text(user_prompt.strip(), MAX_TURN_CHARS, "prompt")
+    assistant_response = _cap_turn_text(assistant_response.strip(), MAX_TURN_CHARS, "response")
 
     ensure_queue_db(db_path)
     content_hash = make_content_hash(
@@ -334,7 +346,7 @@ def enqueue_turn(
 
 
 def claim_batch(
-    batch_size: int = 25,
+    batch_size: int = CLAIM_BATCH_SIZE,
     lease_duration_seconds: int = 300,
     retry_delay_seconds: int = 60,
     prefer_fresh: bool = False,
@@ -386,6 +398,13 @@ def claim_batch(
                 if not states <= {'pending', 'claimed'}:
                     raise RuntimeError(f'Batch {exp_batch_id} has mixed completion state; reconcile before retry')
                 if rows:
+                    peak_attempts = max((r[8] or 0) for r in rows)
+                    split = peak_attempts >= RETRY_SPLIT_AFTER and len(rows) > 1
+                    claim_rows = rows[:1] if split else rows
+                    target_batch_id = (
+                        compute_batch_id(queue_id, [{"id": r[0], "hash": r[1]} for r in claim_rows])
+                        if split else exp_batch_id
+                    )
                     turns = [{
                         "id": r[0],
                         "hash": r[1],
@@ -394,20 +413,22 @@ def claim_batch(
                         "user_prompt": r[4],
                         "assistant_response": r[5],
                         "created_at": r[6],
-                        "batch_id": r[7],
+                        "batch_id": target_batch_id,
                         "attempt_count": r[8] or 0
-                    } for r in rows]
+                    } for r in claim_rows]
+                    claim_ids = [r[0] for r in claim_rows]
+                    id_placeholders = ",".join("?" for _ in claim_ids)
                     new_lease_token = uuid.uuid4().hex
-                    cursor.execute("""
+                    cursor.execute(f"""
                         UPDATE turn_queue
-                        SET status = 'claimed', lease_token = ?,
+                        SET status = 'claimed', batch_id = ?, lease_token = ?,
                             lease_expires_at = datetime('now', '+' || ? || ' seconds'),
                             attempt_count = COALESCE(attempt_count, 0) + 1
-                        WHERE batch_id = ?;
-                    """, (new_lease_token, lease_duration_seconds, exp_batch_id))
+                        WHERE id IN ({id_placeholders});
+                    """, (target_batch_id, new_lease_token, lease_duration_seconds, *claim_ids))
                     conn.execute("COMMIT")
                     return BatchClaim({
-                        "batch_id": exp_batch_id,
+                        "batch_id": target_batch_id,
                         "lease_token": new_lease_token,
                         "source": exp_source,
                         "chat_id": exp_chat_id,
