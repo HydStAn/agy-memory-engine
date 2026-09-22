@@ -257,7 +257,7 @@ def search_memory(query: str, limit: int = 5) -> str:
 
         # --- Jev relevance gate (one call, fail-open) ---
         gate_texts = ([f["content"] for f in facts]
-                      + [f"{e['title']} {e['narrative']}" for e in episodes]
+                      + [f"{e['title']} {e['narrative']} {e.get('stance', '')}" for e in episodes]
                       + [f"{l['insight']} {l['context']}" for l in learnings])
         mask = gate_relevant(str(query), gate_texts)
         n_facts, n_episodes = len(facts), len(episodes)

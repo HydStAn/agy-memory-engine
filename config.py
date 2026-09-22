@@ -95,12 +95,30 @@ JEV_GATE_API_KEY = _JEV_KEY
 JEV_GATE_ENABLED = get_config("AGY_MEMORY_JEV_GATE", "true").lower() in ("true", "1", "yes", "on")
 JEV_GATE_URL = get_config("AGY_JEV_GATE_URL", "https://ai-gateway.vercel.sh/v4/ai/evaluation-model")
 JEV_GATE_MODEL_ID = get_config("AGY_JEV_GATE_MODEL_ID", "typesafe-ai/jev")
-JEV_GATE_FLOOR = float(get_config("AGY_MEMORY_JEV_GATE_FLOOR", "0.75"))
-JEV_GATE_TIMEOUT = float(get_config("AGY_MEMORY_JEV_GATE_TIMEOUT", "6"))
-# Skip the call only when the candidate set is both tiny and short; many small
-# candidates still get gated.
-JEV_GATE_MIN_ITEMS = int(get_config("AGY_MEMORY_JEV_GATE_MIN_ITEMS", "3"))
-JEV_GATE_MIN_CHARS = int(get_config("AGY_MEMORY_JEV_GATE_MIN_CHARS", "600"))
+
+
+def _jev_number(name, default, low, high):
+    """Finite number in range, or None; a bad value disables the gate instead of raising."""
+    raw = get_config(name, str(default))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not (low <= value <= high):  # NaN fails every comparison, infinities fail the range
+        return None
+    return value
+
+
+_JEV_FLOOR = _jev_number("AGY_MEMORY_JEV_GATE_FLOOR", 0.75, 0.0, 1.0)
+_JEV_TIMEOUT = _jev_number("AGY_MEMORY_JEV_GATE_TIMEOUT", 6.0, 0.1, 120.0)
+_JEV_MIN_ITEMS = _jev_number("AGY_MEMORY_JEV_GATE_MIN_ITEMS", 3, 1, 100000)
+_JEV_MIN_CHARS = _jev_number("AGY_MEMORY_JEV_GATE_MIN_CHARS", 600, 0, 10000000)
+if None in (_JEV_FLOOR, _JEV_TIMEOUT, _JEV_MIN_ITEMS, _JEV_MIN_CHARS):
+    JEV_GATE_ENABLED = False
+JEV_GATE_FLOOR = _JEV_FLOOR if _JEV_FLOOR is not None else 0.75
+JEV_GATE_TIMEOUT = _JEV_TIMEOUT if _JEV_TIMEOUT is not None else 6.0
+JEV_GATE_MIN_ITEMS = int(_JEV_MIN_ITEMS) if _JEV_MIN_ITEMS is not None else 3
+JEV_GATE_MIN_CHARS = int(_JEV_MIN_CHARS) if _JEV_MIN_CHARS is not None else 600
 
 # --- Telegram Notifications ---
 DEFAULT_TELEGRAM_CHAT_ID = get_config("AGY_MEMORY_TELEGRAM_CHAT_ID", "")

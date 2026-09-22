@@ -566,7 +566,7 @@ def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_le
         linked_list = list(locals().get('linked_context', []))
         groups = [pref_rows + fact_rows, episode_rows, learning_rows, linked_list]
         gate_texts = ([r[2] for r in groups[0]]
-                      + [f"{r[2]} {r[5]}" for r in groups[1]]
+                      + [f"{r[2]} {r[5]} {r[7]}" for r in groups[1]]
                       + [f"{r[2]} {r[3]}" for r in groups[2]]
                       + linked_list)
         mask = gate_relevant(query, gate_texts)

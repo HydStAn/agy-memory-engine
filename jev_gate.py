@@ -5,6 +5,7 @@ or any error keeps every candidate.
 """
 import json
 import logging
+import threading
 import urllib.request
 
 from config import (
@@ -23,6 +24,7 @@ logger = logging.getLogger("agy_memory.jev_gate")
 ITEM_CHARS = 400
 QUERY_CHARS = 2000
 REQUEST_CHAR_CAP = 28000
+RESPONSE_BYTES_CAP = 262144
 
 _PROTOCOL_VERSION = "0.0.1"
 _SPEC_VERSION = "4"
@@ -37,7 +39,13 @@ _CRITERION = (
 
 
 def _snippet(text, limit):
-    return " ".join(str(text or "").split())[:limit]
+    """Head and tail: the task often sits at the end of the query."""
+    text = " ".join(str(text or "").split())
+    if len(text) <= limit:
+        return text
+    head = limit * 2 // 3
+    tail = limit - head
+    return text[:head] + " ... " + text[-tail:]
 
 
 def _call_jev(state, questions, timeout):
@@ -50,17 +58,44 @@ def _call_jev(state, questions, timeout):
     req.add_header("ai-evaluation-model-specification-version", _SPEC_VERSION)
     req.add_header("ai-model-id", JEV_GATE_MODEL_ID)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read())
+        raw = resp.read(RESPONSE_BYTES_CAP + 1)
+    if len(raw) > RESPONSE_BYTES_CAP:
+        raise ValueError("response over size cap")
+    return json.loads(raw)
 
 
 def _probability(answer):
-    if not isinstance(answer, dict):
+    """Finite boolean probability, or None when the answer is unusable."""
+    if not isinstance(answer, dict) or answer.get("type") != "boolean":
         return None
     score = answer.get("probability")
     if isinstance(score, bool) or not isinstance(score, (int, float)):
         return None
-    score = float(score)
+    try:
+        score = float(score)
+    except (OverflowError, ValueError):
+        return None
     return score if 0.0 <= score <= 1.0 else None
+
+
+def _call_jev_deadlined(state, questions, timeout):
+    """Hard wall-clock ceiling; socket timeout alone cannot bound a trickle."""
+    box = {}
+
+    def _run():
+        try:
+            box["data"] = _call_jev(state, questions, timeout)
+        except Exception as error:  # surfaced on the caller thread
+            box["error"] = error
+
+    worker = threading.Thread(target=_run, daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if "error" in box:
+        raise box["error"]
+    if "data" not in box:
+        raise TimeoutError("jev deadline exceeded")
+    return box["data"]
 
 
 def gate_relevant(query, texts):
@@ -89,20 +124,22 @@ def gate_relevant(query, texts):
         for i in range(len(texts))
     }
     try:
-        data = _call_jev(state, questions, JEV_GATE_TIMEOUT)
+        data = _call_jev_deadlined(state, questions, JEV_GATE_TIMEOUT)
         answers = data.get("answers") if isinstance(data, dict) else None
         if not isinstance(answers, dict) or not answers:
             raise ValueError("missing answers")
+        # Whole-response validation: one unusable answer poisons the verdict,
+        # so an incomplete record keeps every candidate instead.
+        scores = []
+        for i in range(len(texts)):
+            score = _probability(answers.get("m" + str(i + 1)))
+            if score is None:
+                raise ValueError("unusable answer m" + str(i + 1))
+            scores.append(score)
     except Exception as error:
         logger.debug("jev_gate unavailable (%s): keeping %d candidates", type(error).__name__, len(texts))
         return [True] * len(texts)
 
-    mask = []
-    dropped = 0
-    for i in range(len(texts)):
-        score = _probability(answers.get("m" + str(i + 1)))
-        keep = score is None or score >= JEV_GATE_FLOOR
-        mask.append(keep)
-        dropped += 0 if keep else 1
-    logger.debug("jev_gate kept %d/%d candidates", len(texts) - dropped, len(texts))
+    mask = [score >= JEV_GATE_FLOOR for score in scores]
+    logger.debug("jev_gate kept %d/%d candidates", sum(mask), len(texts))
     return mask
