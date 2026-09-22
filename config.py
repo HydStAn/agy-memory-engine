@@ -86,6 +86,22 @@ MAX_TURN_CHARS = int(get_config("AGY_MEMORY_MAX_TURN_CHARS", "20000"))
 # unparseable turn takes its healthy neighbours down with it.
 RETRY_SPLIT_AFTER = int(get_config("AGY_MEMORY_RETRY_SPLIT_AFTER", "3"))
 
+# --- Jev Relevance Gate (one call per retrieval, fail-open) ---
+_JEV_KEY = get_config("AGY_JEV_API_KEY") or get_config("JEV_API_KEY")
+if not _JEV_KEY:
+    # Key lives with the agy hook credentials; same secret, no new contract.
+    _JEV_KEY = _load_env_file(Path.home() / ".config" / "agy" / "sage.env").get("AGY_JEV_API_KEY", "")
+JEV_GATE_API_KEY = _JEV_KEY
+JEV_GATE_ENABLED = get_config("AGY_MEMORY_JEV_GATE", "true").lower() in ("true", "1", "yes", "on")
+JEV_GATE_URL = get_config("AGY_JEV_GATE_URL", "https://ai-gateway.vercel.sh/v4/ai/evaluation-model")
+JEV_GATE_MODEL_ID = get_config("AGY_JEV_GATE_MODEL_ID", "typesafe-ai/jev")
+JEV_GATE_FLOOR = float(get_config("AGY_MEMORY_JEV_GATE_FLOOR", "0.75"))
+JEV_GATE_TIMEOUT = float(get_config("AGY_MEMORY_JEV_GATE_TIMEOUT", "6"))
+# Skip the call only when the candidate set is both tiny and short; many small
+# candidates still get gated.
+JEV_GATE_MIN_ITEMS = int(get_config("AGY_MEMORY_JEV_GATE_MIN_ITEMS", "3"))
+JEV_GATE_MIN_CHARS = int(get_config("AGY_MEMORY_JEV_GATE_MIN_CHARS", "600"))
+
 # --- Telegram Notifications ---
 DEFAULT_TELEGRAM_CHAT_ID = get_config("AGY_MEMORY_TELEGRAM_CHAT_ID", "")
 SEND_TELEGRAM_BIN = Path(os.path.expanduser(
