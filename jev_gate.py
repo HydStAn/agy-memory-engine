@@ -94,7 +94,7 @@ def gate_relevant(query, texts):
         if not isinstance(answers, dict) or not answers:
             raise ValueError("missing answers")
     except Exception as error:
-        logger.info("jev_gate unavailable (%s): keeping %d candidates", type(error).__name__, len(texts))
+        logger.debug("jev_gate unavailable (%s): keeping %d candidates", type(error).__name__, len(texts))
         return [True] * len(texts)
 
     mask = []
@@ -104,5 +104,5 @@ def gate_relevant(query, texts):
         keep = score is None or score >= JEV_GATE_FLOOR
         mask.append(keep)
         dropped += 0 if keep else 1
-    logger.info("jev_gate kept %d/%d candidates", len(texts) - dropped, len(texts))
+    logger.debug("jev_gate kept %d/%d candidates", len(texts) - dropped, len(texts))
     return mask
