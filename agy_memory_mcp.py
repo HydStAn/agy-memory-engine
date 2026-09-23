@@ -19,6 +19,7 @@ from typing import Optional
 from mcp.server.fastmcp import FastMCP
 
 from schema import db_session, get_db_generation
+from jev_gate import gate_relevant
 from vector_index import get_active_model_fingerprint, drain_vector_jobs
 from config import VECTOR_SEARCH_ENABLED
 from agy_memory import (
@@ -253,6 +254,16 @@ def search_memory(query: str, limit: int = 5) -> str:
             facts = fts_facts[:clamped_limit]
             episodes = fts_episodes[:clamped_limit]
             learnings = fts_learnings[:clamped_limit]
+
+        # --- Jev relevance gate (one call, fail-open) ---
+        gate_texts = ([f["content"] for f in facts]
+                      + [f"{e['title']} {e['narrative']} {e.get('stance', '')}" for e in episodes]
+                      + [f"{l['insight']} {l['context']}" for l in learnings])
+        mask = gate_relevant(str(query), gate_texts)
+        n_facts, n_episodes = len(facts), len(episodes)
+        facts = [item for item, keep in zip(facts, mask[:n_facts]) if keep]
+        episodes = [item for item, keep in zip(episodes, mask[n_facts:n_facts + n_episodes]) if keep]
+        learnings = [item for item, keep in zip(learnings, mask[n_facts + n_episodes:]) if keep]
 
         # Entity links (lexical FTS query)
         entity_links = []

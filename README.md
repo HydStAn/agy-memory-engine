@@ -332,7 +332,26 @@ AGY_MEMORY_DASHBOARD_ALLOW_PRIVATE_NETWORKS=true
 AGY_MEMORY_INFERENCE_URL=
 AGY_MEMORY_INFERENCE_MODEL=
 AGY_MEMORY_INFERENCE_KEY=
+
+# Jev relevance gate: one evaluation-model call per retrieval drops memory
+# candidates that do not serve the request. Fail-open: without a key or on any
+# error every candidate is kept. Key falls back to ~/.config/agy/sage.env.
+AGY_JEV_API_KEY=
+AGY_MEMORY_JEV_GATE=true
+AGY_MEMORY_JEV_GATE_FLOOR=0.75
+AGY_MEMORY_JEV_GATE_TIMEOUT=6
+# Skip the call only when the candidate set is tiny AND short.
+AGY_MEMORY_JEV_GATE_MIN_ITEMS=3
+AGY_MEMORY_JEV_GATE_MIN_CHARS=600
 ```
+
+---
+
+## Jev relevance gate
+
+Retrieval results pass through one evaluation-model call before they reach the agent. Each candidate is scored against the request in a single batched question set; candidates below `AGY_MEMORY_JEV_GATE_FLOOR` are dropped. This keeps unrelated facts, episodes, and learnings out of the agent context. The gate covers both `search_memory` and `prefetch`.
+
+The call is skipped when the candidate set is smaller than `AGY_MEMORY_JEV_GATE_MIN_ITEMS` and shorter than `AGY_MEMORY_JEV_GATE_MIN_CHARS`. Many small candidates still get gated. Every failure mode fails open: a missing key, a timeout, or an unparseable answer keeps all candidates.
 
 ---
 

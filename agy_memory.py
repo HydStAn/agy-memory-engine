@@ -25,6 +25,7 @@ from contextlib import contextmanager, nullcontext, closing
 
 import schema
 from schema import db_session, DB_PATH, PROTECTED_CATEGORIES
+from jev_gate import gate_relevant
 from config import (
     MODEL_NAME,
     DEFAULT_MODEL,
@@ -560,6 +561,22 @@ def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_le
                                 if ml:
                                     linked_context.append(f"Linked Learning via '{rel}': ({ml[1]}) {ml[2]} [Context: {ml[3] or ''}]")
                                     seen_learning_ids.add(ml[0])
+
+        # One Jev call drops candidates that do not serve the query (fail-open).
+        linked_list = list(locals().get('linked_context', []))
+        groups = [pref_rows + fact_rows, episode_rows, learning_rows, linked_list]
+        gate_texts = ([r[2] for r in groups[0]]
+                      + [f"{r[2]} {r[5]} {r[7]}" for r in groups[1]]
+                      + [f"{r[2]} {r[3]}" for r in groups[2]]
+                      + linked_list)
+        mask = gate_relevant(query, gate_texts)
+        pos = 0
+        for i, rows in enumerate(groups):
+            span = len(rows)
+            groups[i] = [row for row, keep in zip(rows, mask[pos:pos + span]) if keep]
+            pos += span
+        pref_rows, fact_rows = [], groups[0]
+        episode_rows, learning_rows, linked_context = groups[1], groups[2], groups[3]
 
         # Bound the serialized context, including always-loaded preferences.
         result = {'facts': [], 'episodes': [], 'learnings': [], 'linked_context': []}

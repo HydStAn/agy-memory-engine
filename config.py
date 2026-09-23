@@ -86,6 +86,40 @@ MAX_TURN_CHARS = int(get_config("AGY_MEMORY_MAX_TURN_CHARS", "20000"))
 # unparseable turn takes its healthy neighbours down with it.
 RETRY_SPLIT_AFTER = int(get_config("AGY_MEMORY_RETRY_SPLIT_AFTER", "3"))
 
+# --- Jev Relevance Gate (one call per retrieval, fail-open) ---
+_JEV_KEY = get_config("AGY_JEV_API_KEY") or get_config("JEV_API_KEY")
+if not _JEV_KEY:
+    # Key lives with the agy hook credentials; same secret, no new contract.
+    _JEV_KEY = _load_env_file(Path.home() / ".config" / "agy" / "sage.env").get("AGY_JEV_API_KEY", "")
+JEV_GATE_API_KEY = _JEV_KEY
+JEV_GATE_ENABLED = get_config("AGY_MEMORY_JEV_GATE", "true").lower() in ("true", "1", "yes", "on")
+JEV_GATE_URL = get_config("AGY_JEV_GATE_URL", "https://ai-gateway.vercel.sh/v4/ai/evaluation-model")
+JEV_GATE_MODEL_ID = get_config("AGY_JEV_GATE_MODEL_ID", "typesafe-ai/jev")
+
+
+def _jev_number(name, default, low, high):
+    """Finite number in range, or None; a bad value disables the gate instead of raising."""
+    raw = get_config(name, str(default))
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if not (low <= value <= high):  # NaN fails every comparison, infinities fail the range
+        return None
+    return value
+
+
+_JEV_FLOOR = _jev_number("AGY_MEMORY_JEV_GATE_FLOOR", 0.75, 0.0, 1.0)
+_JEV_TIMEOUT = _jev_number("AGY_MEMORY_JEV_GATE_TIMEOUT", 6.0, 0.1, 120.0)
+_JEV_MIN_ITEMS = _jev_number("AGY_MEMORY_JEV_GATE_MIN_ITEMS", 3, 1, 100000)
+_JEV_MIN_CHARS = _jev_number("AGY_MEMORY_JEV_GATE_MIN_CHARS", 600, 0, 10000000)
+if None in (_JEV_FLOOR, _JEV_TIMEOUT, _JEV_MIN_ITEMS, _JEV_MIN_CHARS):
+    JEV_GATE_ENABLED = False
+JEV_GATE_FLOOR = _JEV_FLOOR if _JEV_FLOOR is not None else 0.75
+JEV_GATE_TIMEOUT = _JEV_TIMEOUT if _JEV_TIMEOUT is not None else 6.0
+JEV_GATE_MIN_ITEMS = int(_JEV_MIN_ITEMS) if _JEV_MIN_ITEMS is not None else 3
+JEV_GATE_MIN_CHARS = int(_JEV_MIN_CHARS) if _JEV_MIN_CHARS is not None else 600
+
 # --- Telegram Notifications ---
 DEFAULT_TELEGRAM_CHAT_ID = get_config("AGY_MEMORY_TELEGRAM_CHAT_ID", "")
 SEND_TELEGRAM_BIN = Path(os.path.expanduser(
