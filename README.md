@@ -1,9 +1,9 @@
-# AGY Memory Engine (v2.3.0)
+# AGY Memory Engine (v2.4.0)
 
 > Hardening branch: see [runtime setup and audit coverage](HARDENING.md). Automatic extraction now requires an explicitly configured tool-free chat-completions endpoint. It no longer launches an unrestricted AGY agent. Failed extraction retains pending turns. Schema upgrades run on first engine access; restart all clients together for rollout.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests: 49/49 Passing](https://img.shields.io/badge/Tests-49%2F49%20Passed-brightgreen.svg)]()
+[![Tests: 229/229 Passing](https://img.shields.io/badge/Tests-229%2F229%20Passed-brightgreen.svg)]()
 
 > Lightweight, high-performance, standalone dynamic cognitive memory layer for Google Antigravity (`agy`) and autonomous agent frameworks.
 
@@ -360,9 +360,11 @@ The call is skipped when the candidate set is smaller than `AGY_MEMORY_JEV_GATE_
 A zero-dependency, standalone live web dashboard is included to inspect, search, and monitor memory state in real time:
 
 * **Live FTS5 Search Sandbox:** Test hybrid multilingual queries with sub-millisecond latency metrics.
+* **Interactive Knowledge Graph (vis.js):** Real-time interactive network graph visualization of entity relations with cluster domain filtering, relation-type pruning, and node physics.
 * **Turn Queue & Debounce Monitor:** Visual countdown bar for active conversation debouncing (5m idle / 15m timeout) with an instant *"Process batch now"* trigger.
 * **4-Layer Visualizer:** Browse Facts (Layer 1), Thematic Episodes with status badges (Layer 2), Experiential Learnings (Layer 3), and Knowledge Graph Entity Links (Layer 4).
-* **Consolidation Audit Log:** Review automated background merges, deduplications, and semantic rationale.
+* **Consolidation Audit Log & Opt-In Control:** Review automated background merges, deduplications, and semantic rationale, with optional LLM semantic consolidation checkbox in optimization modal.
+* **Engine Status & Version Control:** Live git commit SHA, message display, and one-click engine restart button in the header.
 * **Multi-User Profile Switcher:** Seamlessly switch between configured user profiles on the host via the header dropdown.
 
 ### Authentication & Token Security
@@ -438,12 +440,33 @@ Registers the transcript collector on every agent turn stop:
 
 ```bash
 python3 -m unittest discover tests/ -v
-# Ran 48 tests in 2.9s (OK)
+# Ran 229 tests (OK)
 ```
 
 ---
 
 ## 🚀 Release Notes
+
+### v2.4.0 (2026-09-21)
+- **Vector Index Synchronization & Outbox Architecture**:
+  - Self-healing vector synchronization with `vector_index_jobs`, `vector_index_state`, and `vector_index_config` (schema version 212).
+  - Decoupled embedding computation from SQLite write transactions; atomic revision tracking and job enqueueing via database triggers.
+  - Generational fencing, revision fencing, and lease tracking preventing race conditions during background vector draining.
+  - Dedicated CLI inspection & draining tool (`scripts/vector_index_cli.py`).
+- **Interactive Knowledge Graph & Dashboard Enhancements**:
+  - Interactive vis.js network graph visualization for exploring Layer 4 relational entity links directly in the Web Dashboard.
+  - Cluster domain filtering and relationship-type pruning for dense graph navigation.
+  - Live engine status indicators in the dashboard header: Git commit SHA, commit message, and one-click engine restart.
+  - Optional semantic LLM consolidation checkbox in the optimization modal.
+- **Queue Reliability & Inference Hardening**:
+  - Turn size capping at enqueue time to prevent poisoned oversized claim batches.
+  - Adaptive batch splitting on retries instead of replaying failed batches whole.
+  - Configurable queue batch sizing and increased per-run worker caps (`memory_worker.py`).
+  - Streamed JSON input/output for CLI inference (`agy --print`) and compact prompt inventory.
+- **Taxonomy & Graph Normalization**:
+  - Canonical mapping of `relates_to` to `related_to`.
+- **Jev Relevance Gate (Post-v2.4.0 / PR #3)**:
+  - Evaluation-model candidate filtering dropping irrelevant retrieval results before context injection, with full fail-open behavior.
 
 ### v2.3.0 (2026-09-14)
 - **Comprehensive Hardening, WAL-Safe Storage & Queue Reliability**:
@@ -501,6 +524,11 @@ python3 -m unittest discover tests/ -v
   - Native Antigravity CLI fallback (`agy --print`) with markdown JSON extraction and slash-command retry.
   - Multi-user dashboard resilience and cross-user maintenance locking.
   - Tolerant graph linking (`AGY_MEMORY_STRICT_GRAPH=false`) and first-turn Telegram in-flight session resolution.
+- [x] **Vector Index Synchronization & Interactive Knowledge Graph (v2.4.0)**:
+  - Asynchronous, self-healing vector index outbox (`vector_index_jobs`) with schema 212 and generational fencing.
+  - Interactive vis.js graph visualization in Web Dashboard with domain filtering and physics layout.
+  - Turn size capping, retry batch-splitting, and streaming CLI inference.
+  - Jev candidate relevance gating for clean retrieval contexts.
 - [ ] **Extended Agent & CLI Integrations**:
   - **Claude Code Compatibility**: Support Claude CLI (`claude -p`) as alternate background extraction engine.
   - Dynamic extraction profile tagging per client/agent session (multi-agent orchestration).
