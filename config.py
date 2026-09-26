@@ -120,6 +120,41 @@ JEV_GATE_TIMEOUT = _JEV_TIMEOUT if _JEV_TIMEOUT is not None else 6.0
 JEV_GATE_MIN_ITEMS = int(_JEV_MIN_ITEMS) if _JEV_MIN_ITEMS is not None else 3
 JEV_GATE_MIN_CHARS = int(_JEV_MIN_CHARS) if _JEV_MIN_CHARS is not None else 600
 
+# --- Jev Duplicate Candidates (rank-only pairing for consolidate --export-file) ---
+def _jev_int(name, default, lo, hi):
+    """Whole-number knob; a non-integral value is invalid (disables scoring)."""
+    val = _jev_number(name, default, lo, hi)
+    return int(val) if val is not None and float(val).is_integer() else None
+
+
+JEV_DEDUPE_ENABLED = get_config("AGY_MEMORY_JEV_DEDUPE", "true").lower() in ("true", "1", "yes", "on")
+_JEV_DEDUPE_MIN_SIM = _jev_number("AGY_MEMORY_JEV_DEDUPE_MIN_SIM", 0.5, 0.0, 1.0)
+_JEV_DEDUPE_TOP_K = _jev_int("AGY_MEMORY_JEV_DEDUPE_TOP_K", 5, 1, 100)
+_JEV_DEDUPE_MAX_PAIRS = _jev_int("AGY_MEMORY_JEV_DEDUPE_MAX_PAIRS", 2500, 1, 100000)
+_JEV_DEDUPE_PAIRS_PER_CALL = _jev_int("AGY_MEMORY_JEV_DEDUPE_PAIRS_PER_CALL", 20, 1, 50)
+_JEV_DEDUPE_FLOOR = _jev_number("AGY_MEMORY_JEV_DEDUPE_FLOOR", 0.4, 0.0, 1.0)
+_JEV_DEDUPE_BUDGET = _jev_number("AGY_MEMORY_JEV_DEDUPE_BUDGET", 180, 1, 3600)
+_JEV_DEDUPE_REQUEST_BYTES = _jev_int("AGY_MEMORY_JEV_DEDUPE_REQUEST_BYTES", 48000, 4000, 1000000)
+if None in (_JEV_DEDUPE_MIN_SIM, _JEV_DEDUPE_TOP_K, _JEV_DEDUPE_MAX_PAIRS,
+            _JEV_DEDUPE_PAIRS_PER_CALL, _JEV_DEDUPE_FLOOR, _JEV_DEDUPE_BUDGET,
+            _JEV_DEDUPE_REQUEST_BYTES):
+    JEV_DEDUPE_ENABLED = False
+JEV_DEDUPE_MIN_SIM = _JEV_DEDUPE_MIN_SIM if _JEV_DEDUPE_MIN_SIM is not None else 0.5
+JEV_DEDUPE_TOP_K = _JEV_DEDUPE_TOP_K if _JEV_DEDUPE_TOP_K is not None else 5
+JEV_DEDUPE_MAX_PAIRS = _JEV_DEDUPE_MAX_PAIRS if _JEV_DEDUPE_MAX_PAIRS is not None else 2500
+JEV_DEDUPE_PAIRS_PER_CALL = _JEV_DEDUPE_PAIRS_PER_CALL if _JEV_DEDUPE_PAIRS_PER_CALL is not None else 20
+JEV_DEDUPE_FLOOR = _JEV_DEDUPE_FLOOR if _JEV_DEDUPE_FLOOR is not None else 0.4
+JEV_DEDUPE_BUDGET = _JEV_DEDUPE_BUDGET if _JEV_DEDUPE_BUDGET is not None else 180.0
+JEV_DEDUPE_REQUEST_BYTES = _JEV_DEDUPE_REQUEST_BYTES if _JEV_DEDUPE_REQUEST_BYTES is not None else 48000
+# Comma list of categories never sent to Jev. It ADDS to the protected
+# categories (schema.PROTECTED_CATEGORIES); schema imports config, so the
+# union resolves lazily in jev_dedupe to keep the import acyclic (R1).
+_JEV_DEDUPE_EXCLUDE_RAW = get_config("AGY_MEMORY_JEV_DEDUPE_EXCLUDE", "").strip()
+JEV_DEDUPE_EXCLUDE = (
+    frozenset(p.strip().lower() for p in _JEV_DEDUPE_EXCLUDE_RAW.split(",") if p.strip())
+    if _JEV_DEDUPE_EXCLUDE_RAW else None
+)
+
 # --- Telegram Notifications ---
 DEFAULT_TELEGRAM_CHAT_ID = get_config("AGY_MEMORY_TELEGRAM_CHAT_ID", "")
 SEND_TELEGRAM_BIN = Path(os.path.expanduser(

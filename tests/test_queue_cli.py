@@ -24,6 +24,7 @@ from scripts.queue_cli import (
     cmd_release,
     cmd_commit,
     cmd_prune,
+    cmd_requeue,
     main,
 )
 import argparse
@@ -243,6 +244,62 @@ class TestQueueCLI(unittest.TestCase):
         with sqlite3.connect(self.memory_db) as conn:
             row = conn.execute("SELECT fact FROM memories WHERE id = 'from.file'").fetchone()
             self.assertIsNotNone(row)
+
+    def test_cli_commit_rejects_payload_written_for_another_batch(self):
+        enqueue_turn("Turn 1", "Resp 1", source="antigravity", chat_id="chat-bound", db_path=self.queue_db)
+        claim = claim_batch(db_path=self.queue_db)
+        file_path = os.path.join(self.temp_dir, "stale.json")
+
+        def commit(batch_id_in_payload):
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump({"batch_id": batch_id_in_payload,
+                           "facts": [{"id": "bound.fact", "category": "infra", "fact": "Bound to its batch"}]}, f)
+            args = argparse.Namespace(db_path=self.queue_db, batch_id=claim.batch_id, lease_token=claim.lease_token,
+                                      data="-", data_file=file_path, memory_db=self.memory_db)
+            with patch("sys.stdout", new=StringIO()), patch("sys.stderr", new=StringIO()) as err:
+                return cmd_commit(args), err.getvalue()
+
+        code, err = commit("batch_from_an_earlier_claim")
+        self.assertEqual(code, 1)
+        self.assertIn("batch_id", err)
+        with sqlite3.connect(self.memory_db) as conn:
+            self.assertIsNone(conn.execute("SELECT 1 FROM memories WHERE id = 'bound.fact'").fetchone())
+        with sqlite3.connect(self.queue_db) as conn:
+            self.assertEqual(conn.execute("SELECT status FROM turn_queue WHERE batch_id = ?", (claim.batch_id,)).fetchone()[0], "claimed")
+
+        code, _ = commit(claim.batch_id)
+        self.assertEqual(code, 0)
+        with sqlite3.connect(self.memory_db) as conn:
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM memories WHERE id = 'bound.fact'").fetchone())
+
+    def test_cli_requeue_returns_failed_turns_as_fresh(self):
+        for i in range(2):
+            enqueue_turn(f"Failed turn {i}", f"Resp {i}", source="antigravity", chat_id="chat-failed", db_path=self.queue_db)
+        enqueue_turn("Done turn", "Resp", source="antigravity", chat_id="chat-done", db_path=self.queue_db)
+        with sqlite3.connect(self.queue_db) as conn:
+            conn.execute("UPDATE turn_queue SET status='failed', attempt_count=7, batch_id='old_batch', "
+                         "error='Inference failed', processed_at=CURRENT_TIMESTAMP WHERE chat_id='chat-failed'")
+            conn.execute("UPDATE turn_queue SET status='processed' WHERE chat_id='chat-done'")
+
+        def requeue(dry_run):
+            args = argparse.Namespace(db_path=self.queue_db, dry_run=dry_run)
+            with patch("sys.stdout", new=StringIO()) as out:
+                self.assertEqual(cmd_requeue(args), 0)
+            return json.loads(out.getvalue())
+
+        self.assertEqual(requeue(dry_run=True), {"requeued": 2, "dry_run": True})
+        with sqlite3.connect(self.queue_db) as conn:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM turn_queue WHERE status='failed'").fetchone()[0], 2)
+
+        self.assertEqual(requeue(dry_run=False), {"requeued": 2, "dry_run": False})
+        with sqlite3.connect(self.queue_db) as conn:
+            rows = conn.execute("SELECT status, batch_id, attempt_count, processed_at, error FROM turn_queue "
+                                "WHERE chat_id='chat-failed'").fetchall()
+            self.assertEqual({r[:4] for r in rows}, {("pending", None, 0, None)})
+            self.assertTrue(all(r[4] == "requeued after: Inference failed" for r in rows))
+            self.assertEqual(conn.execute("SELECT status FROM turn_queue WHERE chat_id='chat-done'").fetchone()[0], "processed")
+        claim = claim_batch(db_path=self.queue_db)
+        self.assertEqual(len(claim.turns), 2)
 
     def test_cli_skip_and_release(self):
         enqueue_turn("Hello!", "Hi there!", source="antigravity", chat_id="chat-2", db_path=self.queue_db)

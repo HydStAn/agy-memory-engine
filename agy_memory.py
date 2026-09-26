@@ -1155,40 +1155,8 @@ Output ONLY a single valid JSON object (or {{"facts":[], "episodes":[], "learnin
         logger.info("Memory sync committed: %s", {key: len(items) for key, items in applied_changes.items()})
     return applied_changes
 
-def consolidate_memories(dry_run: bool = False) -> list:
-    """Analyze all stored atomic facts per category with Gemini LLM,
-    detect duplicate/overlapping facts, merge them cleanly into a single authoritative record,
-    delete the redundant entries, and log everything to consolidation_log.
-    """
-    with db_session() as conn:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, category, fact, keywords FROM memories ORDER BY category, id")
-        all_facts = cursor.fetchall()
-        consolidation_revisions = dict(conn.execute("SELECT entity_id,revision FROM entity_revisions WHERE entity_type='memories'"))
-        consolidation_gen = schema.get_db_generation(conn)
-
-    if not all_facts or len(all_facts) < 2:
-        logger.info("[CONSOLIDATE] Less than 2 facts in database. Nothing to consolidate.")
-        return []
-
-    # Group facts by category with at least 2 entries
-    categories_to_check = {}
-    for fid, cat, fact, kws in all_facts:
-        cat_name = cat or "general"
-        categories_to_check.setdefault(cat_name, []).append({
-            "id": fid,
-            "category": cat_name,
-            "fact": fact,
-            "keywords": kws or ""
-        })
-
-    # Only include categories that actually have multiple facts
-    categories_to_check = {k: v for k, v in categories_to_check.items() if len(v) >= 2}
-
-    if not categories_to_check:
-        logger.info("[CONSOLIDATE] No categories with 2+ facts to consolidate.")
-        return []
-
+def _propose_consolidations(categories_to_check: dict) -> dict:
+    """Ask the extraction LLM for merge proposals over the grouped facts."""
     canonical_cats = ", ".join(sorted(CANONICAL_FACT_CATEGORIES))
     facts_json = json.dumps(categories_to_check, ensure_ascii=False, indent=2)
     prompt = f"""You are the Memory Consolidation Engine for the user.
@@ -1224,111 +1192,168 @@ Respond ONLY with valid JSON in this exact structure:
 """
     out = _infer_json(prompt, timeout=120)
 
-    consolidations = []
     json_match = re.fullmatch(r'\{.*\}', out.strip(), re.DOTALL)
     if not json_match:
         raise SyncExtractionError("Consolidation output must be a JSON object")
-    if json_match:
-        try:
-            data = json.loads(json_match.group(0))
-            if not isinstance(data, dict) or not isinstance(data.get('merges'), list):
-                raise SyncExtractionError('Consolidation requires a merges list')
-            for merge in data['merges']:
-                if not isinstance(merge,dict) or not isinstance(merge.get('merged_ids'),list) or any(not isinstance(mid,str) or not mid.strip() for mid in merge['merged_ids']):
-                    raise SyncExtractionError('Malformed consolidation proposal')
-                for field in ('target_id','category','fact'):
-                    require_text(merge.get(field), field)
-            for merge in data['merges']:
-                target_id = require_text(merge.get("target_id"), "target_id")
-                raw_cat = require_text(merge.get("category", "general"), "category")
-                cat_name = _normalize_category(raw_cat, CANONICAL_FACT_CATEGORIES)
-                fact_text = require_text(merge.get("fact"), "fact")
-                kws = merge.get("keywords", "")
-                rationale = merge.get("rationale", "")
+    try:
+        return json.loads(json_match.group(0))
+    except ValueError as e:
+        raise SyncExtractionError(f"Consolidation failed: {e}") from e
 
-                raw_merged = merge.get("merged_ids", [])
-                merged_ids = []
-                for m in raw_merged:
-                    mid = require_text(m, "merged_id")
-                    if mid != target_id and mid not in merged_ids:
-                        merged_ids.append(mid)
 
-                if not target_id or not merged_ids or not fact_text:
+def export_consolidation_snapshot(category: str = None) -> dict:
+    """Facts grouped by category (2+ per category) plus the revision state that
+    a later proposal apply is checked against."""
+    with db_session() as conn:
+        rows = conn.execute("SELECT id, category, fact, keywords FROM memories ORDER BY category, id").fetchall()
+        revisions = dict(conn.execute("SELECT entity_id,revision FROM entity_revisions WHERE entity_type='memories'"))
+        generation = schema.get_db_generation(conn)
+    categories = {}
+    for fid, cat, fact, kws in rows:
+        cat_name = cat or "general"
+        if category and cat_name != category:
+            continue
+        categories.setdefault(cat_name, []).append({
+            "id": fid,
+            "category": cat_name,
+            "fact": fact,
+            "keywords": kws or ""
+        })
+    categories = {k: v for k, v in categories.items() if len(v) >= 2}
+    exported = {f["id"] for facts in categories.values() for f in facts}
+    return {
+        "generation": generation,
+        "revisions": {fid: rev for fid, rev in revisions.items() if fid in exported},
+        "categories": categories,
+    }
+
+
+def consolidate_memories(dry_run: bool = False, proposals: dict = None, snapshot: dict = None) -> list:
+    """Analyze all stored atomic facts per category with Gemini LLM,
+    detect duplicate/overlapping facts, merge them cleanly into a single authoritative record,
+    delete the redundant entries, and log everything to consolidation_log.
+
+    With proposals and the snapshot they were written against, apply externally
+    authored merges instead of calling the LLM; the same staleness guards apply.
+    """
+    if proposals is not None and snapshot is None:
+        raise SyncExtractionError("Consolidation proposals require the snapshot they were written against")
+    if snapshot is None:
+        snapshot = export_consolidation_snapshot()
+    if not isinstance(snapshot, dict) or not all(k in snapshot for k in ("categories", "revisions", "generation")):
+        raise SyncExtractionError("Consolidation snapshot must come from export_consolidation_snapshot")
+    categories_to_check = snapshot["categories"]
+    consolidation_revisions = snapshot["revisions"]
+    consolidation_gen = snapshot["generation"]
+
+    if not categories_to_check:
+        logger.info("[CONSOLIDATE] No categories with 2+ facts to consolidate.")
+        return []
+
+    if proposals is None:
+        proposals = _propose_consolidations(categories_to_check)
+
+    consolidations = []
+    data = proposals
+    try:
+        if not isinstance(data, dict) or not isinstance(data.get('merges'), list):
+            raise SyncExtractionError('Consolidation requires a merges list')
+        for merge in data['merges']:
+            if not isinstance(merge,dict) or not isinstance(merge.get('merged_ids'),list) or any(not isinstance(mid,str) or not mid.strip() for mid in merge['merged_ids']):
+                raise SyncExtractionError('Malformed consolidation proposal')
+            for field in ('target_id','category','fact'):
+                require_text(merge.get(field), field)
+        for merge in data['merges']:
+            target_id = require_text(merge.get("target_id"), "target_id")
+            raw_cat = require_text(merge.get("category", "general"), "category")
+            cat_name = _normalize_category(raw_cat, CANONICAL_FACT_CATEGORIES)
+            fact_text = require_text(merge.get("fact"), "fact")
+            kws = merge.get("keywords", "")
+            rationale = merge.get("rationale", "")
+
+            raw_merged = merge.get("merged_ids", [])
+            merged_ids = []
+            for m in raw_merged:
+                mid = require_text(m, "merged_id")
+                if mid != target_id and mid not in merged_ids:
+                    merged_ids.append(mid)
+
+            if not target_id or not merged_ids or not fact_text:
+                continue
+
+            category_facts = categories_to_check.get(raw_cat, categories_to_check.get(cat_name, []))
+            existing_merged = [m for m in merged_ids if any(f["id"] == m for f in category_facts)]
+            existing_merged = [m for m in existing_merged if m != target_id]
+            if not existing_merged:
+                continue
+
+            diff_summary = f"Merged [{', '.join(existing_merged)}] into [{target_id}]"
+
+            with db_session() as conn, conn:
+                if not dry_run:
+                    conn.execute("BEGIN IMMEDIATE")
+                if schema.get_db_generation(conn) != consolidation_gen:
+                    logger.warning('Rejected stale consolidation proposal for %s: database generation changed', target_id)
                     continue
-
-                category_facts = categories_to_check.get(raw_cat, categories_to_check.get(cat_name, []))
-                existing_merged = [m for m in merged_ids if any(f["id"] == m for f in category_facts)]
-                existing_merged = [m for m in existing_merged if m != target_id]
-                if not existing_merged:
+                stale = False
+                for entity_id in set(existing_merged + [target_id]):
+                    row = conn.execute("SELECT revision FROM entity_revisions WHERE entity_type='memories' AND entity_id=?", (entity_id,)).fetchone()
+                    if (row[0] if row else None) != consolidation_revisions.get(entity_id):
+                        stale = True
+                if stale:
+                    logger.warning('Rejected stale consolidation proposal for %s', target_id)
                     continue
-
-                diff_summary = f"Merged [{', '.join(existing_merged)}] into [{target_id}]"
-
-                with db_session() as conn, conn:
-                    if not dry_run:
-                        conn.execute("BEGIN IMMEDIATE")
-                    if schema.get_db_generation(conn) != consolidation_gen:
-                        logger.warning('Rejected stale consolidation proposal for %s: database generation changed', target_id)
-                        continue
-                    stale = False
-                    for entity_id in set(existing_merged + [target_id]):
-                        row = conn.execute("SELECT revision FROM entity_revisions WHERE entity_type='memories' AND entity_id=?", (entity_id,)).fetchone()
-                        if (row[0] if row else None) != consolidation_revisions.get(entity_id):
-                            stale = True
-                    if stale:
-                        logger.warning('Rejected stale consolidation proposal for %s', target_id)
-                        continue
-                    target = conn.execute("SELECT id, category, fact, keywords FROM memories WHERE id = ?", (target_id,)).fetchone()
-                    allowed_ids = {f["id"] for f in category_facts}
-                    if target and (target_id not in allowed_ids or _is_protected_key(target_id, {"category": target[1]})):
-                        continue
-                    # A new fact ID must not collide with another entity layer.
-                    if not target and any(conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (target_id,)).fetchone() for table in ("episodes", "learnings")):
-                        continue
-                    sources = []
+                target = conn.execute("SELECT id, category, fact, keywords FROM memories WHERE id = ?", (target_id,)).fetchone()
+                allowed_ids = {f["id"] for f in category_facts}
+                if target and (target_id not in allowed_ids or _is_protected_key(target_id, {"category": target[1]})):
+                    continue
+                # A new fact ID must not collide with another entity layer.
+                if not target and any(conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (target_id,)).fetchone() for table in ("episodes", "learnings")):
+                    continue
+                sources = []
+                for mid in existing_merged:
+                    row = conn.execute("SELECT id, category, fact, keywords FROM memories WHERE id = ?", (mid,)).fetchone()
+                    if not row or row[1] != raw_cat or _is_protected_key(mid, {"category": row[1]}):
+                        break
+                    sources.append(row)
+                if len(sources) != len(existing_merged) or (target and target[1] != raw_cat):
+                    continue
+                # Reject stale model proposals if a fact changed during inference.
+                proposed = {f["id"]: f for f in category_facts}
+                if any(row[2] != proposed[row[0]]["fact"] or (row[3] or "") != proposed[row[0]]["keywords"] for row in sources + ([target] if target else [])):
+                    continue
+                placeholders = ",".join("?" for _ in existing_merged)
+                links = conn.execute(f"SELECT source_id, target_id, relation FROM entity_links WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})", existing_merged * 2).fetchall()
+                if not dry_run:
+                    upsert_fact(target_id, cat_name, fact_text, kws, connection=conn)
+                    for src, tgt, relation in links:
+                        conn.execute("DELETE FROM entity_links WHERE source_id=? AND target_id=? AND relation=?", (src, tgt, relation))
+                        new_src = target_id if src in existing_merged else src
+                        new_tgt = target_id if tgt in existing_merged else tgt
+                        if new_src != new_tgt:
+                            conn.execute("INSERT OR IGNORE INTO entity_links VALUES (?, ?, ?)",
+                                         (new_src, new_tgt, relation))
                     for mid in existing_merged:
-                        row = conn.execute("SELECT id, category, fact, keywords FROM memories WHERE id = ?", (mid,)).fetchone()
-                        if not row or row[1] != raw_cat or _is_protected_key(mid, {"category": row[1]}):
-                            break
-                        sources.append(row)
-                    if len(sources) != len(existing_merged) or (target and target[1] != raw_cat):
-                        continue
-                    # Reject stale model proposals if a fact changed during inference.
-                    proposed = {f["id"]: f for f in category_facts}
-                    if any(row[2] != proposed[row[0]]["fact"] or (row[3] or "") != proposed[row[0]]["keywords"] for row in sources + ([target] if target else [])):
-                        continue
-                    placeholders = ",".join("?" for _ in existing_merged)
-                    links = conn.execute(f"SELECT source_id, target_id, relation FROM entity_links WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})", existing_merged * 2).fetchall()
-                    if not dry_run:
-                        upsert_fact(target_id, cat_name, fact_text, kws, connection=conn)
-                        for src, tgt, relation in links:
-                            conn.execute("DELETE FROM entity_links WHERE source_id=? AND target_id=? AND relation=?", (src, tgt, relation))
-                            new_src = target_id if src in existing_merged else src
-                            new_tgt = target_id if tgt in existing_merged else tgt
-                            if new_src != new_tgt:
-                                conn.execute("INSERT OR IGNORE INTO entity_links VALUES (?, ?, ?)",
-                                             (new_src, new_tgt, relation))
-                        for mid in existing_merged:
-                            if mid != target_id:
-                                conn.execute("DELETE FROM memories WHERE id = ?", (mid,))
-                        assert conn.execute("SELECT 1 FROM memories WHERE id = ?", (target_id,)).fetchone() is not None, f"Consolidated target fact '{target_id}' missing after merge"
-                        preimage = json.dumps({"summary": diff_summary, "facts": sources, "target": target, "entity_links": links}, ensure_ascii=False)
-                        conn.execute("""INSERT INTO consolidation_log
-                            (action, category, target_id, merged_ids, diff_summary, rationale)
-                            VALUES ('merge', ?, ?, ?, ?, ?)""",
-                            (cat_name, target_id, json.dumps(existing_merged), preimage, rationale))
+                        if mid != target_id:
+                            conn.execute("DELETE FROM memories WHERE id = ?", (mid,))
+                    assert conn.execute("SELECT 1 FROM memories WHERE id = ?", (target_id,)).fetchone() is not None, f"Consolidated target fact '{target_id}' missing after merge"
+                    preimage = json.dumps({"summary": diff_summary, "facts": sources, "target": target, "entity_links": links}, ensure_ascii=False)
+                    conn.execute("""INSERT INTO consolidation_log
+                        (action, category, target_id, merged_ids, diff_summary, rationale)
+                        VALUES ('merge', ?, ?, ?, ?, ?)""",
+                        (cat_name, target_id, json.dumps(existing_merged), preimage, rationale))
 
-                consolidations.append({
-                    "category": cat_name,
-                    "target_id": target_id,
-                    "merged_ids": existing_merged,
-                    "fact": fact_text,
-                    "rationale": rationale,
-                    "diff_summary": diff_summary
-                })
-                logger.info(f"[CONSOLIDATE] {diff_summary} (Rationale: {rationale})")
-        except Exception as e:
-            raise SyncExtractionError(f"Consolidation failed: {e}") from e
+            consolidations.append({
+                "category": cat_name,
+                "target_id": target_id,
+                "merged_ids": existing_merged,
+                "fact": fact_text,
+                "rationale": rationale,
+                "diff_summary": diff_summary
+            })
+            logger.info(f"[CONSOLIDATE] {diff_summary} (Rationale: {rationale})")
+    except Exception as e:
+        raise SyncExtractionError(f"Consolidation failed: {e}") from e
 
     return consolidations
 
@@ -1678,6 +1703,12 @@ def main():
     cs = subparsers.add_parser("consolidate", help="Run LLM semantic deduplication & consolidation of atomic facts")
     cs.add_argument("--apply", action="store_true", help="Apply consolidations to database")
     cs.add_argument("--dry-run", action="store_true", help="Show proposed consolidations without writing")
+    cs.add_argument("--export-file", help="Write the grouped-facts snapshot for an external reviewer to this path, then exit")
+    cs.add_argument("--category", help="With --export-file: export only this category")
+    cs.add_argument("--candidates", action="store_true", help="With --export-file: add Jev-scored duplicate candidates")
+    cs.add_argument("--since-epoch", type=int, default=None, help="With --candidates: only pairs touching facts updated at or after this Unix time")
+    cs.add_argument("--proposals-file", help="Apply merge proposals from this JSON file instead of calling the LLM (dry run unless --apply)")
+    cs.add_argument("--snapshot-file", help="Snapshot the proposals were written against (required with --proposals-file)")
 
     op = subparsers.add_parser("optimize", help="Run episode aging, rebuild FTS indexes, VACUUM, report stats")
     op.add_argument("--apply", action="store_true", help="Apply optimization")
@@ -1739,8 +1770,41 @@ def main():
         res = age_episodes(args.days_to_cooling, args.days_to_historic)
         print(f"Cooled: {len(res['cooled'])}, Historic: {len(res['historied'])}")
     elif args.command == "consolidate":
-        apply_flag = args.apply or (not args.dry_run)
-        consolidate_memories(dry_run=not apply_flag)
+        if args.since_epoch is not None and not args.candidates:
+            parser.error("--since-epoch requires --candidates")
+        if (args.candidates or args.since_epoch is not None) and not args.export_file:
+            parser.error("--candidates requires --export-file")
+        if args.export_file:
+            snapshot = export_consolidation_snapshot(category=args.category)
+            output = {"exported": args.export_file,
+                      "categories": {k: len(v) for k, v in snapshot["categories"].items()}}
+            if args.candidates:
+                from jev_dedupe import find_candidates
+                items, candidates_meta = find_candidates(snapshot, args.since_epoch)
+                snapshot["candidates"] = items
+                snapshot["candidates_meta"] = candidates_meta
+                output["candidates_meta"] = candidates_meta
+                output["candidates"] = [
+                    {"category": it["category"], "a": it["a"], "b": it["b"],
+                     "similarity": it["similarity"], "duplicate": it["duplicate"],
+                     "conflict": it["conflict"]}
+                    for it in items if not it["below_floor"]
+                ][:60]
+            Path(args.export_file).write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(json.dumps(output))
+        elif args.proposals_file:
+            if not args.snapshot_file:
+                parser.error("--proposals-file requires --snapshot-file")
+            proposals = json.loads(Path(args.proposals_file).read_text(encoding="utf-8"))
+            snapshot = json.loads(Path(args.snapshot_file).read_text(encoding="utf-8"))
+            apply_flag = args.apply and not args.dry_run
+            if apply_flag:
+                create_snapshot(tag="consolidate")
+            merges = consolidate_memories(dry_run=not apply_flag, proposals=proposals, snapshot=snapshot)
+            print(json.dumps({"applied": apply_flag, "merges": merges}, ensure_ascii=False, indent=2))
+        else:
+            apply_flag = args.apply or (not args.dry_run)
+            consolidate_memories(dry_run=not apply_flag)
     elif args.command in ("compact", "optimize"):
         optimize_db(
             apply_changes=getattr(args, 'apply', True),

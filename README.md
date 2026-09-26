@@ -343,6 +343,18 @@ AGY_MEMORY_JEV_GATE_TIMEOUT=6
 # Skip the call only when the candidate set is tiny AND short.
 AGY_MEMORY_JEV_GATE_MIN_ITEMS=3
 AGY_MEMORY_JEV_GATE_MIN_CHARS=600
+
+# Jev duplicate candidates (consolidate --export-file --candidates)
+AGY_MEMORY_JEV_DEDUPE=true
+AGY_MEMORY_JEV_DEDUPE_MIN_SIM=0.5
+AGY_MEMORY_JEV_DEDUPE_TOP_K=5
+AGY_MEMORY_JEV_DEDUPE_MAX_PAIRS=2500
+AGY_MEMORY_JEV_DEDUPE_PAIRS_PER_CALL=20
+AGY_MEMORY_JEV_DEDUPE_FLOOR=0.4
+AGY_MEMORY_JEV_DEDUPE_BUDGET=180
+AGY_MEMORY_JEV_DEDUPE_REQUEST_BYTES=48000
+# Comma list of extra categories never sent to Jev; the protected ones are always excluded
+AGY_MEMORY_JEV_DEDUPE_EXCLUDE=
 ```
 
 ---
@@ -352,6 +364,18 @@ AGY_MEMORY_JEV_GATE_MIN_CHARS=600
 Retrieval results pass through one evaluation-model call before they reach the agent. Each candidate is scored against the request in a single batched question set; candidates below `AGY_MEMORY_JEV_GATE_FLOOR` are dropped. This keeps unrelated facts, episodes, and learnings out of the agent context. The gate covers both `search_memory` and `prefetch`.
 
 The call is skipped when the candidate set is smaller than `AGY_MEMORY_JEV_GATE_MIN_ITEMS` and shorter than `AGY_MEMORY_JEV_GATE_MIN_CHARS`. Many small candidates still get gated. Every failure mode fails open: a missing key, a timeout, or an unparseable answer keeps all candidates.
+
+---
+
+## Jev duplicate candidates
+
+`consolidate --export-file F --candidates` adds ranked duplicate candidates to the exported snapshot, so an external reviewer can decide on merges without an LLM call.
+
+Candidates are fact pairs within one category. Each fact pairs with its `AGY_MEMORY_JEV_DEDUPE_TOP_K` nearest neighbours whose cosine similarity is at least `AGY_MEMORY_JEV_DEDUPE_MIN_SIM`, up to `AGY_MEMORY_JEV_DEDUPE_MAX_PAIRS` pairs in total. Stored vectors are used only when they are fresh for the exported revision and generation. Other facts are embedded from the snapshot text, or reported as unembedded when that fails. `--since-epoch S` keeps only the pairs that touch a fact updated at or after Unix time `S`.
+
+The Jev endpoint that serves the retrieval gate then scores each pair for duplication and for conflict. It receives fact ids and fact snippets, nothing else. Each request carries up to `AGY_MEMORY_JEV_DEDUPE_PAIRS_PER_CALL` pairs and stays under `AGY_MEMORY_JEV_DEDUPE_REQUEST_BYTES` bytes, and no new request starts after `AGY_MEMORY_JEV_DEDUPE_BUDGET` seconds. Jev never receives facts from the protected categories: health, finance, pension, insurance, preferences, and user. `AGY_MEMORY_JEV_DEDUPE_EXCLUDE` adds categories to that list.
+
+Jev only ranks the pairs. Nothing is removed from the exported file or written to the database. A pair scored below `AGY_MEMORY_JEV_DEDUPE_FLOOR` on both questions is marked `below_floor: true` and listed last, and the printed output shows up to 60 pairs that are not below the floor. A missing key, a timeout, or an unusable answer leaves pairs unscored and ranked by similarity, and `candidates_meta` reports that state.
 
 ---
 
@@ -440,7 +464,7 @@ Registers the transcript collector on every agent turn stop:
 
 ```bash
 python3 -m unittest discover tests/ -v
-# Ran 229 tests (OK)
+# Ran 274 tests (OK)
 ```
 
 ---
