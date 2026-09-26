@@ -1705,6 +1705,8 @@ def main():
     cs.add_argument("--dry-run", action="store_true", help="Show proposed consolidations without writing")
     cs.add_argument("--export-file", help="Write the grouped-facts snapshot for an external reviewer to this path, then exit")
     cs.add_argument("--category", help="With --export-file: export only this category")
+    cs.add_argument("--candidates", action="store_true", help="With --export-file: add Jev-scored duplicate candidates")
+    cs.add_argument("--since-epoch", type=int, default=None, help="With --candidates: only pairs touching facts updated at or after this Unix time")
     cs.add_argument("--proposals-file", help="Apply merge proposals from this JSON file instead of calling the LLM (dry run unless --apply)")
     cs.add_argument("--snapshot-file", help="Snapshot the proposals were written against (required with --proposals-file)")
 
@@ -1768,11 +1770,28 @@ def main():
         res = age_episodes(args.days_to_cooling, args.days_to_historic)
         print(f"Cooled: {len(res['cooled'])}, Historic: {len(res['historied'])}")
     elif args.command == "consolidate":
+        if args.since_epoch is not None and not args.candidates:
+            parser.error("--since-epoch requires --candidates")
+        if (args.candidates or args.since_epoch is not None) and not args.export_file:
+            parser.error("--candidates requires --export-file")
         if args.export_file:
             snapshot = export_consolidation_snapshot(category=args.category)
+            output = {"exported": args.export_file,
+                      "categories": {k: len(v) for k, v in snapshot["categories"].items()}}
+            if args.candidates:
+                from jev_dedupe import find_candidates
+                items, candidates_meta = find_candidates(snapshot, args.since_epoch)
+                snapshot["candidates"] = items
+                snapshot["candidates_meta"] = candidates_meta
+                output["candidates_meta"] = candidates_meta
+                output["candidates"] = [
+                    {"category": it["category"], "a": it["a"], "b": it["b"],
+                     "similarity": it["similarity"], "duplicate": it["duplicate"],
+                     "conflict": it["conflict"]}
+                    for it in items if not it["below_floor"]
+                ][:60]
             Path(args.export_file).write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
-            print(json.dumps({"exported": args.export_file,
-                              "categories": {k: len(v) for k, v in snapshot["categories"].items()}}))
+            print(json.dumps(output))
         elif args.proposals_file:
             if not args.snapshot_file:
                 parser.error("--proposals-file requires --snapshot-file")
