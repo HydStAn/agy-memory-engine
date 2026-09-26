@@ -16,6 +16,7 @@ from queue_manager import (
     acknowledge_batch,
     release_batch,
     prune_processed_turns,
+    requeue_failed_turns,
     QUEUE_DB_PATH,
     _get_connection,
 )
@@ -277,6 +278,13 @@ def cmd_commit(args):
         sys.stderr.write(f"Invalid JSON data: {e}\n")
         return 1
 
+    # A payload that names its batch must name this one: catches a stale file from an earlier claim.
+    if isinstance(data, dict) and "batch_id" in data and data["batch_id"] != args.batch_id:
+        sys.stderr.write(
+            f"Commit rejected: payload batch_id '{data['batch_id']}' does not match --batch-id '{args.batch_id}'.\n"
+        )
+        return 1
+
     try:
         facts, episodes, learnings, links = _validate_payload(data)
     except ValueError as e:
@@ -343,6 +351,13 @@ def cmd_commit(args):
     return 0 if ok else 1
 
 
+def cmd_requeue(args):
+    db_path = args.db_path or QUEUE_DB_PATH
+    count = requeue_failed_turns(dry_run=args.dry_run, db_path=db_path)
+    print(json.dumps({"requeued": count, "dry_run": bool(args.dry_run)}))
+    return 0
+
+
 def cmd_prune(args):
     db_path = args.db_path or QUEUE_DB_PATH
     deleted_count = prune_processed_turns(days=args.days, db_path=db_path)
@@ -389,6 +404,10 @@ def main():
     commit_p.add_argument("--data-file", default=None, help="Path to JSON data file")
     commit_p.add_argument("--memory-db", default=None, help="Custom memory database path")
     commit_p.set_defaults(func=cmd_commit)
+
+    requeue_p = subparsers.add_parser("requeue", help="Return failed turns to pending as fresh turns (after an extraction outage)")
+    requeue_p.add_argument("--dry-run", action="store_true", help="Only count the failed turns")
+    requeue_p.set_defaults(func=cmd_requeue)
 
     prune_p = subparsers.add_parser("prune", help="Prune processed and skipped turns older than N days")
     prune_p.add_argument("--days", type=int, default=7, help="Age in days")

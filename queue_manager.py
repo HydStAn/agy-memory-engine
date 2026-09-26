@@ -685,6 +685,33 @@ def mark_turn_status(
             raise
 
 
+def requeue_failed_turns(dry_run: bool = False, db_path: str = QUEUE_DB_PATH) -> int:
+    """Return failed turns to pending as fresh turns.
+
+    Clears batch, attempts and lease so each turn batches with its conversation
+    again; the old error stays as an audit note. Use after an extraction outage,
+    when the failures say nothing about the turns themselves.
+    """
+    ensure_queue_db(db_path)
+    with _get_connection(db_path, timeout=5.0, isolation_level=None) as conn:
+        if dry_run:
+            return conn.execute("SELECT COUNT(*) FROM turn_queue WHERE status = 'failed'").fetchone()[0]
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = conn.execute("""
+                UPDATE turn_queue
+                SET status = 'pending', batch_id = NULL, attempt_count = 0, processed_at = NULL,
+                    lease_token = NULL, lease_expires_at = NULL,
+                    error = CASE WHEN error IS NULL THEN NULL ELSE 'requeued after: ' || error END
+                WHERE status = 'failed'
+            """)
+            conn.execute("COMMIT")
+            return cursor.rowcount
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
+
 def prune_processed_turns(days: int = 7, db_path: str = QUEUE_DB_PATH) -> int:
     """Delete old processed / skipped items based on processed_at (fallback to created_at)."""
     ensure_queue_db(db_path)
