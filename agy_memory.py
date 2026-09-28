@@ -404,6 +404,7 @@ def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_le
         """)
         pref_rows = cursor.fetchall()
         seen_fact_ids = {r[0] for r in pref_rows}
+        query_matched_fact_ids = set()
         seen_episode_ids = set()
         seen_learning_ids = set()
 
@@ -433,6 +434,7 @@ def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_le
                     if r[0] not in seen_fact_ids and r[1] not in ('preference', 'rule', 'preferences'):
                         fact_rows.append(r)
                         seen_fact_ids.add(r[0])
+                        query_matched_fact_ids.add(r[0])
                         if len(fact_rows) >= limit_facts:
                             break
             except sqlite3.OperationalError:
@@ -504,6 +506,7 @@ def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_le
                             if r[0] not in seen_fact_ids and r[1] not in ('preference', 'rule', 'preferences'):
                                 fact_rows.append(r)
                                 seen_fact_ids.add(r[0])
+                                query_matched_fact_ids.add(r[0])
                                 if len(fact_rows) >= limit_facts:
                                     break
                     except sqlite3.OperationalError:
@@ -531,8 +534,8 @@ def prefetch(query: str, limit_facts: int = 3, limit_episodes: int = 2, limit_le
                     except sqlite3.OperationalError:
                         pass
 
-            # 3. Entity Graph Expansion (1-hop Linked Entities)
-            matched_ids = list(seen_fact_ids | seen_episode_ids | seen_learning_ids)
+            # 3. Entity Graph Expansion (1-hop Linked Entities based only on search matches, not static preferences)
+            matched_ids = list(query_matched_fact_ids | seen_episode_ids | seen_learning_ids)
             linked_context = []
             if matched_ids:
                 placeholders = ",".join("?" * len(matched_ids))
@@ -885,8 +888,9 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
 
 ## Layer Definitions
 
-1. ATOMIC FACTS ("facts"): Hard facts, IPs, specs, master data, device IDs, account names, medications, config parameters, definite dates/appointments, contact details.
+1. ATOMIC FACTS ("facts"): Hard facts, IPs, specs, master data, device IDs, account names, medications, config parameters, enduring dates/deadlines, contact details.
    ALLOWED CATEGORIES: {', '.join(sorted(CANONICAL_FACT_CATEGORIES))}
+   🚫 DO NOT store: Ephemeral calendar appointments, day schedules, one-off meetings, or tasks that belong in Google Calendar / Tasks. Only store enduring master dates (e.g. birthdays, anniversaries) or official contract/legal deadlines.
 
 2. NARRATIVE CHRONICLES & EPISODES ("episodes"): Background histories, disputes, social/relationship dynamics, sentiment/stances, multi-event story arcs.
    - Status: "active" (ongoing), "cooling" (cooling down), "historic" (concluded past), "resolved" (fixed/completed).
@@ -904,8 +908,9 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
 
    🚫 DO NOT store as learnings:
    - One-time bug fixes or debugging sessions ("Fixed SQLite UTC conversion in dashboard.py")
-   - Implementation details of a specific codebase ("Baileys emits protocolMessages during sync")
-   - Version-specific migration notes ("mcp 2.x breaks FastMCP imports")
+   - Specific pricing, cancellation terms, fees, or reservation conditions for a single venue/restaurant/shop (these belong in facts or external docs, NEVER learnings)
+   - Implementation details of a specific codebase or single PR workarounds
+   - Version-specific migration notes
    - Configuration changes made once ("Set model to gemini-3.8-flash-low")
    - API quirks of a specific service ("Spotify 403 on playlist endpoint")
    These belong in code comments, commit messages, or facts — NOT learnings.
@@ -914,6 +919,7 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
    You MUST use ONLY these canonical relation types:
    {', '.join(sorted(CANONICAL_RELATIONS))}
    Do not invent relation types. Omit ambiguous relations.
+   🚫 Avoid overusing 'related_to'. Use specific semantic relations ('runs_on', 'part_of', 'monitors', 'uses', etc.). Do not link unrelated entities just because they appeared in the same conversation.
 
 ## Existing Database Keys & Topics:
 {inv_context}
@@ -1366,6 +1372,41 @@ def prune_orphan_links(dry_run: bool = False) -> int:
         return len(orphans)
 
 
+def prune_stale_calendar_facts(dry_run: bool = False, reference_date=None) -> list:
+    """Identify and prune past one-off calendar appointments and reservations from memories."""
+    if reference_date is None:
+        reference_date = datetime.date.today()
+    elif isinstance(reference_date, str):
+        reference_date = datetime.date.fromisoformat(reference_date)
+
+    stale_ids = []
+    with db_session() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id, fact FROM memories WHERE id LIKE 'calendar.appointment.%' OR id LIKE 'calendar.reservation.%' OR id LIKE 'calendar.vote.%'")
+        for mid, fact in cursor.fetchall():
+            m = re.search(r'202\d{5}', mid)
+            if m:
+                try:
+                    dt = datetime.datetime.strptime(m.group(0), '%Y%m%d').date()
+                    if dt < reference_date:
+                        stale_ids.append(mid)
+                except ValueError:
+                    pass
+
+        if stale_ids and not dry_run:
+            for sid in stale_ids:
+                cursor.execute("DELETE FROM memories WHERE id = ?", (sid,))
+                cursor.execute("DELETE FROM entity_links WHERE source_id = ? OR target_id = ?", (sid, sid))
+                if delete_vector:
+                    try:
+                        delete_vector(conn, 'memories', sid)
+                    except Exception:
+                        pass
+            conn.commit()
+
+    return stale_ids
+
+
 def normalize_existing_categories() -> dict:
     """Apply only known mappings; preserve unknown legacy values for review."""
     counts = {"facts": 0, "learnings": 0, "episodes": 0, "links": 0}
@@ -1437,7 +1478,7 @@ def optimize_db(apply_changes: bool = False, age_decay: bool = True, consolidate
                 "historic": conn.execute("SELECT COUNT(*) FROM episodes WHERE status IN ('active', 'cooling') AND updated_at < datetime('now', '-90 days')").fetchone()[0] if age_decay else 0,
             }
     stats["applied"] = apply_changes
-    stats["planned"] = ["normalize", "prune_orphan_links", "prune_queue", "rebuild_fts", "vacuum"]
+    stats["planned"] = ["normalize", "prune_stale_calendar_facts", "prune_orphan_links", "prune_queue", "rebuild_fts", "vacuum"]
     if age_decay:
         stats["planned"].append("age_episodes")
     if consolidate:
@@ -1457,6 +1498,7 @@ def optimize_db(apply_changes: bool = False, age_decay: bool = True, consolidate
     if consolidate:
         stats["merges"] = consolidate_memories()
     stats["normalized"] = normalize_existing_categories()
+    stats["stale_calendar_facts"] = len(prune_stale_calendar_facts(dry_run=False))
     stats["orphan_links"] = prune_orphan_links()
     from queue_manager import prune_processed_turns
     prune_processed_turns(days=7)

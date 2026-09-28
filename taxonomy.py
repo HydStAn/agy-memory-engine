@@ -42,7 +42,7 @@ _CATEGORY_ALIASES = {
     "realestate": "home", "calendar": "general",
     "device": "hardware", "devices": "hardware",
     "credential": "security", "credentials": "security",
-    "identity": "preferences", "personal": "preferences",
+    "identity": "contacts", "personal": "general",
     "project": "work", "projects": "work",
     "service": "infra", "services": "infra",
     "tool": "software", "tools": "software",
