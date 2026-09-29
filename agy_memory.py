@@ -1471,6 +1471,11 @@ def rebuild_fts(conn):
     for table, columns in FTS_COLUMNS.items():
         conn.execute(f"DELETE FROM {table}_fts")
         conn.execute(f"INSERT INTO {table}_fts (rowid, {columns}) SELECT rowid, {columns} FROM {table}")
+    try:
+        conn.execute("DELETE FROM memories_trigram")
+        conn.execute("INSERT INTO memories_trigram (rowid, id, category, fact) SELECT rowid, id, category, fact FROM memories")
+    except Exception:
+        pass
     _VOCABULARY_CACHE.clear()
 
 
