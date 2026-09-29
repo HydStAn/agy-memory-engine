@@ -1196,8 +1196,30 @@ def consolidate_memories(dry_run: bool = False) -> list:
         return []
 
     canonical_cats = ", ".join(sorted(CANONICAL_FACT_CATEGORIES))
-    facts_json = json.dumps(categories_to_check, ensure_ascii=False, indent=2)
-    prompt = f"""You are the Memory Consolidation Engine for the user.
+    consolidations = []
+
+    batches = []
+    total_facts_count = sum(len(v) for v in categories_to_check.values())
+    if total_facts_count <= 25:
+        batches.append(categories_to_check)
+    else:
+        for cat_name, facts in sorted(categories_to_check.items()):
+            if len(facts) <= 30:
+                batches.append({cat_name: facts})
+            else:
+                chunk_size = 25
+                for i in range(0, len(facts), chunk_size):
+                    chunk = facts[i:i+chunk_size]
+                    if len(chunk) < 2 and batches:
+                        prev_cat = list(batches[-1].keys())[0]
+                        if prev_cat == cat_name:
+                            batches[-1][cat_name].extend(chunk)
+                            continue
+                    batches.append({cat_name: chunk})
+
+    for batch_categories in batches:
+        facts_json = json.dumps(batch_categories, ensure_ascii=False, indent=2)
+        prompt = f"""You are the Memory Consolidation Engine for the user.
 Review the following atomic facts grouped by category.
 Identify any facts within each category that are duplicates, heavily overlapping, redundant, or represent the same information across different keys.
 
@@ -1228,13 +1250,11 @@ Respond ONLY with valid JSON in this exact structure:
   ]
 }}
 """
-    out = _infer_json(prompt, timeout=120)
+        out = _infer_json(prompt, timeout=120)
 
-    consolidations = []
-    json_match = re.fullmatch(r'\{.*\}', out.strip(), re.DOTALL)
-    if not json_match:
-        raise SyncExtractionError("Consolidation output must be a JSON object")
-    if json_match:
+        json_match = re.fullmatch(r'\{.*\}', out.strip(), re.DOTALL)
+        if not json_match:
+            raise SyncExtractionError("Consolidation output must be a JSON object")
         try:
             data = json.loads(json_match.group(0))
             if not isinstance(data, dict) or not isinstance(data.get('merges'), list):

@@ -10,7 +10,8 @@ CANONICAL_FACT_CATEGORIES = frozenset({
 
 CANONICAL_LEARNING_CATEGORIES = frozenset({
     "workflow", "communication", "finance", "health", "shopping", "travel",
-    "hardware", "safety", "architecture", "security", "automation", "preferences", "insurance", "general"
+    "hardware", "safety", "architecture", "security", "automation", "preferences", "insurance", "general",
+    "ux", "dev", "infra", "media"
 })
 
 CANONICAL_EPISODE_TOPICS = frozenset({
@@ -38,7 +39,7 @@ _CATEGORY_ALIASES = {
     "gear": "hardware", "tesla": "hardware",
     "devsecops": "dev", "dev.cron": "automation",
     "heuristics": "general", "ai_tools": "software", "ai": "dev",
-    "ui_ux": "architecture", "network": "infra",
+    "ui_ux": "ux", "network": "infra",
     "realestate": "home", "calendar": "general",
     "device": "hardware", "devices": "hardware",
     "credential": "security", "credentials": "security",
