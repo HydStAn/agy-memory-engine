@@ -77,6 +77,44 @@ def resolve_transcript(payload):
     return None
 
 
+USER_TYPES = ("USER_INPUT", "user", "human")
+ASSISTANT_TYPES = ("PLANNER_RESPONSE", "MODEL_RESPONSE", "assistant")
+# Claude Code content blocks that are not conversation text.
+NON_TEXT_BLOCKS = ("tool_use", "tool_result", "thinking", "redacted_thinking", "image", "document")
+
+
+def content_text(content):
+    if isinstance(content, dict):
+        # Claude Code wraps the API message: {"role": ..., "content": str | [blocks]}
+        content = content.get("content") or content.get("text") or ""
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, dict):
+                if item.get("type") in NON_TEXT_BLOCKS:
+                    continue
+                parts.append(item.get("text") or item.get("content") or "")
+            else:
+                parts.append(str(item))
+        content = "\n".join(p for p in parts if isinstance(p, str) and p)
+    return str(content or "").strip()
+
+
+def parse_entry(data):
+    """Return (role, text) for one transcript line; role is None for non-conversation lines."""
+    if data.get("isMeta") or data.get("isSidechain"):
+        return None, ""
+    msg_type = data.get("type") or data.get("role") or ""
+    message = data.get("message")
+    role = data.get("role") or (message.get("role") if isinstance(message, dict) else None)
+    text = content_text(data.get("content") or data.get("text") or message or "")
+    if msg_type in USER_TYPES or role == "user":
+        return "user", text
+    if msg_type in ASSISTANT_TYPES or role == "assistant":
+        return "assistant", text
+    return None, ""
+
+
 def extract_from_transcript(path: Path):
     try:
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -84,8 +122,7 @@ def extract_from_transcript(path: Path):
         return "", ""
     assistant_parts = []
     last_user = ""
-    user_index = None
-    for offset, line in enumerate(reversed(lines)):
+    for line in reversed(lines):
         line = line.strip()
         if not line:
             continue
@@ -93,56 +130,20 @@ def extract_from_transcript(path: Path):
             data = json.loads(line)
         except ValueError:
             continue
-        msg_type = data.get("type") or data.get("role") or ""
-        content = data.get("content") or data.get("text") or data.get("message") or ""
-        if isinstance(content, list):
-            parts = []
-            for item in content:
-                if isinstance(item, dict):
-                    parts.append(item.get("text") or item.get("content") or "")
-                else:
-                    parts.append(str(item))
-            content = "\n".join(p for p in parts if p)
-        content = str(content).strip()
-        if not last_user:
-            if msg_type in ("USER_INPUT", "user", "human") or data.get("role") == "user":
-                if "<USER_REQUEST>" in content:
-                    start = content.find("<USER_REQUEST>") + len("<USER_REQUEST>")
-                    end = content.find("</USER_REQUEST>")
-                    if end != -1:
-                        content = content[start:end].strip()
-                last_user = content
-                user_index = len(lines) - 1 - offset
-                break
-            if msg_type in ("PLANNER_RESPONSE", "MODEL_RESPONSE", "assistant") or data.get("role") == "assistant":
-                if content:
-                    assistant_parts.append(content)
-        else:
+        if not isinstance(data, dict):
+            continue
+        role, content = parse_entry(data)
+        if role == "assistant" and content:
+            assistant_parts.append(content)
+        elif role == "user" and content:
+            # Tool-result-only user lines have no text and are skipped above.
+            if "<USER_REQUEST>" in content:
+                start = content.find("<USER_REQUEST>") + len("<USER_REQUEST>")
+                end = content.find("</USER_REQUEST>")
+                if end != -1:
+                    content = content[start:end].strip()
+            last_user = content
             break
-    if not last_user:
-        # reverse direction fallback: last user in chronological order
-        for line in lines:
-            try:
-                data = json.loads(line)
-            except ValueError:
-                continue
-            msg_type = data.get("type") or data.get("role") or ""
-            if msg_type in ("USER_INPUT", "user") or data.get("role") == "user":
-                content = data.get("content") or data.get("text") or ""
-                if isinstance(content, str) and content.strip():
-                    last_user = content.strip()
-        if last_user and not assistant_parts:
-            for line in reversed(lines):
-                try:
-                    data = json.loads(line)
-                except ValueError:
-                    continue
-                msg_type = data.get("type") or data.get("role") or ""
-                if msg_type in ("MODEL_RESPONSE", "PLANNER_RESPONSE", "assistant") or data.get("role") == "assistant":
-                    content = data.get("content") or data.get("text") or ""
-                    if isinstance(content, str) and content.strip():
-                        assistant_parts.append(content.strip())
-                        break
     assistant = "\n\n".join(reversed(assistant_parts)).strip()
     return last_user, assistant
 
