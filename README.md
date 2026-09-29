@@ -1,4 +1,4 @@
-# AGY Memory Engine (v2.4.0)
+# AGY Memory Engine (v2.5.0)
 
 > Hardening branch: see [runtime setup and audit coverage](HARDENING.md). Automatic extraction now requires an explicitly configured tool-free chat-completions endpoint. It no longer launches an unrestricted AGY agent. Failed extraction retains pending turns. Schema upgrades run on first engine access; restart all clients together for rollout.
 
@@ -447,6 +447,24 @@ python3 -m unittest discover tests/ -v
 
 ## 🚀 Release Notes
 
+### v2.5.0 (2026-09-29)
+- **Domain Taxonomy Expansion & De-concentration**:
+  - Expanded `CANONICAL_LEARNING_CATEGORIES` with dedicated domains: `ux`, `dev`, `infra`, and `media`, relieving the catch-all `architecture` bucket.
+  - Aligned LLM extraction guidance and runtime validation aliases (`ui_ux` -> `ux`).
+- **High-Precision Knowledge Graph Relations**:
+  - Broadened `CANONICAL_RELATIONS` from 26 to 32 expressive link types: `documents`, `configures`, `applies_to`, `resolves`, `targets`, `supports`.
+  - Added bidirectional inverse mappings: `documented_by`, `configured_by`, `resolved_by`, `targeted_by`, `supported_by`, `used_by`, `stored_at`, and `stored_in`.
+  - Re-mapped generic `related_to` links across system configurations, user profiles, projects, and media pipelines (reducing `related_to` density by >43%).
+- **Adaptive Batched Semantic Memory Consolidation**:
+  - Refactored `consolidate_memories` from monolithic single-prompt serialization (which previously exceeded CLI subprocess payload and timeout limits on large stores) into category-chunked batches (≤ 25 facts per inference call).
+  - Maintained single-pass backward compatibility for small databases and mocked unit tests.
+- **FTS5 & Trigram Index Integrity**:
+  - Automated continuous SQLite triggers (`trg_memories_trigram_ai/au/ad`) to keep the substring trigram virtual table synchronized with `memories`.
+  - Added `memories_trigram` maintenance to the routine `rebuild_fts` workflow in `optimize_db`.
+- **Retrieval & Ingestion Hardening**:
+  - Decoupled static persistent preferences and safety guardrails from graph expansion to guarantee deterministic zero-hop system prompt injection.
+  - Hardened automated calendar fact pruning and point-in-time episode lifecycle resolution.
+
 ### v2.4.0 (2026-09-21)
 - **Vector Index Synchronization & Outbox Architecture**:
   - Self-healing vector synchronization with `vector_index_jobs`, `vector_index_state`, and `vector_index_config` (schema version 212).
@@ -529,6 +547,11 @@ python3 -m unittest discover tests/ -v
   - Interactive vis.js graph visualization in Web Dashboard with domain filtering and physics layout.
   - Turn size capping, retry batch-splitting, and streaming CLI inference.
   - Jev candidate relevance gating for clean retrieval contexts.
+- [x] **Domain Taxonomy Expansion, Expressive Relations & Batched Consolidation (v2.5.0)**:
+  - Domain expansion for learnings (`ux`, `dev`, `infra`, `media`).
+  - Expressive relational link types (`documents`, `configures`, `applies_to`, `resolves`, `targets`, `supports`) and inverse mappings.
+  - Chunked, adaptive batching for LLM semantic fact consolidation preventing oversized prompts and subprocess timeouts.
+  - Continuous trigram synchronization via SQLite triggers and routine FTS maintenance.
 - [ ] **Extended Agent & CLI Integrations**:
   - **Claude Code Compatibility**: Support Claude CLI (`claude -p`) as alternate background extraction engine.
   - Dynamic extraction profile tagging per client/agent session (multi-agent orchestration).

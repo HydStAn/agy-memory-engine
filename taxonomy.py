@@ -25,7 +25,8 @@ CANONICAL_RELATIONS = frozenset({
     "insured_by", "finances", "communicates_via", "located_at", "uses",
     "stores", "connects_to", "related_to", "maintains", "created_by",
     "delivers_to", "advises", "works_at", "lives_at", "travels_to",
-    "subscribed_to", "prescribes"
+    "subscribed_to", "prescribes",
+    "documents", "configures", "applies_to", "resolves", "targets", "supports"
 })
 
 
@@ -97,6 +98,13 @@ RELATION_MAPPINGS: Dict[str, Tuple[str, bool]] = {
     "prescribed_by": ("prescribes", True), # Med prescribed_by Doc -> Doc prescribes Med
     "insured_at": ("insured_by", False),
     "stored_in": ("stores", True),             # Item stored_in Location -> Location stores Item
+    "stored_at": ("stores", True),
+    "used_by": ("uses", True),
+    "documented_by": ("documents", True),
+    "configured_by": ("configures", True),
+    "resolved_by": ("resolves", True),
+    "targeted_by": ("targets", True),
+    "supported_by": ("supports", True),
     "resides_in": ("located_at", False),
     "situated_at": ("located_at", False),
 }
