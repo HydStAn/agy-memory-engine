@@ -1,6 +1,6 @@
 # AGY Memory Engine (v2.5.0)
 
-> Hardening branch: see [runtime setup and audit coverage](HARDENING.md). Automatic extraction now requires an explicitly configured tool-free chat-completions endpoint. It no longer launches an unrestricted AGY agent. Failed extraction retains pending turns. Schema upgrades run on first engine access; restart all clients together for rollout.
+> Hardening branch: see [runtime setup and audit coverage](docs/HARDENING.md). Automatic extraction now requires an explicitly configured tool-free chat-completions endpoint. It no longer launches an unrestricted AGY agent. Failed extraction retains pending turns. Schema upgrades run on first engine access; restart all clients together for rollout.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests: 229/229 Passing](https://img.shields.io/badge/Tests-229%2F229%20Passed-brightgreen.svg)]()

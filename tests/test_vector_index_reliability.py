@@ -1,6 +1,6 @@
 """
 Unit and Integration Tests for AGY Memory Engine Vector Index Reliability.
-Verifies all 13 core requirements of VECTOR_INDEX_RELIABILITY_PLAN.md:
+Verifies all 13 core requirements of docs/VECTOR_INDEX_RELIABILITY_PLAN.md:
 transactional outbox, revision and generation fencing, lease recovery,
 top-k prefiltering, and self-healing retries.
 """
