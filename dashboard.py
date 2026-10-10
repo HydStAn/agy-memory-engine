@@ -2670,7 +2670,7 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Dashboard-Token")
             self.send_header("Vary", "Origin")
 
-    def _send_bytes(self, body: bytes, content_type: str, status: int = 200, cache_control: Optional[str] = None):
+    def _send_bytes(self, body: bytes, content_type: str, status: int = 200, cache_control: Optional[str] = None, extra_headers: Optional[dict] = None):
         accept_encoding = self.headers.get("Accept-Encoding", "")
         use_gzip = "gzip" in accept_encoding and len(body) > 1024
         if use_gzip:
@@ -2682,6 +2682,9 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Vary", "Accept-Encoding")
             if cache_control:
                 self.send_header("Cache-Control", cache_control)
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
             self._set_cors_headers()
             self.end_headers()
             self.wfile.write(compressed)
@@ -2691,6 +2694,9 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             if cache_control:
                 self.send_header("Cache-Control", cache_control)
+            if extra_headers:
+                for k, v in extra_headers.items():
+                    self.send_header(k, v)
             self._set_cors_headers()
             self.end_headers()
             self.wfile.write(body)
@@ -2699,9 +2705,9 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
         self._send_bytes(body, "application/json; charset=utf-8", status=status)
 
-    def _send_html(self, html: str, status: int = 200):
+    def _send_html(self, html: str, status: int = 200, extra_headers: Optional[dict] = None):
         body = html.encode("utf-8")
-        self._send_bytes(body, "text/html; charset=utf-8", status=status, cache_control="no-store")
+        self._send_bytes(body, "text/html; charset=utf-8", status=status, cache_control="no-store", extra_headers=extra_headers)
 
     def _verify_auth(self) -> bool:
         expected = get_or_create_dashboard_token()
@@ -2781,7 +2787,12 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             token = get_or_create_dashboard_token()
             rendered = HTML_TEMPLATE.replace("{{DASHBOARD_TOKEN}}", json.dumps(token).replace("<", "\\u003c"))
             body = rendered.encode("utf-8")
-            self._send_bytes(body, "text/html; charset=utf-8", status=200, cache_control="no-store")
+            extra = {
+                "Set-Cookie": f"dashboard_token={token}; Path=/; SameSite=Strict; HttpOnly",
+                "X-Frame-Options": "DENY",
+                "Referrer-Policy": "no-referrer",
+            }
+            self._send_bytes(body, "text/html; charset=utf-8", status=200, cache_control="no-store", extra_headers=extra)
             return
 
         if path.startswith("/static/"):
