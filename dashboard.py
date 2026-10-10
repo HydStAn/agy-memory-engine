@@ -16,6 +16,7 @@ import hmac
 import fcntl
 import ipaddress
 import urllib.parse
+import gzip
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Optional
@@ -336,7 +337,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <meta name="theme-color" content="#0d1117">
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/vis-network/9.1.9/dist/vis-network.min.js"></script>
+  <script defer src="/static/vis-network.min.js"></script>
   <style>
     :root {
       --bg: #0d1117;
@@ -1132,6 +1133,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     let currentProfile = (new URLSearchParams(window.location.search)).get('user') || 'ubuntu';
     let rawData = null;
     let searchTimer = null;
+    let searchAbortController = null;
     const openTurnDetails = new Set();
     let currentQueueFilter = 'all';
     let currentActiveTab = 'facts';
@@ -1147,6 +1149,19 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     let lastRenderedAuditHash = '';
     let lastRenderedSnapshotsHash = '';
     let currentHistorySubTab = 'snapshots';
+
+    function renderTabContent(tabName, force = false) {
+      if (!rawData) return;
+      if (tabName === 'queue') renderQueue(rawData.queue, force);
+      else if (tabName === 'facts') renderFacts(rawData.facts, force);
+      else if (tabName === 'episodes') renderEpisodes(rawData.episodes, force);
+      else if (tabName === 'learnings') renderLearnings(rawData.learnings, force);
+      else if (tabName === 'graph') renderGraph(rawData.links, force);
+      else if (tabName === 'history') {
+        renderSnapshots(rawData.snapshots, force);
+        renderAudit(rawData.audit, force);
+      }
+    }
 
     function switchTab(name) {
       if (name === 'audit') {
@@ -1168,6 +1183,8 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
       const targetTab = document.getElementById('tab-' + name);
       if (targetTab) targetTab.classList.add('active');
+
+      renderTabContent(name);
     }
 
     function switchHistorySubTab(subtab, ev) {
@@ -1183,6 +1200,14 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     }
 
     function clearSearch() {
+      if (searchTimer) {
+        clearTimeout(searchTimer);
+        searchTimer = null;
+      }
+      if (searchAbortController) {
+        searchAbortController.abort();
+        searchAbortController = null;
+      }
       const inp = document.getElementById('inp-search');
       if (inp) inp.value = '';
       document.getElementById('btn-clear-search').style.display = 'none';
@@ -1317,13 +1342,21 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         document.getElementById('cnt-queue').innerText = qCnt;
         document.getElementById('lbl-queue-sub').innerText = qCnt === 0 ? '0 pending (idle)' : `${qCnt} waiting for debounce`;
 
-        renderQueue(data.queue, forceDomRefresh);
-        renderFacts(data.facts, forceDomRefresh);
-        renderEpisodes(data.episodes, forceDomRefresh);
-        renderLearnings(data.learnings, forceDomRefresh);
-        renderGraph(data.links, forceDomRefresh);
-        renderSnapshots(data.snapshots, forceDomRefresh);
-        renderAudit(data.audit, forceDomRefresh);
+        // Always update queue status header and active tab content
+        renderTabContent(currentActiveTab, forceDomRefresh);
+        if (currentActiveTab !== 'queue') {
+          // Keep debounce bar updated even if looking at facts/episodes
+          const debLbl = document.getElementById('lbl-debounce-text');
+          const prog = document.getElementById('progress-debounce');
+          if (data.queue && debLbl && prog) {
+            const idleSec = data.queue.newest_age_seconds || 0;
+            const pct = Math.min(100, Math.round((idleSec / 300) * 100));
+            prog.style.width = pct + '%';
+            debLbl.innerText = data.queue.pending_count > 0
+              ? `Last message ${idleSec}s ago (batch triggers at 300s idle or 15m timeout)`
+              : 'Queue is idle (0 pending turns)';
+          }
+        }
 
         const snCnt = (data.snapshots || []).length;
         const auCnt = (data.audit || []).length;
@@ -2204,7 +2237,11 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     function debounceSearch() {
       clearTimeout(searchTimer);
-      searchTimer = setTimeout(runSearch, 150);
+      if (searchAbortController) {
+        searchAbortController.abort();
+        searchAbortController = null;
+      }
+      searchTimer = setTimeout(runSearch, 350);
     }
 
     async function runSearch() {
@@ -2214,6 +2251,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const clearBtn = document.getElementById('btn-clear-search');
 
       if (!q) {
+        if (searchAbortController) {
+          searchAbortController.abort();
+          searchAbortController = null;
+        }
         clearBtn.style.display = 'none';
         cont.style.display = 'none';
         latLbl.innerText = '0 ms';
@@ -2226,6 +2267,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         return;
       }
 
+      if (searchAbortController) {
+        searchAbortController.abort();
+      }
+      searchAbortController = new AbortController();
+      const signal = searchAbortController.signal;
+
       clearBtn.style.display = 'block';
       document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
       document.querySelectorAll('.stat-card').forEach(c => c.classList.remove('active'));
@@ -2233,7 +2280,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
       const t0 = performance.now();
       try {
-        const res = await fetch('/api/search?q=' + encodeURIComponent(q) + '&user=' + encodeURIComponent(currentProfile));
+        const res = await fetch('/api/search?q=' + encodeURIComponent(q) + '&user=' + encodeURIComponent(currentProfile), { signal });
         const data = await res.json();
         const t1 = performance.now();
         latLbl.innerText = `${(t1 - t0).toFixed(1)} ms (${data.tokens ? data.tokens.join(', ') : ''})`;
@@ -2269,6 +2316,10 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         }
         cont.innerHTML = html;
       } catch (e) {
+        if (e.name === 'AbortError') {
+          // Request was superseded by a newer keystroke; silent ignore
+          return;
+        }
         cont.innerHTML = '<p style="color:var(--danger); text-align:center; padding: 20px;">Search request failed</p>';
       }
     }
@@ -2567,9 +2618,13 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         .replace(/'/g, "&#039;");
     }
 
-    // Auto-refresh every 3 seconds for real-time responsiveness
+    // Auto-refresh when page is visible
     fetchData();
-    setInterval(fetchData, 3000);
+    setInterval(() => {
+      if (document.visibilityState === 'visible') {
+        fetchData();
+      }
+    }, 5000);
   </script>
 </body>
 </html>
@@ -2615,26 +2670,38 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Dashboard-Token")
             self.send_header("Vary", "Origin")
 
+    def _send_bytes(self, body: bytes, content_type: str, status: int = 200, cache_control: Optional[str] = None):
+        accept_encoding = self.headers.get("Accept-Encoding", "")
+        use_gzip = "gzip" in accept_encoding and len(body) > 1024
+        if use_gzip:
+            compressed = gzip.compress(body, compresslevel=6)
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Encoding", "gzip")
+            self.send_header("Content-Length", str(len(compressed)))
+            self.send_header("Vary", "Accept-Encoding")
+            if cache_control:
+                self.send_header("Cache-Control", cache_control)
+            self._set_cors_headers()
+            self.end_headers()
+            self.wfile.write(compressed)
+        else:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            if cache_control:
+                self.send_header("Cache-Control", cache_control)
+            self._set_cors_headers()
+            self.end_headers()
+            self.wfile.write(body)
+
     def _send_json(self, data: dict, status: int = 200):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self._set_cors_headers()
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_bytes(body, "application/json; charset=utf-8", status=status)
 
     def _send_html(self, html: str, status: int = 200):
         body = html.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Frame-Options", "DENY")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Length", str(len(body)))
-        self._set_cors_headers()
-        self.end_headers()
-        self.wfile.write(body)
+        self._send_bytes(body, "text/html; charset=utf-8", status=status, cache_control="no-store")
 
     def _verify_auth(self) -> bool:
         expected = get_or_create_dashboard_token()
@@ -2714,28 +2781,23 @@ class MemoryDashboardHandler(BaseHTTPRequestHandler):
             token = get_or_create_dashboard_token()
             rendered = HTML_TEMPLATE.replace("{{DASHBOARD_TOKEN}}", json.dumps(token).replace("<", "\\u003c"))
             body = rendered.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Frame-Options", "DENY")
-            self.send_header("Referrer-Policy", "no-referrer")
-            self.send_header("Set-Cookie", f"dashboard_token={token}; Path=/; SameSite=Strict; HttpOnly")
-            self.send_header("Content-Length", str(len(body)))
-            self._set_cors_headers()
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_bytes(body, "text/html; charset=utf-8", status=200, cache_control="no-store")
             return
+
+        if path.startswith("/static/"):
+            filename = os.path.basename(path)
+            static_file = BASE_DIR / "static" / filename
+            if static_file.exists() and static_file.is_file():
+                with open(static_file, "rb") as f:
+                    content = f.read()
+                mime = "application/javascript" if filename.endswith(".js") else "application/octet-stream"
+                self._send_bytes(content, mime, status=200, cache_control="public, max-age=604800")
+                return
 
         if path == "/favicon.ico":
             svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100"><text y=".9em" font-size="90">🧠</text></svg>'
             body = svg.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "image/svg+xml")
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "public, max-age=86400")
-            self._set_cors_headers()
-            self.end_headers()
-            self.wfile.write(body)
+            self._send_bytes(body, "image/svg+xml", status=200, cache_control="public, max-age=86400")
             return
 
         user = params.get("user", ["ubuntu"])[0]

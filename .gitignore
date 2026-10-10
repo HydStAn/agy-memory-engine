@@ -11,3 +11,4 @@ __pycache__/
 *.sync.lock
 *.maintenance.lock
 *.worker.lock
+rollback_pr2.sh

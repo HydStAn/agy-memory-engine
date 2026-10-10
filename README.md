@@ -360,6 +360,7 @@ The call is skipped when the candidate set is smaller than `AGY_MEMORY_JEV_GATE_
 A zero-dependency, standalone live web dashboard is included to inspect, search, and monitor memory state in real time:
 
 * **Live FTS5 Search Sandbox:** Test hybrid multilingual queries with sub-millisecond latency metrics.
+* **High-Performance Architecture:** Transparent Gzip compression (~67% payload reduction), locally bundled deferred assets (`vis-network`), and lazy tab rendering for instant mobile & desktop loads.
 * **Interactive Knowledge Graph (vis.js):** Real-time interactive network graph visualization of entity relations with cluster domain filtering, relation-type pruning, and node physics.
 * **Turn Queue & Debounce Monitor:** Visual countdown bar for active conversation debouncing (5m idle / 15m timeout) with an instant *"Process batch now"* trigger.
 * **4-Layer Visualizer:** Browse Facts (Layer 1), Thematic Episodes with status badges (Layer 2), Experiential Learnings (Layer 3), and Knowledge Graph Entity Links (Layer 4).
