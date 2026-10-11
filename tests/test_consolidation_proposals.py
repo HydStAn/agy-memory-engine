@@ -109,5 +109,58 @@ class ConsolidationProposalTests(unittest.TestCase):
             memory.main()
 
 
+    def test_learnings_export_and_apply_merges_and_purges(self):
+        memory.upsert_learning('l1', 'architecture', 'heuristic 1', 'ctx1', 'kw1')
+        memory.upsert_learning('l2', 'architecture', 'heuristic 1 overlapping', 'ctx2', 'kw2')
+        memory.upsert_learning('l3_obsolete', 'dev', 'one-time bugfix in test script', 'ctx3', 'kw3')
+        memory.link_entities('l2', 'a', 'depends_on')
+        memory.link_entities('l3_obsolete', 'solo', 'depends_on')
+
+        snapshot = memory.export_consolidation_snapshot(entity_type='learnings')
+        self.assertIn('architecture', snapshot['categories'])
+        self.assertIn('dev', snapshot['categories'])
+        self.assertIn('l1', snapshot['revisions'])
+        self.assertIn('l2', snapshot['revisions'])
+        self.assertIn('l3_obsolete', snapshot['revisions'])
+
+        proposals = {
+            'merges': [{
+                'target_id': 'l1',
+                'category': 'architecture',
+                'insight': 'canonical heuristic 1',
+                'context': 'ctx merged',
+                'keywords': 'kw1 kw2',
+                'merged_ids': ['l2'],
+                'rationale': 'duplicate'
+            }],
+            'purges': [{
+                'id': 'l3_obsolete',
+                'rationale': 'obsolete bugfix'
+            }]
+        }
+
+        # Dry run
+        dry_res = memory.consolidate_learnings(dry_run=True, proposals=proposals, snapshot=snapshot)
+        self.assertEqual(len(dry_res), 2)
+        with schema.db_session() as conn:
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM learnings WHERE id='l2'").fetchone())
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM learnings WHERE id='l3_obsolete'").fetchone())
+
+        # Apply
+        res = memory.consolidate_learnings(dry_run=False, proposals=proposals, snapshot=snapshot)
+        self.assertEqual(len(res), 2)
+        with schema.db_session() as conn:
+            self.assertIsNone(conn.execute("SELECT 1 FROM learnings WHERE id='l2'").fetchone())
+            self.assertIsNone(conn.execute("SELECT 1 FROM learnings WHERE id='l3_obsolete'").fetchone())
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM learnings WHERE id='l1'").fetchone())
+            # entity_links rewired for l2 -> l1
+            self.assertIsNotNone(conn.execute("SELECT 1 FROM entity_links WHERE source_id='l1' AND target_id='a'").fetchone())
+            # entity_links purged for l3_obsolete
+            self.assertIsNone(conn.execute("SELECT 1 FROM entity_links WHERE source_id='l3_obsolete'").fetchone())
+            # consolidation log recorded
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM consolidation_log WHERE action='merge'").fetchone()[0], 1)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM consolidation_log WHERE action='purge'").fetchone()[0], 1)
+
+
 if __name__ == '__main__':
     unittest.main()

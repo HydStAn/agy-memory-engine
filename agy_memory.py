@@ -896,24 +896,20 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
    - Status: "active" (ongoing), "cooling" (cooling down), "historic" (concluded past), "resolved" (fixed/completed).
    ALLOWED TOPICS: family, health, travel, finance, home, dev, infra, insurance, music, work, realestate, trading, general
 
-3. EXPERIENTIAL LEARNINGS ("learnings"): ONLY personal heuristics, behavioral insights, and reusable rules of thumb that will help in FUTURE similar situations.
+3. EXPERIENTIAL LEARNINGS ("learnings"):
+   CRITICAL: DEFAULT TO EMPTY: "learnings": []
+   STRICT THRESHOLD: Only extract a learning if the user EXPLICITLY instructed an enduring rule, heuristic, behavioral preference, or guideline for the future (e.g. "Merk dir für die Zukunft", "In Zukunft immer...", "Regel:", "/learn") OR if an enduring personal behavioral preference was explicitly stated by the user.
    ALLOWED CATEGORIES: {', '.join(sorted(CANONICAL_LEARNING_CATEGORIES))}
 
-   ✅ GOOD learnings (store these):
-   - "Karin prefers bullet-point summaries for financial topics" (personal communication insight)
-   - "E-Mails an Dr. Bär müssen extrem kurz sein" (reusable behavioral rule)
-   - "PK-Einkäufe nicht ins Depot, sondern liquide halten" (financial heuristic)
-   - "Garmin shows 'Detraining' even with daily exercise if no GPS activity is recorded" (reusable device knowledge)
-   - "When self-restarting a systemd service from within, always decouple via sleep+nohup" (reusable ops pattern)
-
-   🚫 DO NOT store as learnings:
-   - One-time bug fixes or debugging sessions ("Fixed SQLite UTC conversion in dashboard.py")
-   - Specific pricing, cancellation terms, fees, or reservation conditions for a single venue/restaurant/shop (these belong in facts or external docs, NEVER learnings)
-   - Implementation details of a specific codebase or single PR workarounds
-   - Version-specific migration notes
-   - Configuration changes made once ("Set model to gemini-3.8-flash-low")
-   - API quirks of a specific service ("Spotify 403 on playlist endpoint")
-   These belong in code comments, commit messages, or facts — NOT learnings.
+   🚫 NEVER store as learnings:
+   - Routine coding, debugging, refactoring, or implementation steps (even if a clever technical trick was found).
+   - One-time bug fixes or debugging sessions ("Fixed SQLite UTC conversion in dashboard.py").
+   - Implementation details of a specific codebase, library quirks, CLI flags, workaround scripts, or single PR workarounds.
+   - Assistant reflections, technical summaries, or self-congratulatory insights.
+   - Specific pricing, cancellation terms, fees, or reservation conditions for a single venue/restaurant/shop.
+   - Version-specific migration notes or single tool configurations.
+   Technical solutions and findings belong in code comments, git commits, or project docs — NEVER in learnings.
+   If the user did NOT explicitly state an enduring rule or personal heuristic, ALWAYS return "learnings": [].
 
 4. ENTITY LINKS ("entity_links"): Structural relationships between existing entities.
    You MUST use ONLY these canonical relation types:
@@ -930,7 +926,7 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
 - Keep episodes rich with context and stance (3-5 sentences).
 - Include multilingual keywords (German/English synonyms, related query terms).
 - CRITICAL: Prefer EMPTY arrays over low-value entries. When in doubt, do NOT store it.
-- A learning must pass this test: "Would this insight help me handle a SIMILAR situation in the future?" If no, don't store it.
+- A learning must pass this test: "Did the user explicitly state this as an enduring rule or personal heuristic?" If no, return empty array [].
 - Entity links must use ONLY the canonical relation types listed above.
 
 User: {user_prompt}
@@ -1233,27 +1229,48 @@ Respond ONLY with valid JSON in this exact structure:
     return {"merges": consolidations}
 
 
-def export_consolidation_snapshot(category: str = None) -> dict:
-    """Facts grouped by category (2+ per category) plus the revision state that
+def export_consolidation_snapshot(category: str = None, entity_type: str = "memories") -> dict:
+    """Entities (facts or learnings) grouped by category plus the revision state that
     a later proposal apply is checked against."""
+    if entity_type not in ("memories", "learnings"):
+        raise ValueError(f"Unsupported entity_type: {entity_type}")
     with db_session() as conn:
-        rows = conn.execute("SELECT id, category, fact, keywords FROM memories ORDER BY category, id").fetchall()
-        revisions = dict(conn.execute("SELECT entity_id,revision FROM entity_revisions WHERE entity_type='memories'"))
+        if entity_type == "memories":
+            rows = conn.execute("SELECT id, category, fact, keywords FROM memories ORDER BY category, id").fetchall()
+        else:
+            rows = conn.execute("SELECT id, category, insight, context, keywords FROM learnings ORDER BY category, id").fetchall()
+        revisions = dict(conn.execute("SELECT entity_id, revision FROM entity_revisions WHERE entity_type=?", (entity_type,)))
         generation = schema.get_db_generation(conn)
     categories = {}
-    for fid, cat, fact, kws in rows:
-        cat_name = cat or "general"
-        if category and cat_name != category:
-            continue
-        categories.setdefault(cat_name, []).append({
-            "id": fid,
-            "category": cat_name,
-            "fact": fact,
-            "keywords": kws or ""
-        })
-    categories = {k: v for k, v in categories.items() if len(v) >= 2}
-    exported = {f["id"] for facts in categories.values() for f in facts}
+    if entity_type == "memories":
+        for fid, cat, fact, kws in rows:
+            cat_name = cat or "general"
+            if category and cat_name != category:
+                continue
+            categories.setdefault(cat_name, []).append({
+                "id": fid,
+                "category": cat_name,
+                "fact": fact,
+                "keywords": kws or ""
+            })
+        categories = {k: v for k, v in categories.items() if len(v) >= 2}
+    else:
+        for lid, cat, insight, ctx, kws in rows:
+            cat_name = cat or "general"
+            if category and cat_name != category:
+                continue
+            categories.setdefault(cat_name, []).append({
+                "id": lid,
+                "category": cat_name,
+                "insight": insight,
+                "context": ctx or "",
+                "keywords": kws or ""
+            })
+        categories = {k: v for k, v in categories.items() if len(v) >= 1}
+
+    exported = {item["id"] for items in categories.values() for item in items}
     return {
+        "entity_type": entity_type,
         "generation": generation,
         "revisions": {fid: rev for fid, rev in revisions.items() if fid in exported},
         "categories": categories,
@@ -1384,6 +1401,253 @@ def consolidate_memories(dry_run: bool = False, proposals: dict = None, snapshot
                 "diff_summary": diff_summary
             })
             logger.info(f"[CONSOLIDATE] {diff_summary} (Rationale: {rationale})")
+    except Exception as e:
+        raise SyncExtractionError(f"Consolidation failed: {e}") from e
+
+    return consolidations
+
+
+def _propose_consolidations_learnings(categories_to_check: dict) -> dict:
+    """Ask the extraction LLM for merge & purge proposals over the grouped learnings."""
+    canonical_cats = ", ".join(sorted(CANONICAL_LEARNING_CATEGORIES))
+    merges = []
+    purges = []
+
+    batches = []
+    for cat_name, items in sorted(categories_to_check.items()):
+        if len(items) <= 25:
+            batches.append({cat_name: items})
+        else:
+            chunk_size = 20
+            for i in range(0, len(items), chunk_size):
+                batches.append({cat_name: items[i:i+chunk_size]})
+
+    for batch_categories in batches:
+        items_json = json.dumps(batch_categories, ensure_ascii=False, indent=2)
+        prompt = f"""You are the Experiential Learnings Consolidation & Pruning Engine for the user.
+Review the following learnings grouped by category.
+1. MERGE: Combine duplicate, heavily overlapping, or closely related heuristics into ONE canonical, authoritative learning.
+2. PURGE: Mark any one-time bug fixes, single PR implementation notes, temporary CLI workarounds, or obsolete hyper-specific tricks for deletion.
+3. PRESERVE: If a learning is a genuinely enduring, useful rule of thumb or behavioral heuristic, leave it untouched (do not list it in merges or purges).
+
+Categories and Learnings:
+{items_json}
+
+ALLOWED CATEGORIES: {canonical_cats}
+
+Respond ONLY with valid JSON:
+{{
+  "merges": [
+    {{
+      "target_id": "authoritative.key",
+      "category": "architecture",
+      "insight": "Clean authoritative heuristic...",
+      "context": "Context...",
+      "keywords": "keywords",
+      "merged_ids": ["redundant.key.1", "redundant.key.2"],
+      "rationale": "Reason for merge"
+    }}
+  ],
+  "purges": [
+    {{
+      "id": "obsolete.key",
+      "rationale": "One-time bugfix note with no future heuristic value"
+    }}
+  ]
+}}
+"""
+        out = _infer_json(prompt, timeout=120)
+        json_match = re.fullmatch(r'\{.*\}', out.strip(), re.DOTALL)
+        if not json_match:
+            raise SyncExtractionError("Consolidation output must be a JSON object")
+        try:
+            batch_data = json.loads(json_match.group(0))
+            if isinstance(batch_data, dict):
+                if isinstance(batch_data.get("merges"), list):
+                    merges.extend(batch_data["merges"])
+                if isinstance(batch_data.get("purges"), list):
+                    purges.extend(batch_data["purges"])
+        except ValueError as e:
+            raise SyncExtractionError(f"Consolidation failed: {e}") from e
+
+    return {"merges": merges, "purges": purges}
+
+
+def consolidate_learnings(dry_run: bool = False, proposals: dict = None, snapshot: dict = None) -> list:
+    """Analyze all stored learnings per category with Gemini LLM or externally authored proposals,
+    detect duplicate/overlapping heuristics, merge them cleanly into a single authoritative record,
+    purge obsolete/one-time bugfix learnings, rewiring entity_links and logging to consolidation_log.
+    """
+    if proposals is not None and snapshot is None:
+        raise SyncExtractionError("Consolidation proposals require the snapshot they were written against")
+    if snapshot is None:
+        snapshot = export_consolidation_snapshot(entity_type="learnings")
+    if not isinstance(snapshot, dict) or not all(k in snapshot for k in ("categories", "revisions", "generation")):
+        raise SyncExtractionError("Consolidation snapshot must come from export_consolidation_snapshot")
+    if snapshot.get("entity_type") not in (None, "learnings"):
+        raise SyncExtractionError("Consolidation snapshot entity_type mismatch: expected 'learnings'")
+    categories_to_check = snapshot["categories"]
+    consolidation_revisions = snapshot["revisions"]
+    consolidation_gen = snapshot["generation"]
+
+    if not categories_to_check:
+        logger.info("[CONSOLIDATE] No learnings categories to consolidate.")
+        return []
+
+    if proposals is None:
+        proposals = _propose_consolidations_learnings(categories_to_check)
+
+    consolidations = []
+    data = proposals
+    try:
+        if not isinstance(data, dict):
+            raise SyncExtractionError('Consolidation requires a dictionary with merges and/or purges')
+        merges_list = data.get('merges', [])
+        purges_list = data.get('purges', [])
+        if not isinstance(merges_list, list) or not isinstance(purges_list, list):
+            raise SyncExtractionError('Malformed consolidation proposal: merges and purges must be lists')
+
+        # Validate merges schema
+        for merge in merges_list:
+            if not isinstance(merge, dict) or not isinstance(merge.get('merged_ids'), list) or any(not isinstance(mid, str) or not mid.strip() for mid in merge['merged_ids']):
+                raise SyncExtractionError('Malformed consolidation merge proposal')
+            for field in ('target_id', 'category', 'insight'):
+                require_text(merge.get(field), field)
+
+        # Validate purges schema
+        for purge in purges_list:
+            if not isinstance(purge, dict) or not isinstance(purge.get('id'), str) or not purge['id'].strip():
+                raise SyncExtractionError('Malformed consolidation purge proposal')
+
+        # Process merges
+        for merge in merges_list:
+            target_id = require_text(merge.get("target_id"), "target_id")
+            raw_cat = require_text(merge.get("category", "general"), "category")
+            cat_name = _normalize_category(raw_cat, CANONICAL_LEARNING_CATEGORIES)
+            insight_text = require_text(merge.get("insight"), "insight")
+            context_text = merge.get("context", "")
+            kws = merge.get("keywords", "")
+            rationale = merge.get("rationale", "")
+
+            raw_merged = merge.get("merged_ids", [])
+            merged_ids = []
+            for m in raw_merged:
+                mid = require_text(m, "merged_id")
+                if mid != target_id and mid not in merged_ids:
+                    merged_ids.append(mid)
+
+            if not target_id or not merged_ids or not insight_text:
+                continue
+
+            category_items = categories_to_check.get(raw_cat, categories_to_check.get(cat_name, []))
+            existing_merged = [m for m in merged_ids if any(f["id"] == m for f in category_items)]
+            existing_merged = [m for m in existing_merged if m != target_id]
+            if not existing_merged:
+                continue
+
+            diff_summary = f"Merged [{', '.join(existing_merged)}] into [{target_id}]"
+
+            with db_session() as conn, conn:
+                if not dry_run:
+                    conn.execute("BEGIN IMMEDIATE")
+                if schema.get_db_generation(conn) != consolidation_gen:
+                    logger.warning('Rejected stale consolidation proposal for %s: database generation changed', target_id)
+                    continue
+                stale = False
+                for entity_id in set(existing_merged + [target_id]):
+                    row = conn.execute("SELECT revision FROM entity_revisions WHERE entity_type='learnings' AND entity_id=?", (entity_id,)).fetchone()
+                    if (row[0] if row else None) != consolidation_revisions.get(entity_id):
+                        stale = True
+                if stale:
+                    logger.warning('Rejected stale consolidation proposal for %s', target_id)
+                    continue
+                target = conn.execute("SELECT id, category, insight, context, keywords FROM learnings WHERE id = ?", (target_id,)).fetchone()
+                allowed_ids = {f["id"] for f in category_items}
+                if target and (target_id not in allowed_ids or _is_protected_key(target_id, {"category": target[1]})):
+                    continue
+                # Collision guard: new ID must not exist in other layers
+                if not target and any(conn.execute(f"SELECT 1 FROM {table} WHERE id = ?", (target_id,)).fetchone() for table in ("memories", "episodes")):
+                    continue
+                sources = []
+                for mid in existing_merged:
+                    row = conn.execute("SELECT id, category, insight, context, keywords FROM learnings WHERE id = ?", (mid,)).fetchone()
+                    if not row or row[1] != raw_cat or _is_protected_key(mid, {"category": row[1]}):
+                        break
+                    sources.append(row)
+                if len(sources) != len(existing_merged) or (target and target[1] != raw_cat):
+                    continue
+
+                placeholders = ",".join("?" for _ in existing_merged)
+                links = conn.execute(f"SELECT source_id, target_id, relation FROM entity_links WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})", existing_merged * 2).fetchall()
+                if not dry_run:
+                    upsert_learning(target_id, cat_name, insight_text, context_text, kws, connection=conn)
+                    for src, tgt, relation in links:
+                        conn.execute("DELETE FROM entity_links WHERE source_id=? AND target_id=? AND relation=?", (src, tgt, relation))
+                        new_src = target_id if src in existing_merged else src
+                        new_tgt = target_id if tgt in existing_merged else tgt
+                        if new_src != new_tgt:
+                            conn.execute("INSERT OR IGNORE INTO entity_links VALUES (?, ?, ?)", (new_src, new_tgt, relation))
+                    for mid in existing_merged:
+                        if mid != target_id:
+                            conn.execute("DELETE FROM learnings WHERE id = ?", (mid,))
+                    assert conn.execute("SELECT 1 FROM learnings WHERE id = ?", (target_id,)).fetchone() is not None
+                    preimage = json.dumps({"summary": diff_summary, "learnings": sources, "target": target, "entity_links": links}, ensure_ascii=False)
+                    conn.execute("""INSERT INTO consolidation_log
+                        (action, category, target_id, merged_ids, diff_summary, rationale)
+                        VALUES ('merge', ?, ?, ?, ?, ?)""",
+                        (cat_name, target_id, json.dumps(existing_merged), preimage, rationale))
+
+            consolidations.append({
+                "action": "merge",
+                "category": cat_name,
+                "target_id": target_id,
+                "merged_ids": existing_merged,
+                "insight": insight_text,
+                "rationale": rationale,
+                "diff_summary": diff_summary
+            })
+            logger.info(f"[CONSOLIDATE] {diff_summary} (Rationale: {rationale})")
+
+        # Process purges
+        for purge in purges_list:
+            purge_id = require_text(purge.get("id"), "id")
+            rationale = purge.get("rationale", "Obsolete or low-value single-case note")
+
+            with db_session() as conn, conn:
+                if not dry_run:
+                    conn.execute("BEGIN IMMEDIATE")
+                if schema.get_db_generation(conn) != consolidation_gen:
+                    logger.warning('Rejected stale purge proposal for %s: database generation changed', purge_id)
+                    continue
+                row = conn.execute("SELECT revision FROM entity_revisions WHERE entity_type='learnings' AND entity_id=?", (purge_id,)).fetchone()
+                if (row[0] if row else None) != consolidation_revisions.get(purge_id):
+                    logger.warning('Rejected stale purge proposal for %s', purge_id)
+                    continue
+                existing_item = conn.execute("SELECT id, category, insight, context, keywords FROM learnings WHERE id = ?", (purge_id,)).fetchone()
+                if not existing_item or _is_protected_key(purge_id, {"category": existing_item[1]}):
+                    continue
+
+                links = conn.execute("SELECT source_id, target_id, relation FROM entity_links WHERE source_id=? OR target_id=?", (purge_id, purge_id)).fetchall()
+                diff_summary = f"Purged [{purge_id}]"
+
+                if not dry_run:
+                    conn.execute("DELETE FROM entity_links WHERE source_id=? OR target_id=?", (purge_id, purge_id))
+                    conn.execute("DELETE FROM learnings WHERE id = ?", (purge_id,))
+                    preimage = json.dumps({"summary": diff_summary, "learning": existing_item, "entity_links": links}, ensure_ascii=False)
+                    conn.execute("""INSERT INTO consolidation_log
+                        (action, category, target_id, merged_ids, diff_summary, rationale)
+                        VALUES ('purge', ?, ?, '[]', ?, ?)""",
+                        (existing_item[1], purge_id, preimage, rationale))
+
+            consolidations.append({
+                "action": "purge",
+                "category": existing_item[1] if existing_item else "general",
+                "target_id": purge_id,
+                "rationale": rationale,
+                "diff_summary": diff_summary
+            })
+            logger.info(f"[CONSOLIDATE] {diff_summary} (Rationale: {rationale})")
+
     except Exception as e:
         raise SyncExtractionError(f"Consolidation failed: {e}") from e
 
@@ -1773,10 +2037,11 @@ def main():
     ag.add_argument("--days-to-historic", type=int, default=90)
 
     # Semantic consolidation CLI command
-    cs = subparsers.add_parser("consolidate", help="Run LLM semantic deduplication & consolidation of atomic facts")
+    cs = subparsers.add_parser("consolidate", help="Run LLM semantic deduplication & consolidation of atomic facts or learnings")
+    cs.add_argument("--type", choices=["memories", "learnings"], default="memories", help="Entity type to consolidate (default: memories)")
     cs.add_argument("--apply", action="store_true", help="Apply consolidations to database")
     cs.add_argument("--dry-run", action="store_true", help="Show proposed consolidations without writing")
-    cs.add_argument("--export-file", help="Write the grouped-facts snapshot for an external reviewer to this path, then exit")
+    cs.add_argument("--export-file", help="Write the grouped snapshot for an external reviewer to this path, then exit")
     cs.add_argument("--category", help="With --export-file: export only this category")
     cs.add_argument("--proposals-file", help="Apply merge proposals from this JSON file instead of calling the LLM (dry run unless --apply)")
     cs.add_argument("--snapshot-file", help="Snapshot the proposals were written against (required with --proposals-file)")
@@ -1841,10 +2106,12 @@ def main():
         res = age_episodes(args.days_to_cooling, args.days_to_historic)
         print(f"Cooled: {len(res['cooled'])}, Historic: {len(res['historied'])}")
     elif args.command == "consolidate":
+        entity_type = getattr(args, "type", "memories")
         if args.export_file:
-            snapshot = export_consolidation_snapshot(category=args.category)
+            snapshot = export_consolidation_snapshot(category=args.category, entity_type=entity_type)
             Path(args.export_file).write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
             print(json.dumps({"exported": args.export_file,
+                              "entity_type": entity_type,
                               "categories": {k: len(v) for k, v in snapshot["categories"].items()}}))
         elif args.proposals_file:
             if not args.snapshot_file:
@@ -1854,11 +2121,17 @@ def main():
             apply_flag = args.apply and not args.dry_run
             if apply_flag:
                 create_snapshot(tag="consolidate")
-            merges = consolidate_memories(dry_run=not apply_flag, proposals=proposals, snapshot=snapshot)
-            print(json.dumps({"applied": apply_flag, "merges": merges}, ensure_ascii=False, indent=2))
+            if snapshot.get("entity_type") == "learnings" or entity_type == "learnings":
+                results = consolidate_learnings(dry_run=not apply_flag, proposals=proposals, snapshot=snapshot)
+            else:
+                results = consolidate_memories(dry_run=not apply_flag, proposals=proposals, snapshot=snapshot)
+            print(json.dumps({"applied": apply_flag, "entity_type": snapshot.get("entity_type", entity_type), "results": results}, ensure_ascii=False, indent=2))
         else:
             apply_flag = args.apply or (not args.dry_run)
-            consolidate_memories(dry_run=not apply_flag)
+            if entity_type == "learnings":
+                consolidate_learnings(dry_run=not apply_flag)
+            else:
+                consolidate_memories(dry_run=not apply_flag)
     elif args.command in ("compact", "optimize"):
         optimize_db(
             apply_changes=getattr(args, 'apply', True),
