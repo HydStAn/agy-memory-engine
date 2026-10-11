@@ -897,19 +897,23 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
    ALLOWED TOPICS: family, health, travel, finance, home, dev, infra, insurance, music, work, realestate, trading, general
 
 3. EXPERIENTIAL LEARNINGS ("learnings"):
-   CRITICAL: DEFAULT TO EMPTY: "learnings": []
-   STRICT THRESHOLD: Only extract a learning if the user EXPLICITLY instructed an enduring rule, heuristic, behavioral preference, or guideline for the future (e.g. "Merk dir für die Zukunft", "In Zukunft immer...", "Regel:", "/learn") OR if an enduring personal behavioral preference was explicitly stated by the user.
+   DEFAULT TO EMPTY: "learnings": []
+   Extract a learning ONLY when at least one of these 4 specific trigger conditions is met:
+   a) USER CORRECTION & DIRECTIVE: The user corrects an assumption, behavior, or approach ("Nein, nicht so...", "Mach das künftig über...", "Wir handhaben das immer so...").
+   b) EXPLICIT RULE / HEURISTIC: The user explicitly declares an enduring rule, heuristic, or guideline (e.g. "/learn", "Merk dir:", "Regel:", "Faustregel:").
+   c) ENDURING PERSONAL PREFERENCE: The user communicates a stable personal, behavioral, or communication preference (e.g. formatting styles, preferred communication channels).
+   d) VERIFIED DEAD-END & HARD ARCHITECTURAL DISCOVERY: An approach proved fundamentally blocked by external reality (e.g. strict WAF IP blocking, OS security boundary, hardware protocol barrier) and required a reusable architectural workaround.
    ALLOWED CATEGORIES: {', '.join(sorted(CANONICAL_LEARNING_CATEGORIES))}
 
    🚫 NEVER store as learnings:
-   - Routine coding, debugging, refactoring, or implementation steps (even if a clever technical trick was found).
-   - One-time bug fixes or debugging sessions ("Fixed SQLite UTC conversion in dashboard.py").
-   - Implementation details of a specific codebase, library quirks, CLI flags, workaround scripts, or single PR workarounds.
-   - Assistant reflections, technical summaries, or self-congratulatory insights.
+   - Routine coding, debugging, refactoring, or implementation steps (even if a clever trick was found).
+   - One-time bug fixes or simple troubleshooting sessions ("Fixed SQLite UTC conversion in dashboard.py").
+   - Ordinary library quirks, CLI flags, syntax fixes, or tool configuration steps.
+   - Assistant reflections, technical summaries, or self-congratulatory lessons.
    - Specific pricing, cancellation terms, fees, or reservation conditions for a single venue/restaurant/shop.
-   - Version-specific migration notes or single tool configurations.
-   Technical solutions and findings belong in code comments, git commits, or project docs — NEVER in learnings.
-   If the user did NOT explicitly state an enduring rule or personal heuristic, ALWAYS return "learnings": [].
+   - Version-specific migration notes.
+   Routine technical takeaways belong in git commit messages, code comments, or documentation — NEVER in learnings.
+   If none of the 4 trigger conditions (a-d) apply, ALWAYS return "learnings": [].
 
 4. ENTITY LINKS ("entity_links"): Structural relationships between existing entities.
    You MUST use ONLY these canonical relation types:
@@ -926,7 +930,7 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
 - Keep episodes rich with context and stance (3-5 sentences).
 - Include multilingual keywords (German/English synonyms, related query terms).
 - CRITICAL: Prefer EMPTY arrays over low-value entries. When in doubt, do NOT store it.
-- A learning must pass this test: "Did the user explicitly state this as an enduring rule or personal heuristic?" If no, return empty array [].
+- A learning must pass this test: "Does this represent a user correction, an explicit rule, an enduring preference, or a verified architectural dead-end?" If no, return empty array [].
 - Entity links must use ONLY the canonical relation types listed above.
 
 User: {user_prompt}
