@@ -448,6 +448,22 @@ python3 -m unittest discover tests/ -v
 
 ## 🚀 Release Notes
 
+### v2.6.0 (2026-10-23)
+- **Continuous Automated Learnings Consolidation**:
+  - Integrated `consolidate_learnings()` directly into `optimize_db()`, enabling seamless, automated consolidation during nightly maintenance (`04:30 Uhr` via cron) and autonomous worker cycles.
+  - Automatically deduplicates overlapping heuristics and purges transient bugfix and single-PR notes alongside atomic facts.
+- **Extended Ephemeral Fact Lifecycle & Pruning**:
+  - Upgraded `prune_stale_calendar_facts()` into a unified ephemeral fact lifecycle engine.
+  - Detects transient transaction and travel facts (`%.flug_%`, `%.hotel_%`, `%.hammam_%`, `%.rueckreise_%`, `shopping.%order_%`) with past dates (>14 days grace window) and automatically purges them, preventing fact-store dilution while strictly preserving long-term dates (medical, contracts, future bookings).
+- **Event-Triggered Learning Extraction Refinement**:
+  - Tightened turn extraction criteria in `agy_memory.py` to 3 core triggers (user corrections, explicit rules/heuristics, and stable personal preferences), eliminating routine technical debugging noise.
+- **Self-Healing Quality Watchdog Architecture**:
+  - Refactored `watchdog_memory_learnings.py` to measure incoming learning noise dynamically against the latest `consolidation_log` timestamp.
+  - Automated autonomous background consolidation triggering when threshold (>15 new items) is reached, replacing manual CLI intervention prompts.
+- **Dashboard & Environment Security Hardening**:
+  - Ensured correct precedence for `~/.gemini/memory.env` overrides over project defaults.
+  - Hardened authenticated HTML responses and preserved security headers.
+
 ### v2.5.0 (2026-09-29)
 - **Domain Taxonomy Expansion & De-concentration**:
   - Expanded `CANONICAL_LEARNING_CATEGORIES` with dedicated domains: `ux`, `dev`, `infra`, and `media`, relieving the catch-all `architecture` bucket.
