@@ -898,11 +898,10 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
 
 3. EXPERIENTIAL LEARNINGS ("learnings"):
    DEFAULT TO EMPTY: "learnings": []
-   Extract a learning ONLY when at least one of these 4 specific trigger conditions is met:
+   Extract a learning ONLY when at least one of these 3 specific trigger conditions is met:
    a) USER CORRECTION & DIRECTIVE: The user corrects an assumption, behavior, or approach ("Nein, nicht so...", "Mach das künftig über...", "Wir handhaben das immer so...").
    b) EXPLICIT RULE / HEURISTIC: The user explicitly declares an enduring rule, heuristic, or guideline (e.g. "/learn", "Merk dir:", "Regel:", "Faustregel:").
    c) ENDURING PERSONAL PREFERENCE: The user communicates a stable personal, behavioral, or communication preference (e.g. formatting styles, preferred communication channels).
-   d) VERIFIED DEAD-END & HARD ARCHITECTURAL DISCOVERY: An approach proved fundamentally blocked by external reality (e.g. strict WAF IP blocking, OS security boundary, hardware protocol barrier) and required a reusable architectural workaround.
    ALLOWED CATEGORIES: {', '.join(sorted(CANONICAL_LEARNING_CATEGORIES))}
 
    🚫 NEVER store as learnings:
@@ -913,7 +912,7 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
    - Specific pricing, cancellation terms, fees, or reservation conditions for a single venue/restaurant/shop.
    - Version-specific migration notes.
    Routine technical takeaways belong in git commit messages, code comments, or documentation — NEVER in learnings.
-   If none of the 4 trigger conditions (a-d) apply, ALWAYS return "learnings": [].
+   If none of the 3 trigger conditions (a-c) apply, ALWAYS return "learnings": [].
 
 4. ENTITY LINKS ("entity_links"): Structural relationships between existing entities.
    You MUST use ONLY these canonical relation types:
@@ -930,7 +929,7 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
 - Keep episodes rich with context and stance (3-5 sentences).
 - Include multilingual keywords (German/English synonyms, related query terms).
 - CRITICAL: Prefer EMPTY arrays over low-value entries. When in doubt, do NOT store it.
-- A learning must pass this test: "Does this represent a user correction, an explicit rule, an enduring preference, or a verified architectural dead-end?" If no, return empty array [].
+- A learning must pass this test: "Does this represent a user correction, an explicit rule, or an enduring personal preference?" If no, return empty array [].
 - Entity links must use ONLY the canonical relation types listed above.
 
 User: {user_prompt}
@@ -1691,7 +1690,7 @@ def prune_orphan_links(dry_run: bool = False) -> int:
         return len(orphans)
 
 
-def prune_stale_calendar_facts(dry_run: bool = False, reference_date=None) -> list:
+def prune_stale_calendar_facts(dry_run: bool = False, reference_date=None, grace_days: int = 14) -> list:
     """Identify and prune past one-off calendar appointments and reservations from memories."""
     if reference_date is None:
         reference_date = datetime.date.today()
@@ -1699,15 +1698,32 @@ def prune_stale_calendar_facts(dry_run: bool = False, reference_date=None) -> li
         reference_date = datetime.date.fromisoformat(reference_date)
 
     stale_ids = []
+    calendar_patterns = [
+        "id LIKE 'calendar.appointment.%'",
+        "id LIKE 'calendar.reservation.%'",
+        "id LIKE 'calendar.vote.%'",
+    ]
+    ephemeral_patterns = [
+        "id LIKE '%flug_%'",
+        "id LIKE '%hotel_%'",
+        "id LIKE '%hammam_%'",
+        "id LIKE '%rueckreise_%'",
+        "id LIKE 'shopping.%order_%'",
+    ]
+    query = f"SELECT id, fact FROM memories WHERE {' OR '.join(calendar_patterns + ephemeral_patterns)}"
+    cutoff_ephemeral = reference_date - datetime.timedelta(days=grace_days)
+
     with db_session() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id, fact FROM memories WHERE id LIKE 'calendar.appointment.%' OR id LIKE 'calendar.reservation.%' OR id LIKE 'calendar.vote.%'")
+        cursor.execute(query)
         for mid, fact in cursor.fetchall():
             m = re.search(r'202\d{5}', mid)
             if m:
                 try:
                     dt = datetime.datetime.strptime(m.group(0), '%Y%m%d').date()
-                    if dt < reference_date:
+                    is_calendar = any(mid.startswith(p) for p in ("calendar.appointment.", "calendar.reservation.", "calendar.vote."))
+                    cutoff = reference_date if is_calendar else cutoff_ephemeral
+                    if dt < cutoff:
                         stale_ids.append(mid)
                 except ValueError:
                     pass
@@ -1821,6 +1837,11 @@ def optimize_db(apply_changes: bool = False, age_decay: bool = True, consolidate
         age_episodes()
     if consolidate:
         stats["merges"] = consolidate_memories()
+        try:
+            stats["learning_merges"] = consolidate_learnings()
+        except Exception as e:
+            logger.warning("[CONSOLIDATE] Failed to consolidate learnings: %s", e)
+            stats["learning_merges"] = []
     stats["normalized"] = normalize_existing_categories()
     stats["stale_calendar_facts"] = len(prune_stale_calendar_facts(dry_run=False))
     stats["orphan_links"] = prune_orphan_links()

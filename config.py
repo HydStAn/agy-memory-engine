@@ -30,13 +30,13 @@ def _load_env_file(filepath: Path) -> dict:
     return env_vars
 
 
-# Load from project .env first, then ~/.gemini/memory.env fallback
+# Load from project .env first, then ~/.gemini/memory.env overrides
 _PROJECT_ENV = Path(__file__).resolve().parent / ".env"
 _USER_ENV = Path.home() / ".gemini" / "memory.env"
 
 _FILE_VARS = {}
-_FILE_VARS.update(_load_env_file(_USER_ENV))
 _FILE_VARS.update(_load_env_file(_PROJECT_ENV))
+_FILE_VARS.update(_load_env_file(_USER_ENV))
 
 
 def get_config(key: str, default: str = "") -> str:
