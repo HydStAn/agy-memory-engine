@@ -905,6 +905,8 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
    ALLOWED CATEGORIES: {', '.join(sorted(CANONICAL_LEARNING_CATEGORIES))}
 
    🚫 NEVER store as learnings:
+   - Technical dead-ends, architecture patterns, hardware protocol barriers, framework quirks, or OS/system workarounds (even if reusable) — these belong in git commits, code comments, or project docs/skills.
+   - Any rules, guidelines, deductions, or best practices proposed or formulated by the ASSISTANT. Learnings MUST strictly originate directly from the USER.
    - Routine coding, debugging, refactoring, or implementation steps (even if a clever trick was found).
    - One-time bug fixes or simple troubleshooting sessions ("Fixed SQLite UTC conversion in dashboard.py").
    - Ordinary library quirks, CLI flags, syntax fixes, or tool configuration steps.
@@ -912,7 +914,7 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
    - Specific pricing, cancellation terms, fees, or reservation conditions for a single venue/restaurant/shop.
    - Version-specific migration notes.
    Routine technical takeaways belong in git commit messages, code comments, or documentation — NEVER in learnings.
-   If none of the 3 trigger conditions (a-c) apply, ALWAYS return "learnings": [].
+   If none of the 3 trigger conditions (a-c) apply or if the insight was formulated by the assistant, ALWAYS return "learnings": [].
 
 4. ENTITY LINKS ("entity_links"): Structural relationships between existing entities.
    You MUST use ONLY these canonical relation types:
@@ -929,7 +931,7 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
 - Keep episodes rich with context and stance (3-5 sentences).
 - Include multilingual keywords (German/English synonyms, related query terms).
 - CRITICAL: Prefer EMPTY arrays over low-value entries. When in doubt, do NOT store it.
-- A learning must pass this test: "Does this represent a user correction, an explicit rule, or an enduring personal preference?" If no, return empty array [].
+- A learning must pass this test: "Did the USER explicitly state this as an enduring correction, rule, or personal preference?" If the insight was derived by the assistant or concerns technical architecture/workarounds/dead-ends, return empty array [].
 - Entity links must use ONLY the canonical relation types listed above.
 
 User: {user_prompt}
