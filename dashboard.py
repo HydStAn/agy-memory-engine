@@ -1252,6 +1252,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
     let networkClusterFilter = 'all';
     let networkRelationFilter = 'all';
     let networkHideRelatedTo = false;
+    let networkSpacing = parseFloat(localStorage.getItem('agy_graph_spacing') || '1.8') || 1.8;
 
     function onNetworkFilterChange() {
       const selC = document.getElementById('sel-network-cluster');
@@ -1266,6 +1267,17 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       networkHideRelatedTo = !!checked;
       lastRenderedGraphHash = '';
       if (rawData && rawData.links) renderGraph(rawData.links, true);
+    }
+
+    function updateNetworkSpacing(val) {
+      networkSpacing = parseFloat(val) || 1.8;
+      try { localStorage.setItem('agy_graph_spacing', networkSpacing.toString()); } catch (e) {}
+      const lbl = document.getElementById('val-network-spacing');
+      if (lbl) lbl.innerText = networkSpacing.toFixed(1) + 'x';
+      if (networkInstance) {
+        networkInstance.setOptions(getPhysicsOptions(networkSpacing));
+        networkInstance.startSimulation();
+      }
     }
 
     function onProfileChange(val) {
@@ -1762,6 +1774,12 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
                 </select>
               </div>
 
+              <div style="display:flex; align-items:center; gap:6px;">
+                <label style="color:var(--text-muted); font-size:0.75rem; font-weight:600;" title="Abstand und Abstoßung zwischen den Themen-Wolken">Spreizung:</label>
+                <input type="range" id="rng-network-spacing" min="0.8" max="3.0" step="0.1" value="${networkSpacing}" oninput="updateNetworkSpacing(this.value)" style="cursor:pointer; width:80px; accent-color:var(--accent);">
+                <span id="val-network-spacing" style="color:var(--text-bright); font-size:0.75rem; font-family:monospace; min-width:32px;">${networkSpacing.toFixed(1)}x</span>
+              </div>
+
               <label style="display:flex; align-items:center; gap:5px; font-size:0.75rem; color:var(--text-bright); cursor:pointer; user-select:none; margin-left:auto;">
                 <input type="checkbox" id="chk-hide-related" ${networkHideRelatedTo ? 'checked' : ''} onchange="toggleHideRelatedTo(this.checked)">
                 Hide generic <code>related_to</code> edges
@@ -1849,6 +1867,23 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     let networkInstance = null;
 
+    function getPhysicsOptions(spacing) {
+      const s = parseFloat(spacing) || 1.8;
+      return {
+        physics: {
+          stabilization: { iterations: 180, updateInterval: 25 },
+          barnesHut: {
+            gravitationalConstant: Math.round(-3500 * Math.pow(s, 1.4)),
+            centralGravity: Math.max(0.01, +(0.12 / Math.pow(s, 1.2)).toFixed(3)),
+            springLength: Math.round(95 * s),
+            springConstant: 0.03,
+            damping: 0.09,
+            avoidOverlap: 0.3
+          }
+        }
+      };
+    }
+
     function initNetworkGraph(links) {
       const container = document.getElementById('network-graph-canvas');
       if (!container || typeof vis === 'undefined') return;
@@ -1930,16 +1965,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       };
 
       const options = {
-        physics: {
-          stabilization: { iterations: 150, updateInterval: 25 },
-          barnesHut: {
-            gravitationalConstant: -3500,
-            centralGravity: 0.25,
-            springLength: 95,
-            springConstant: 0.04,
-            damping: 0.09
-          }
-        },
+        physics: getPhysicsOptions(networkSpacing).physics,
         interaction: {
           hover: true,
           tooltipDelay: 100,
