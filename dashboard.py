@@ -1251,7 +1251,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     let networkClusterFilter = 'all';
     let networkRelationFilter = 'all';
-    let networkHideRelatedTo = false;
+    let networkHideRelatedTo = (localStorage.getItem('agy_graph_hide_related') !== 'false');
     let networkSpacing = parseFloat(localStorage.getItem('agy_graph_spacing') || '1.8') || 1.8;
 
     function onNetworkFilterChange() {
@@ -1265,6 +1265,7 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
 
     function toggleHideRelatedTo(checked) {
       networkHideRelatedTo = !!checked;
+      try { localStorage.setItem('agy_graph_hide_related', networkHideRelatedTo ? 'true' : 'false'); } catch (e) {}
       lastRenderedGraphHash = '';
       if (rawData && rawData.links) renderGraph(rawData.links, true);
     }
@@ -1275,6 +1276,22 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const lbl = document.getElementById('val-network-spacing');
       if (lbl) lbl.innerText = networkSpacing.toFixed(1) + 'x';
       if (networkInstance) {
+        const s = networkSpacing;
+        const intraLen = Math.round(55 * s);
+        const crossLen = Math.round(280 * s);
+        const edgeUpdates = [];
+        if (networkInstance.body && networkInstance.body.data && networkInstance.body.data.edges) {
+          networkInstance.body.data.edges.forEach(edge => {
+            const d1 = (edge.from.split('.')[0] || '').toLowerCase();
+            const d2 = (edge.to.split('.')[0] || '').toLowerCase();
+            const sameDomain = (d1 === d2);
+            edgeUpdates.push({
+              id: edge.id,
+              length: sameDomain ? intraLen : crossLen
+            });
+          });
+          networkInstance.body.data.edges.update(edgeUpdates);
+        }
         networkInstance.setOptions(getPhysicsOptions(networkSpacing));
         networkInstance.startSimulation();
       }
@@ -1871,14 +1888,15 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
       const s = parseFloat(spacing) || 1.8;
       return {
         physics: {
-          stabilization: { iterations: 180, updateInterval: 25 },
-          barnesHut: {
-            gravitationalConstant: Math.round(-3500 * Math.pow(s, 1.4)),
-            centralGravity: Math.max(0.01, +(0.12 / Math.pow(s, 1.2)).toFixed(3)),
-            springLength: Math.round(95 * s),
-            springConstant: 0.03,
-            damping: 0.09,
-            avoidOverlap: 0.3
+          solver: 'forceAtlas2Based',
+          stabilization: { iterations: 200, updateInterval: 25 },
+          forceAtlas2Based: {
+            gravitationalConstant: Math.round(-120 * s),
+            centralGravity: Math.max(0.001, +(0.005 / s).toFixed(4)),
+            springLength: Math.round(75 * s),
+            springConstant: 0.08,
+            damping: 0.4,
+            avoidOverlap: 1.0
           }
         }
       };
@@ -1942,14 +1960,26 @@ HTML_TEMPLATE = r"""<!DOCTYPE html>
         getOrCreateNode(l.source_id);
         getOrCreateNode(l.target_id);
 
+        const d1 = (l.source_id.split('.')[0] || '').toLowerCase();
+        const d2 = (l.target_id.split('.')[0] || '').toLowerCase();
+        const sameDomain = (d1 === d2);
+
+        const s = networkSpacing || 1.8;
+        const intraLen = Math.round(55 * s);
+        const crossLen = Math.round(280 * s);
+
         edges.push({
           id: 'edge_' + idx,
           from: l.source_id,
           to: l.target_id,
           label: l.relation,
-          font: { color: '#8b949e', size: 10, align: 'middle' },
+          length: sameDomain ? intraLen : crossLen,
+          font: { color: sameDomain ? '#8b949e' : '#484f58', size: 10, align: 'middle' },
           arrows: 'to',
-          color: { color: 'rgba(139, 148, 158, 0.4)', highlight: '#58a6ff' },
+          color: {
+            color: sameDomain ? 'rgba(139, 148, 158, 0.45)' : 'rgba(139, 148, 158, 0.12)',
+            highlight: '#58a6ff'
+          },
           smooth: { enabled: true, type: 'continuous', roundness: 0.2 }
         });
       });
