@@ -23,7 +23,9 @@ except (ImportError, ModuleNotFoundError):
     HAS_SQLITE_VEC = False
 
 # Protected categories that require explicit confirmation before overwrite in sync-turn
-PROTECTED_CATEGORIES = frozenset({"health", "finance", "pension", "insurance", "preferences", "user"})
+PROTECTED_CATEGORIES = frozenset({
+    "health", "finance", "pension", "insurance", "preferences", "user", "family", "contacts"
+})
 
 _SCHEMA_IDENTITIES = {}
 SCHEMA_VERSION = 212

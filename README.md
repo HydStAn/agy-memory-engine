@@ -1,9 +1,9 @@
-# AGY Memory Engine (v2.5.0)
+# AGY Memory Engine (v2.7.0)
 
 > Hardening branch: see [runtime setup and audit coverage](docs/HARDENING.md). Automatic extraction now requires an explicitly configured tool-free chat-completions endpoint. It no longer launches an unrestricted AGY agent. Failed extraction retains pending turns. Schema upgrades run on first engine access; restart all clients together for rollout.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Tests: 229/229 Passing](https://img.shields.io/badge/Tests-229%2F229%20Passed-brightgreen.svg)]()
+[![Tests: 249/249 Passing](https://img.shields.io/badge/Tests-249%2F249%20Passed-brightgreen.svg)]()
 
 > Lightweight, high-performance, standalone dynamic cognitive memory layer for Google Antigravity (`agy`) and autonomous agent frameworks.
 
@@ -447,6 +447,23 @@ python3 -m unittest discover tests/ -v
 ---
 
 ## 🚀 Release Notes
+
+### v2.7.0 (2026-11-26)
+- **Why this release (Lessons from Long-Term Real-Life Operation)**:
+  - Long-running production usage over months revealed a subtle *memory erosion / semantic blurring* effect as the store grew: blind `ON CONFLICT DO UPDATE` writes in `sync_turn` (where the extraction LLM only saw IDs, not existing text) and repeated daily LLM consolidations gradually stripped hard identifiers (IPs, dates, birthdates, paths, order/contract IDs, amounts) and over-pruned valid user rules.
+  - v2.7.0 eliminates this degradation with deterministic read-before-write protection and lossless consolidation guardrails, ensuring the knowledge base stays crisp as real-world experience accumulates.
+- **Read-Before-Write & Anti-Wipe Guard (`sync_turn`)**:
+  - Added `_fetch_relevant_existing_context()` to inject the full current content of relevant FTS5-matched facts, episodes, and learnings directly into the extraction prompt, alongside explicit lossless-update and distinct-project ID rules.
+  - Added deterministic `_guard_non_destructive_update()`: if an automated update drops ≥ 2 hard factual details or severely shrinks content with low token overlap, the prior content is preserved and the new update is appended rather than overwriting history.
+- **Lossless Consolidation Guardrails (`consolidate_memories`)**:
+  - Added `_check_lossless_merge()` to automatically reject consolidation proposals that drop hard details (IPs, dates, amounts, paths, URLs, IDs) or over-compress below 40% (or 55% when losing details).
+  - Updated consolidation prompts to strictly forbid summarizing away concrete identifiers or merging unrelated items into narrow single-item keys.
+- **Extended Protection & Learning Purge Brake**:
+  - Added `family` and `contacts` to `PROTECTED_CATEGORIES` and protected all `*.profile` master records against automated overwrites or merges.
+  - Disabled automated learning deletions by default during `optimize_db()` (`allow_learning_purges=False`; opt-in via `--allow-learning-purges`).
+  - Added optional `AGY_CONSOLIDATION_MODEL` in `config.py` so semantic consolidation can use a dedicated model independently of `AGY_MEMORY_MODEL`.
+- **Verification**:
+  - Added `tests/test_lossless_guardrails.py` (5 new tests); full suite at **249/249 passing**.
 
 ### v2.6.0 (2026-10-23)
 - **Continuous Automated Learnings Consolidation**:

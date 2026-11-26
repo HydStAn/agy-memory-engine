@@ -28,6 +28,7 @@ from schema import db_session, DB_PATH, PROTECTED_CATEGORIES
 from jev_gate import gate_relevant
 from config import (
     MODEL_NAME,
+    CONSOLIDATION_MODEL_NAME,
     DEFAULT_MODEL,
     CACHE_PATH,
     AGY_BIN, MODEL_EXPLICIT, archive_path, sync_lock_path, STRICT_GRAPH
@@ -39,7 +40,7 @@ except ImportError:
     delete_vector = None
     build_text_repr = None
 
-__version__ = "2.6.0"
+__version__ = "2.7.0"
 
 logger = logging.getLogger("agy_memory")
 if not logger.handlers:
@@ -735,9 +736,181 @@ def list_all():
         for src, tgt, rel in links:
             logger.info(f"{src:<30} --[{rel}]--> {tgt}")
 
+_HARD_DETAIL_RE = re.compile(
+    r'(?:https?://[^\s,;\)\]]+'
+    r'|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{1,5})?\b'
+    r'|\b\d{2}\.\d{2}\.\d{2,4}\b'
+    r'|\b\d{4}-\d{2}-\d{2}\b'
+    r'|\b(?:CHF|EUR|USD|ISK|MAD)\s*[\d\'\.,]+\b'
+    r'|\b[\d\'\.,]+\s*(?:CHF|EUR|USD|ISK|MAD|€)\b'
+    r'|\+?\d[\d\s\-]{6,}\d'
+    r'|\b[A-Z]{2,}[0-9][A-Z0-9_\-]{1,}\b'
+    r'|(?<![A-Za-z0-9_])/[A-Za-z0-9_\-\./]{3,}'
+    r'|\b[A-Za-z]:\\[^\s,;\)\]]+'
+    r'|\b\d+(?:[.,]\d+)?\s*(?:GB|TB|MB|GiB|MiB|Gbit/s|Mbit/s|kW|kWh|Wh|Hz|MHz|GHz|mm|cm|km|kg|mg|ml|%|°C)\b)',
+    re.IGNORECASE,
+)
+
+
+def _extract_hard_details(text: str) -> set[str]:
+    """Extract structured factual tokens (IPs, dates, amounts, paths, URLs, IDs, units)."""
+    if not text:
+        return set()
+    return {re.sub(r'\s+', ' ', m.group(0).strip().lower()) for m in _HARD_DETAIL_RE.finditer(text)}
+
+
+def _token_overlap(old_text: str, new_text: str) -> float:
+    """Fraction of meaningful prior words retained in new_text."""
+    old_words = {w for w in re.findall(r'[\w]{4,}', (old_text or '').lower()) if not w.isdigit()}
+    if not old_words:
+        return 1.0
+    new_words = set(re.findall(r'[\w]{4,}', (new_text or '').lower()))
+    return len(old_words & new_words) / len(old_words)
+
+
+def _check_lossless_merge(source_texts: list[str], merged_text: str) -> tuple[bool, str]:
+    """Reject consolidation merges that drop hard factual details or over-compress."""
+    combined_before = [t for t in source_texts if t]
+    if not combined_before:
+        return True, ""
+    total_before = sum(len(t) for t in combined_before)
+    details_before = set()
+    for t in combined_before:
+        details_before |= _extract_hard_details(t)
+    details_after = _extract_hard_details(merged_text)
+    lost_details = sorted(details_before - details_after)
+
+    if len(lost_details) >= 2:
+        return False, f"drops {len(lost_details)} hard details ({', '.join(lost_details[:5])})"
+    if total_before >= 250 and len(merged_text) < total_before * 0.55 and len(lost_details) >= 1:
+        return False, f"compressed {total_before}c->{len(merged_text)}c while losing hard detail ({lost_details[0]})"
+    if total_before >= 300 and len(merged_text) < total_before * 0.40:
+        return False, f"excessive compression {total_before}c->{len(merged_text)}c (<40% retained)"
+    return True, ""
+
+
+def _guard_non_destructive_update(old_text: str, new_text: str, kind: str = "fact") -> str:
+    """Prevent blind overwrites when sync_turn updates an existing entry without carrying prior details."""
+    if not old_text or not new_text:
+        return new_text
+    if old_text.strip() == new_text.strip():
+        return new_text
+    old_details = _extract_hard_details(old_text)
+    new_details = _extract_hard_details(new_text)
+    lost_details = sorted(old_details - new_details)
+    overlap = _token_overlap(old_text, new_text)
+
+    severe_shrink = len(old_text) >= 180 and len(new_text) < len(old_text) * 0.60 and overlap < 0.50
+    detail_wipe = len(lost_details) >= 2 and overlap < 0.55
+
+    if not (severe_shrink or detail_wipe):
+        return new_text
+
+    if new_text.strip() in old_text:
+        return old_text
+    sep = "\n\n[Update]: " if kind == "episode" else " | Update: "
+    combined = f"{old_text.rstrip()}{sep}{new_text.strip()}"
+    max_len = 3000 if kind == "episode" else 2200
+    if len(combined) > max_len:
+        if len(old_text) < max_len - 200:
+            available = max(200, max_len - len(old_text) - len(sep))
+            combined = f"{old_text.rstrip()}{sep}{new_text.strip()[:available]}"
+        else:
+            tail_new = new_text.strip()[:800]
+            keep_old = max(200, max_len - len(sep) - len(tail_new) - 3)
+            combined = f"{old_text[:keep_old].rstrip()}...{sep}{tail_new}"
+    logger.warning(
+        "[ANTI-WIPE] Preserved prior %s content on destructive update (old=%dc, new=%dc, lost_details=%d, overlap=%.2f)",
+        kind, len(old_text), len(new_text), len(lost_details), overlap,
+    )
+    return combined
+
+
+def _fetch_relevant_existing_context(query: str, limit_facts: int = 12, limit_episodes: int = 6,
+                                     limit_learnings: int = 4, max_chars: int = 10000) -> dict:
+    """Read-before-write helper: fetch full current text of relevant existing items via local FTS5."""
+    result = {"facts": [], "episodes": [], "learnings": []}
+    if not query or not query.strip():
+        return result
+    with db_session() as conn:
+        cursor = conn.cursor()
+        vocab = get_all_vocabulary(cursor)
+        words = extract_multilingual_tokens(query[:12000], vocab)[:32]
+        if not words:
+            return result
+        fts_terms = [f'"{w}"*' if len(w) >= 4 else f'"{w}"' for w in words]
+        fts_query = " OR ".join(fts_terms)
+
+        used_chars = 0
+
+        def _append_bounded(bucket: str, entry: dict) -> bool:
+            nonlocal used_chars
+            size = len(json.dumps(entry, ensure_ascii=False))
+            if used_chars + size > max_chars:
+                return False
+            result[bucket].append(entry)
+            used_chars += size
+            return True
+
+        try:
+            rows = cursor.execute("""
+                SELECT m.id, m.category, m.fact, m.keywords
+                FROM memories m
+                JOIN memories_fts f ON m.id = f.id
+                WHERE memories_fts MATCH ?
+                ORDER BY f.rank
+                LIMIT ?
+            """, (fts_query, limit_facts)).fetchall()
+            for mid, cat, fact, kw in rows:
+                if not _append_bounded("facts", {"id": mid, "category": cat, "fact": fact, "keywords": kw or ""}):
+                    break
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            rows = cursor.execute("""
+                SELECT e.id, e.topic, e.title, e.status, e.narrative, e.stance
+                FROM episodes e
+                JOIN episodes_fts f ON e.id = f.id
+                WHERE episodes_fts MATCH ?
+                ORDER BY f.rank
+                LIMIT ?
+            """, (fts_query, limit_episodes)).fetchall()
+            for eid, topic, title, status, nar, stance in rows:
+                if not _append_bounded("episodes", {
+                    "id": eid, "topic": topic, "title": title, "status": status,
+                    "narrative": nar, "stance": stance or ""
+                }):
+                    break
+        except sqlite3.OperationalError:
+            pass
+
+        try:
+            rows = cursor.execute("""
+                SELECT l.id, l.category, l.insight, l.context
+                FROM learnings l
+                JOIN learnings_fts f ON l.id = f.id
+                WHERE learnings_fts MATCH ?
+                ORDER BY f.rank
+                LIMIT ?
+            """, (fts_query, limit_learnings)).fetchall()
+            for lid, cat, insight, ctx in rows:
+                if not _append_bounded("learnings", {
+                    "id": lid, "category": cat, "insight": insight, "context": ctx or ""
+                }):
+                    break
+        except sqlite3.OperationalError:
+            pass
+
+    return result
+
+
 def _is_protected_key(key_id: str, existing: dict = None) -> bool:
-    """Protect persisted categories as well as category tokens in an ID."""
-    if any(part in PROTECTED_CATEGORIES for part in re.split(r"[._-]", key_id.lower())):
+    """Protect persisted categories, category tokens in an ID, and canonical *.profile master records."""
+    lowered = key_id.lower()
+    if lowered.endswith(".profile"):
+        return True
+    if any(part in PROTECTED_CATEGORIES for part in re.split(r"[._-]", lowered)):
         return True
     if existing is not None:
         return (existing.get("category") or existing.get("topic") or "").lower() in PROTECTED_CATEGORIES
@@ -823,11 +996,12 @@ def sync_turn(user_prompt: str, assistant_response: str, dry_run: bool = False, 
         lock_fd.close()
 
 
-def _infer_json(prompt, timeout):
+def _infer_json(prompt, timeout, model=None):
     """A bounded subprocess with no tools; never launch an unrestricted agent."""
+    selected_model = model or get_cached_model()
     try:
         result = subprocess.run(
-            [sys.executable, str(Path(__file__).with_name('memory_inference.py')), '--model', get_cached_model()],
+            [sys.executable, str(Path(__file__).with_name('memory_inference.py')), '--model', selected_model],
             input=prompt, capture_output=True, text=True, timeout=timeout,
             env=dict(os.environ, AGY_INTERNAL_INVOCATION='1', AGY_SAGE_DISABLED='1'))
     except subprocess.TimeoutExpired as error:
@@ -882,6 +1056,14 @@ def _sync_turn_inner(user_prompt: str, assistant_response: str, dry_run: bool = 
         "learnings": inv.get("learnings", []),
     }
     inv_context = json.dumps(inv_for_prompt, ensure_ascii=False)
+    relevant_existing = _fetch_relevant_existing_context(f"{user_prompt}\n{assistant_response}")
+    existing_content_block = ""
+    if any(relevant_existing.values()):
+        existing_content_block = (
+            "\n## Existing Relevant Entries (Current Content — MUST PRESERVE valid details when updating!):\n"
+            + json.dumps(relevant_existing, ensure_ascii=False)
+            + "\n"
+        )
 
     prompt = f"""You are the Multi-Layer Cognitive Memory Engine for the user.
 Analyze the conversation turn below and extract ONLY genuinely persistent, reusable information.
@@ -924,11 +1106,13 @@ Analyze the conversation turn below and extract ONLY genuinely persistent, reusa
 
 ## Existing Database Keys & Topics:
 {inv_context}
-
+{existing_content_block}
 ## Rules:
 - If updating an existing item, reuse its EXACT existing ID from the inventory.
-- Keep facts atomic and dense.
-- Keep episodes rich with context and stance (3-5 sentences).
+- LOSSLESS UPDATES (CRITICAL): When updating an existing fact or episode, you MUST integrate the new information WITH the existing content above and PRESERVE all still-valid hard details (birthdates, dates, IPs, ports, paths, URLs, contract/order/booking IDs, amounts, specs, names). NEVER replace an existing entry with only a partial snippet from the current turn.
+- DISTINCT PROJECTS / INCIDENTS: For a new unrelated project, song, or incident under a broad topic, ALWAYS create a NEW specific ID instead of overwriting an existing episode about a different project.
+- Keep facts atomic and dense, without dropping hard identifiers or numbers.
+- Keep episodes rich with context, chronology, and stance (3-6 sentences).
 - Include multilingual keywords (German/English synonyms, related query terms).
 - CRITICAL: Prefer EMPTY arrays over low-value entries. When in doubt, do NOT store it.
 - A learning must pass this test: "Did the USER explicitly state this as an enduring correction, rule, or personal preference?" If the insight was derived by the assistant or concerns technical architecture/workarounds/dead-ends, return empty array [].
@@ -1017,6 +1201,8 @@ Output ONLY a single valid JSON object (or {{"facts":[], "episodes":[], "learnin
                     if isinstance(f, dict) and "id" in f and "fact" in f:
                         existing = _get_existing_value(f["id"], "memories", connection=transaction)
                         f = dict(existing or {}, **f)
+                        if existing and not _is_protected_key(f["id"], existing):
+                            f["fact"] = _guard_non_destructive_update(existing["fact"], f["fact"], kind="fact")
                         diff = _format_diff(existing, f, "Fact")
                         if diff:
                             diff_lines.append(diff)
@@ -1044,6 +1230,8 @@ Output ONLY a single valid JSON object (or {{"facts":[], "episodes":[], "learnin
                     if isinstance(ep, dict) and "id" in ep and "narrative" in ep:
                         existing = _get_existing_value(ep["id"], "episodes", connection=transaction)
                         ep = dict(existing or {}, **ep)
+                        if existing and not _is_protected_key(ep["id"], existing):
+                            ep["narrative"] = _guard_non_destructive_update(existing["narrative"], ep["narrative"], kind="episode")
                         diff = _format_diff(existing, ep, "Episode")
                         if diff:
                             diff_lines.append(diff)
@@ -1196,13 +1384,14 @@ Categories and Facts:
 {facts_json}
 
 INSTRUCTIONS:
-1. If two or more facts describe the exact same topic/entity/preference/routine, combine them into ONE authoritative, complete, concise fact.
-2. Choose the best, most structured primary ID (target_id) from the existing IDs, or suggest a clean canonical ID.
-3. List the redundant IDs that must be DELETED (merged_ids).
-4. Combine the keywords/tags cleanly without duplicates.
-5. Provide a short rationale explaining why these were merged.
-6. If no facts need to be merged in a category, do not create a merge entry for it.
-7. The category MUST be one of: {canonical_cats}
+1. Only merge facts that are true duplicates or direct fragments of the EXACT same entity/configuration. When in doubt, do NOT merge.
+2. STRICT LOSSLESS MERGE: You MUST preserve ALL concrete hard details from every merged fact — including dates, birthdates, IPs, ports, URLs, file paths, model/serial/order/booking/contract numbers, prices/amounts, and technical parameters. Never summarize away specifics.
+3. Choose an accurate canonical primary ID (target_id). NEVER merge an unrelated item into a narrowly named key (e.g. do not merge a second product into a single-product key).
+4. List the redundant IDs that must be DELETED (merged_ids).
+5. Combine the keywords/tags cleanly without duplicates.
+6. Provide a short rationale explaining why these were merged.
+7. If no facts need to be merged in a category, do not create a merge entry for it.
+8. The category MUST be one of: {canonical_cats}
    If the existing category is not in this list, map it to the closest canonical one.
 
 Respond ONLY with valid JSON in this exact structure:
@@ -1211,7 +1400,7 @@ Respond ONLY with valid JSON in this exact structure:
     {{
       "target_id": "authoritative.key.name",
       "category": "health",
-      "fact": "Authoritative consolidated fact text...",
+      "fact": "Authoritative lossless consolidated fact text preserving all numbers, IDs, dates, paths...",
       "keywords": "combined keyword tags",
       "merged_ids": ["redundant.key.1", "redundant.key.2"],
       "rationale": "Merged daily intake and brand information into single routine entry."
@@ -1219,7 +1408,7 @@ Respond ONLY with valid JSON in this exact structure:
   ]
 }}
 """
-        out = _infer_json(prompt, timeout=120)
+        out = _infer_json(prompt, timeout=120, model=CONSOLIDATION_MODEL_NAME) if CONSOLIDATION_MODEL_NAME else _infer_json(prompt, timeout=120)
 
         json_match = re.fullmatch(r'\{.*\}', out.strip(), re.DOTALL)
         if not json_match:
@@ -1376,6 +1565,15 @@ def consolidate_memories(dry_run: bool = False, proposals: dict = None, snapshot
                 proposed = {f["id"]: f for f in category_facts}
                 if any(row[2] != proposed[row[0]]["fact"] or (row[3] or "") != proposed[row[0]]["keywords"] for row in sources + ([target] if target else [])):
                     continue
+                # Lossless merge guard: reject consolidations that drop hard factual details or over-compress.
+                source_texts = [row[2] for row in sources] + ([target[2]] if target else [])
+                is_lossless, loss_reason = _check_lossless_merge(source_texts, fact_text)
+                if not is_lossless:
+                    logger.warning(
+                        "[CONSOLIDATE-GUARD] Rejected lossy merge for %s <- %s: %s",
+                        target_id, existing_merged, loss_reason
+                    )
+                    continue
                 placeholders = ",".join("?" for _ in existing_merged)
                 links = conn.execute(f"SELECT source_id, target_id, relation FROM entity_links WHERE source_id IN ({placeholders}) OR target_id IN ({placeholders})", existing_merged * 2).fetchall()
                 if not dry_run:
@@ -1431,9 +1629,9 @@ def _propose_consolidations_learnings(categories_to_check: dict) -> dict:
         items_json = json.dumps(batch_categories, ensure_ascii=False, indent=2)
         prompt = f"""You are the Experiential Learnings Consolidation & Pruning Engine for the user.
 Review the following learnings grouped by category.
-1. MERGE: Combine duplicate, heavily overlapping, or closely related heuristics into ONE canonical, authoritative learning.
-2. PURGE: Mark any one-time bug fixes, single PR implementation notes, temporary CLI workarounds, or obsolete hyper-specific tricks for deletion.
-3. PRESERVE: If a learning is a genuinely enduring, useful rule of thumb or behavioral heuristic, leave it untouched (do not list it in merges or purges).
+1. MERGE: Combine duplicate, heavily overlapping, or closely related heuristics into ONE canonical, authoritative learning without losing concrete rules or constraints.
+2. PURGE: Mark ONLY obvious one-time bug fixes or obsolete single-PR notes for deletion. NEVER purge user workflow directives, tool/host routing rules, repository policies, communication styles, safety rules, or personal preferences.
+3. PRESERVE: When in doubt, leave a learning untouched (do not list it in merges or purges).
 
 Categories and Learnings:
 {items_json}
@@ -1461,7 +1659,7 @@ Respond ONLY with valid JSON:
   ]
 }}
 """
-        out = _infer_json(prompt, timeout=120)
+        out = _infer_json(prompt, timeout=120, model=CONSOLIDATION_MODEL_NAME) if CONSOLIDATION_MODEL_NAME else _infer_json(prompt, timeout=120)
         json_match = re.fullmatch(r'\{.*\}', out.strip(), re.DOTALL)
         if not json_match:
             raise SyncExtractionError("Consolidation output must be a JSON object")
@@ -1478,10 +1676,11 @@ Respond ONLY with valid JSON:
     return {"merges": merges, "purges": purges}
 
 
-def consolidate_learnings(dry_run: bool = False, proposals: dict = None, snapshot: dict = None) -> list:
+def consolidate_learnings(dry_run: bool = False, proposals: dict = None, snapshot: dict = None,
+                          allow_purges: bool = True) -> list:
     """Analyze all stored learnings per category with Gemini LLM or externally authored proposals,
     detect duplicate/overlapping heuristics, merge them cleanly into a single authoritative record,
-    purge obsolete/one-time bugfix learnings, rewiring entity_links and logging to consolidation_log.
+    optionally purge obsolete/one-time bugfix learnings, rewiring entity_links and logging to consolidation_log.
     """
     if proposals is not None and snapshot is None:
         raise SyncExtractionError("Consolidation proposals require the snapshot they were written against")
@@ -1613,7 +1812,12 @@ def consolidate_learnings(dry_run: bool = False, proposals: dict = None, snapsho
             })
             logger.info(f"[CONSOLIDATE] {diff_summary} (Rationale: {rationale})")
 
-        # Process purges
+        # Process purges (disabled by default during automated optimize_db runs)
+        if not allow_purges:
+            if purges_list:
+                logger.info("[CONSOLIDATE-GUARD] Skipped %d learning purge proposal(s) (allow_purges=False)", len(purges_list))
+            purges_list = []
+
         for purge in purges_list:
             purge_id = require_text(purge.get("id"), "id")
             rationale = purge.get("rationale", "Obsolete or low-value single-case note")
@@ -1802,7 +2006,8 @@ def _readonly_db(path):
         yield conn
 
 
-def optimize_db(apply_changes: bool = False, age_decay: bool = True, consolidate: bool = False):
+def optimize_db(apply_changes: bool = False, age_decay: bool = True, consolidate: bool = False,
+                allow_learning_purges: bool = False):
     """Preview without writes, or back up and apply maintenance explicitly."""
     target_db = schema.DB_PATH
     if not os.path.exists(target_db) and apply_changes:
@@ -1840,7 +2045,7 @@ def optimize_db(apply_changes: bool = False, age_decay: bool = True, consolidate
     if consolidate:
         stats["merges"] = consolidate_memories()
         try:
-            stats["learning_merges"] = consolidate_learnings()
+            stats["learning_merges"] = consolidate_learnings(allow_purges=allow_learning_purges)
         except Exception as e:
             logger.warning("[CONSOLIDATE] Failed to consolidate learnings: %s", e)
             stats["learning_merges"] = []
@@ -2078,12 +2283,14 @@ def main():
     op.add_argument("--no-age", action="store_true", help="Skip episode aging")
     op.add_argument("--consolidate", action="store_true", default=False, help="Explicitly enable semantic deduplication")
     op.add_argument("--no-consolidate", action="store_false", dest="consolidate", help="Skip semantic deduplication")
+    op.add_argument("--allow-learning-purges", action="store_true", default=False, help="Allow automated purging of learnings during consolidation (disabled by default)")
 
     # Keep backward compatibility
     cp = subparsers.add_parser("compact", help="(Alias for 'optimize') Rebuild FTS indexes & VACUUM")
     cp.add_argument("--apply", action="store_true")
     cp.add_argument("--consolidate", action="store_true", default=False, help="Explicitly enable semantic deduplication")
     cp.add_argument("--no-consolidate", action="store_false", dest="consolidate", help="Skip semantic deduplication")
+    cp.add_argument("--allow-learning-purges", action="store_true", default=False, help="Allow automated purging of learnings during consolidation (disabled by default)")
 
     # Snapshot management CLI commands
     sn = subparsers.add_parser("snapshots", help="List database backup snapshots")
@@ -2163,7 +2370,8 @@ def main():
         optimize_db(
             apply_changes=getattr(args, 'apply', True),
             age_decay=not getattr(args, 'no_age', False),
-            consolidate=getattr(args, 'consolidate', False)
+            consolidate=getattr(args, 'consolidate', False),
+            allow_learning_purges=getattr(args, 'allow_learning_purges', False)
         )
     elif args.command == "snapshots":
         if args.create:
