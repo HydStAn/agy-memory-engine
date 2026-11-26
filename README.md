@@ -1,6 +1,6 @@
 # AGY Memory Engine (v2.7.0)
 
-> Hardening branch: see [runtime setup and audit coverage](docs/HARDENING.md). Automatic extraction now requires an explicitly configured tool-free chat-completions endpoint. It no longer launches an unrestricted AGY agent. Failed extraction retains pending turns. Schema upgrades run on first engine access; restart all clients together for rollout.
+> Security & Runtime Hardening: see [runtime setup and audit coverage](docs/HARDENING.md). Automatic extraction uses a tool-free inference path (`AGY_MEMORY_INFERENCE_URL` or native `agy` CLI) and never launches an unrestricted agent. Failed extraction retains pending turns. Schema upgrades run on first engine access; restart all clients together for rollout.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Tests: 249/249 Passing](https://img.shields.io/badge/Tests-249%2F249%20Passed-brightgreen.svg)]()
@@ -441,7 +441,7 @@ Registers the transcript collector on every agent turn stop:
 
 ```bash
 python3 -m unittest discover tests/ -v
-# Ran 229 tests (OK)
+# Ran 249 tests (OK)
 ```
 
 ---
